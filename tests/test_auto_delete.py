@@ -166,5 +166,28 @@ class CallSiteTests(unittest.TestCase):
             self.assertIn("QUEST_REFUSAL_NOTICE_DELETE_AFTER", site)
 
 
+class SupervisorTests(unittest.TestCase):
+    def test_a_failed_service_cancels_its_siblings_before_returning(self):
+        async def go():
+            cancelled = asyncio.Event()
+
+            async def waits_forever():
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            async def crashes():
+                await asyncio.sleep(0)
+                raise RuntimeError("boom")
+
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                await bot_listener._supervise_service_tasks([waits_forever(), crashes()])
+            self.assertTrue(cancelled.is_set())
+
+        _run(go())
+
+
 if __name__ == "__main__":
     unittest.main()

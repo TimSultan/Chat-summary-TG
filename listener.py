@@ -34,6 +34,7 @@ import pets
 import quests
 import stats
 import tree
+import via_cleaner
 from config import SUMMARY_COMMAND, build_session, load_config
 from errors import ChatSummaryError
 from intent import parse_summary_request, resolve_name_hint
@@ -206,6 +207,28 @@ def blocked_file_name(msg) -> str | None:
         if name and name.lower().endswith(BLOCKED_FILE_EXTENSIONS):
             return name
     return None
+
+
+def inline_bot_ref(msg) -> str | None:
+    """Which inline bot this message was posted through -- Telegram's "via @gif" label --
+    or None if it was written by a person in the normal way (see via_cleaner.py).
+
+    Returned as a printable reference rather than a bool so the log line can say which bot
+    is filling the chat, which is the first thing anybody asks when they see the cleaner
+    working. The @username is only available when Telethon already has that bot cached,
+    and resolving one would mean a network round trip per message for a string nothing
+    depends on -- so the numeric id is a perfectly good answer and the common one.
+    """
+    bot_id = getattr(msg, "via_bot_id", None)
+    if not bot_id:
+        return None
+    try:
+        username = getattr(getattr(msg, "via_bot", None), "username", None)
+    except Exception:
+        # `via_bot` reads an entity cache and has no business raising, but this sits on
+        # the path every message in the chat takes; a log string is not worth the risk.
+        username = None
+    return f"@{username}" if username else str(bot_id)
 
 
 def format_blocked_file_notice(sender) -> str:
@@ -1215,6 +1238,31 @@ async def run_listener(
                         except Exception as e:
                             log(f"[listener] failed to send blocked-file notice: {e}")
                 return
+
+        # ViaCleaner: a post made through an inline bot ("via @gif"). Only remembered
+        # here, never deleted -- the delay is the feature, and the delete itself belongs to
+        # the bot account, which is the one holding the "delete messages" right (see
+        # via_cleaner.py). Deliberately does NOT return: the message is still a message
+        # until it goes, so it keeps counting for stats and can still be read as a command.
+        # via_cleaner.remember is a no-op for a chat that has the cleaner switched off,
+        # which is every chat until an administrator turns it on in /viacleaner.
+        via_ref = inline_bot_ref(msg)
+        if via_ref is not None and not msg.is_private:
+            chat = await event.get_chat()
+            entry = matched_allowed_chat(chat)
+            if entry is not None:
+                try:
+                    delete_at = via_cleaner.remember(entry, msg.id, via=via_ref)
+                except Exception:
+                    # A broken store must cost this one message its cleanup, not the
+                    # figurine counting, quest submissions and summary handling below it.
+                    log(f"[listener] via_cleaner could not schedule {msg.id}:\n{traceback.format_exc()}")
+                else:
+                    if delete_at is not None:
+                        log(
+                            f"[listener] via-message {msg.id} (via {via_ref}) in '{entry}' "
+                            f"scheduled for deletion in {int(max(0, delete_at - time.time()))}s"
+                        )
 
         # #япокрасил + an attached photo OR video -- a "figurine painted" post (see
         # XP_PER_FIGURINE in stats.py). is_image_message/is_video_message (not just

@@ -688,6 +688,7 @@ class ReviewPaymentTests(QuestsTestCase):
         self.assertTrue(receipt["scroll"])
         self.assertTrue(receipt["scroll_name"])
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_accepting_pays_gold_pet_xp_tickets_and_a_drop_exactly_once(self):
         """The most important behaviour in this module: review is a button pressed from a
         web page, and a moderator on a slow connection WILL double-tap it. All four
@@ -724,6 +725,7 @@ class ReviewPaymentTests(QuestsTestCase):
         self.assertEqual(pets.farm_tickets(entry, "1"), reward["tickets"])
         self.assertEqual(len(pets.get_pet(entry, "1")["inventory"]), 1)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_a_painter_with_no_creature_is_paid_what_can_actually_reach_them(self):
         """Quests are a PAINTING task, so they deliberately do not require a pet -- the
         chat is full of people who never bought a cage, and the ticket wallet is at the

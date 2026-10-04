@@ -56,6 +56,7 @@ import donations
 import economy
 import maintenance
 import pets
+import pets_cardbattle
 import pets_combat
 import pets_config as C
 import pets_dungeon as D
@@ -107,10 +108,15 @@ _QUEST_COMPLETION_KEY = web.AppKey("pets_quest_completion")
 _PREFIX_KEY = web.AppKey("pets_prefix", str)
 _LOG_KEY = web.AppKey("pets_log", Callable[..., None])
 _TEST_BATTLE_SESSIONS_KEY = web.AppKey("pets_test_battle_sessions", dict)
+_CARD_BATTLE_SESSIONS_KEY = web.AppKey("pets_card_battle_sessions", dict)
 _SPRITE_JOBS_KEY = web.AppKey("pets_sprite_jobs", set)
 
 TEST_BATTLE_SESSION_TTL = 30 * 60
 TEST_BATTLE_SESSION_LIMIT = 1000
+# A card duel is played a tap at a time over several minutes and holds a whole shuffled
+# deck, so it is given the same half hour and the same ceiling as the turn-based test.
+CARD_BATTLE_SESSION_TTL = 30 * 60
+CARD_BATTLE_SESSION_LIMIT = 1000
 
 # Item codes are ASCII and short by construction (w001, amulet_red_button, bt01). Anything
 # else never reaches the filesystem -- same two-step guard vote_web.handle_media uses.
@@ -1059,6 +1065,9 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
         # discover it one refusal at a time.
         "level_up": pets.level_up_status(entry, user_id),
         "maintenance": maintenance.status(),
+        # What is switched on at all (see pets_config's closed features). The client hides
+        # a closed feature's tab and buttons from this rather than keeping its own list.
+        "features": {"farm": C.FARM_OPEN, "card_duel": C.CARD_DUEL_OPEN},
         "unread_updates": pets_updates.has_unread(entry, user_id),
         # Separate from "unread": a reward stays owed after the note has been read, so a
         # player who opened the log and got distracted still sees the gift waiting.
@@ -1143,6 +1152,7 @@ def _assemble_state(entry: str, user_id, xp: int, prefix: str, mine, quarry_rece
     # this is the one call standing between that and the browser, so it must never be
     # swapped for something that reads the round's raw `cells` list instead.
     state["meadow"] = pets.meadow_status(entry, user_id)
+    state["meadow"]["ticket_sources"] = pets.meadow_ticket_sources()
     state["forge"] = pets.forge_status(entry, user_id)
     return state
 
@@ -1374,6 +1384,10 @@ def _action_apply_personal_paint(entry, user_id, xp, payload):
     return ok, message
 
 
+def _action_remove_personal_paint(entry, user_id, xp, payload):
+    return pets.remove_personal_paint_rune(entry, user_id, str(payload.get("code") or ""))
+
+
 def _action_dungeon_enter(entry, user_id, xp, payload):
     return pets.enter_dungeon(entry, user_id)
 
@@ -1481,6 +1495,7 @@ _ACTIONS = {
     "reforge": _action_reforge,
     "enchant_weapon": _action_enchant_weapon,
     "apply_personal_paint": _action_apply_personal_paint,
+    "remove_personal_paint": _action_remove_personal_paint,
     "sell": _action_sell,
     "gift": _action_gift,
     "buy_cage": _action_buy_cage,
@@ -2108,6 +2123,324 @@ async def handle_test_battle_action(request: web.Request) -> web.Response:
         "message": "Тест завершён — ничего не записано." if battle.get("finished") else "",
         "battle": pets_test_combat.public_state(battle),
     })
+
+
+# ------------------------------------------------------------------------- card duel
+# A card duel is a real fight on a real stake. It costs one arena fight, taken when the
+# duel OPENS (pets.spend_card_duel) rather than when it ends -- otherwise walking out of a
+# duel that was going badly would be free, and with triple pay on the line that would be
+# the only way anybody played. When it finishes, pets.record_card_duel settles it.
+#
+# Between those two writes the duel touches the store not at all: opening it reads once to
+# build both decks, and every turn after that is dictionary work on a session already in
+# memory, however many turns it runs.
+
+# The card game's own scale. Deliberately NOT pets_combat's: that model is built around a
+# 500-point health bar and ~50-point swings, and a "49" printed on a card that gets played
+# three times a turn reads as noise. The two numbers below put a duel at roughly a dozen
+# turns for any pair of pets, because attack and HP both grow linearly in the stats and
+# the constant offsets are in proportion -- so a big pet and a small one play the same
+# LENGTH of game, and the advantage between them shows up where it should: in which of
+# the two runs out of health first.
+# Both fighters start from the same body, and the pet's stats are not consulted at all.
+# This is the whole design of the mode: strength, health, armour and level already decide
+# the arena, and letting them decide here too would make a card duel a second reading of
+# the same power rating with more taps. What differs between two players is their deck --
+# which base cards they draw, and which legendaries their bag put in among them.
+#
+# Fixing the numbers also fixes the CARD TEXT. Every card's damage is a multiple of
+# CARD_ATTACK, so "Удар 20" is 20 for everybody, on both sides of every duel: the deck can
+# be learned once instead of re-read against whoever is sitting opposite. That is worth
+# more to a card game than any amount of stat fidelity.
+#
+# 20 and 360 are measured, not picked: they hold a duel at about twelve turns between two
+# base decks (nine when both sides are deep in legendaries), which leaves a wide margin
+# under the engine's 40-turn limit. Health is 18 Strikes -- change one of these and the
+# other has to move with it, or the pacing goes with it.
+CARD_ATTACK = 20
+CARD_MAX_HP = 360
+
+
+def _card_items_for(record: dict) -> list[dict]:
+    """Every legendary in this pet's bag, flattened to what the engine needs.
+
+    The BAG, not the equipped slots: a card duel is the one place a legendary that lost
+    its slot to a better roll still gets to do something, and a deck built out of six
+    equipment slots would be four cards long for nearly everybody.
+
+    What is worn does not matter in either direction -- the stats behind `attack` and
+    `max_hp` already carry the equipment, so a legendary never counts twice.
+    """
+    rows = []
+    seen: set[str] = set()
+    for code in record.get("inventory") or ():
+        # One card per distinct legendary. Two copies of the same weapon in a bag are one
+        # card, or a duplicate-heavy collection would keep dealing itself the same
+        # finisher while the rest of the deck never came up.
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        item = C.find_item(code)
+        if item is None or item.rarity != "legendary":
+            continue
+        effect = item.effect if isinstance(item.effect, dict) else {}
+        rows.append({
+            "code": item.code,
+            "name": item.name,
+            "slot": item.slot,
+            "effect_code": str(effect.get("code") or ""),
+            "effect_text": str(effect.get("text") or item.description or ""),
+        })
+    rows.sort(key=lambda row: row["code"])
+    return rows
+
+
+def _card_scrolls_for(data: dict, record: dict, user_id: str) -> list[dict]:
+    """Every scroll this creature has ever found, flattened to what the engine needs.
+
+    The whole collection, exactly as the bag is read for legendaries -- not the four
+    equipped slots. A card duel has no loadout to build beforehand, and a collection of
+    thirty spells that could only ever play four of them would be a worse deck than no
+    spells at all.
+
+    Both halves are read off the store snapshot already in hand: the creature's own list
+    and the chat-wide scroll wallet, which is where a purchased or gifted scroll lands.
+    """
+    codes = list(pets._owned_scroll_codes_for(record))
+    try:
+        codes.extend(pets._scroll_wallet(data, user_id)["unlocked"])
+    except (KeyError, TypeError, AttributeError):
+        pass                               # a store written before the wallet existed
+    rows = []
+    for code in dict.fromkeys(codes):
+        row = pets_scroll_catalog.scroll(code)
+        if row is None:
+            continue
+        rows.append({
+            "code": row.get("code"),
+            "name": row.get("name"),
+            "icon": row.get("icon"),
+            "short": row.get("short"),
+            "ultimate": bool(row.get("ultimate")),
+            "effects": [dict(effect) for effect in row.get("effects") or ()],
+        })
+    rows.sort(key=lambda row: (not row["ultimate"], str(row["code"])))
+    return rows
+
+
+def _card_side(data: dict, record: dict, key: str) -> tuple[dict, list[dict]]:
+    """The fighter header and the deck for one side, from one already-loaded store.
+
+    The header is the same numbers for everyone (see CARD_ATTACK/CARD_MAX_HP); the record
+    supplies only the name on the health bar, the legendaries in the bag and the scrolls
+    in the collection.
+    """
+    fighter = {
+        "id": str(key),
+        "name": record.get("name") or "Существо",
+        "max_hp": CARD_MAX_HP,
+        "hp": CARD_MAX_HP,
+        "attack": CARD_ATTACK,
+    }
+    deck = pets_cardbattle.build_deck(
+        _card_items_for(record), CARD_ATTACK, CARD_MAX_HP,
+        scrolls=_card_scrolls_for(data, record, str(key)),
+    )
+    return fighter, deck
+
+
+def _card_portrait(record: dict, key: str, prefix: str) -> dict:
+    """What the duel screen draws above a health bar. The same portrait contract the
+    arena replay uses, so a face that works there works here."""
+    return {
+        "name": record.get("name") or "Существо",
+        "portrait": _portrait_url(prefix, key),
+        "crop": record.get("portrait_crop"),
+        "owner_name": record.get("owner_name"),
+        "kind": pets_sprite.cached_archetype(record) or pets_sprite.DEFAULT_ARCHETYPE,
+        "owner_id": str(key),
+    }
+
+
+def _card_battle_start_payload(
+    entry: str, me: str, opponent_id: str, prefix: str, seed: int,
+) -> tuple[dict | None, tuple[str, int, str] | None]:
+    """The whole blocking half of opening a duel: one store read, two decks, no writes."""
+    # The stake first: spend_card_duel re-reads and re-checks on its own, and refuses with
+    # the line to put on screen. Nothing below runs if the player cannot pay for the duel.
+    try:
+        pets.spend_card_duel(entry, me, opponent_id)
+    except ValueError as error:
+        return None, (str(error), 409, "CANNOT_FIGHT")
+
+    data = pets._load(entry)
+    mine = pets._tamed_record(data, me)
+    theirs = pets._tamed_record(data, opponent_id) if opponent_id else None
+    if mine is None:
+        return None, ("Сначала приручи существо.", 409, "NO_PET")
+    if theirs is None:
+        return None, ("Соперник больше не доступен.", 409, "NO_OPPONENT")
+
+    player, player_deck = _card_side(data, mine, me)
+    enemy, enemy_deck = _card_side(data, theirs, opponent_id)
+    state = pets_cardbattle.start(player, enemy, player_deck, enemy_deck, seed=seed)
+    return {
+        "state": state,
+        "faces": {
+            "player": _card_portrait(mine, me, prefix),
+            "enemy": _card_portrait(theirs, opponent_id, prefix),
+        },
+        "deck_size": {"player": len(player_deck), "enemy": len(enemy_deck)},
+        "legendaries": sum(1 for card in player_deck if card.get("source") == "item"),
+        "scrolls": sum(1 for card in player_deck if card.get("source") == "scroll"),
+        "attack": CARD_ATTACK,
+        "max_hp": CARD_MAX_HP,
+    }, None
+
+
+def _card_battle_settle(entry: str, me: str, opponent_id: str, battle: dict,
+                        xp: int, prefix: str) -> tuple[dict | None, dict | None]:
+    """Pay out one finished duel and hand back the state the result screen draws.
+
+    Kept whole in one worker: the settlement, the reward row and the state payload are all
+    blocking store work, and offloading only part of it would leave the rest on the event
+    loop where it delays everybody else's request.
+    """
+    winner = battle.get("winner")
+    winner_id = me if winner == "player" else (opponent_id if winner == "enemy" else None)
+    try:
+        reward = pets.record_card_duel(
+            entry, me, opponent_id, winner_id, draw=bool(battle.get("draw")),
+        )
+    except (ValueError, KeyError):
+        # The duel still ended and the screen still has to show its result; only the purse
+        # is lost. Far better than a 500 that hides the outcome of a fight already played.
+        return None, _state_payload(entry, me, xp, prefix, "arena")
+    return reward, _state_payload(entry, me, xp, prefix, "arena")
+
+
+def _prune_card_battles(app: web.Application) -> None:
+    sessions = app[_CARD_BATTLE_SESSIONS_KEY]
+    now = time.monotonic()
+    expired = [token for token, row in sessions.items()
+               if now - float(row.get("last_used", 0)) > CARD_BATTLE_SESSION_TTL]
+    for token in expired:
+        sessions.pop(token, None)
+    if len(sessions) > CARD_BATTLE_SESSION_LIMIT:
+        oldest = sorted(sessions, key=lambda token: sessions[token].get("last_used", 0))
+        for token in oldest[:len(sessions) - CARD_BATTLE_SESSION_LIMIT]:
+            sessions.pop(token, None)
+
+
+def _card_battle_response(session: dict, token: str) -> dict:
+    """One duel as the screen sees it. `pets_cardbattle.public` is what decides how much
+    of the opponent's deck goes out -- their announced turn, and nothing else."""
+    return {
+        "ok": True,
+        "session": token,
+        "battle": pets_cardbattle.public(session["battle"]),
+        "faces": session.get("faces") or {},
+        "deck_size": session.get("deck_size") or {},
+        "legendaries": session.get("legendaries", 0),
+        "scrolls": session.get("scrolls", 0),
+        "attack": CARD_ATTACK,
+        "max_hp": CARD_MAX_HP,
+    }
+
+
+async def handle_card_battle_start(request: web.Request) -> web.Response:
+    """Open a card duel against one opponent from the arena roster."""
+    started = time.monotonic()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, _xp = await _player(request, body)
+    if not await _is_member(request, user):
+        return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    paused = _paused_response()
+    if paused is not None:
+        return paused
+    # Only starting is refused: a duel already open when the switch flipped can still be
+    # played to its end and settled by the action route.
+    if not C.CARD_DUEL_OPEN:
+        return _json_error(C.CARD_DUEL_CLOSED_NOTICE, status=409, code="CARD_DUEL_CLOSED")
+
+    me = str(user["id"])
+    opponent_id = str(body.get("opponent_id") or "")
+    if not opponent_id or opponent_id == me:
+        return _json_error("Выбери соперника.", status=409, code="NO_OPPONENT")
+
+    payload, refusal = await asyncio.to_thread(
+        _card_battle_start_payload, request.app[_ENTRY_KEY], me, opponent_id,
+        request.app[_PREFIX_KEY], secrets.randbits(63),
+    )
+    if refusal is not None:
+        message, status, code = refusal
+        return _json_error(message, status=status, code=code)
+    assert payload is not None
+
+    _prune_card_battles(request.app)
+    token = secrets.token_urlsafe(18)
+    session = {
+        "owner": me, "entry": request.app[_ENTRY_KEY], "opponent": opponent_id,
+        "last_used": time.monotonic(), "battle": payload["state"],
+        "faces": payload["faces"], "deck_size": payload["deck_size"],
+        "legendaries": payload["legendaries"], "scrolls": payload["scrolls"],
+    }
+    request.app[_CARD_BATTLE_SESSIONS_KEY][token] = session
+    return _ok(_card_battle_response(session, token), took=time.monotonic() - started)
+
+
+async def handle_card_battle_action(request: web.Request) -> web.Response:
+    """Play one card, or hand the turn over.
+
+    Both are pure dictionary work on a session already in memory, so an ordinary turn
+    reads nothing and needs no worker thread. The exception is the turn that ENDS the
+    duel: that one settles the stake, and the whole of that work is offloaded.
+    """
+    started = time.monotonic()
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+    user, xp = await _player(request, body)
+    if not await _is_member(request, user):
+        return _json_error("Драться могут только участники чата.", status=403, code="NOT_A_MEMBER")
+    _prune_card_battles(request.app)
+    me = str(user["id"])
+    token = str(body.get("session") or "")
+    session = request.app[_CARD_BATTLE_SESSIONS_KEY].get(token)
+    if session is None:
+        return _json_error("Карточный бой закончился или устарел.", status=404, code="NO_CARD_SESSION")
+    if session.get("owner") != me or session.get("entry") != request.app[_ENTRY_KEY]:
+        return _json_error("Это чужой карточный бой.", status=403, code="WRONG_CARD_OWNER")
+
+    action = str(body.get("action") or "")
+    try:
+        if action == "play":
+            battle = pets_cardbattle.play(session["battle"], str(body.get("card") or ""))
+        elif action == "end_turn":
+            battle = pets_cardbattle.end_turn(session["battle"])
+        else:
+            return _json_error("Неизвестный ход.", status=409, code="BAD_CARD_ACTION")
+    except ValueError as error:
+        return _json_error(str(error), status=409, code="BAD_CARD_ACTION")
+
+    session["battle"] = battle
+    session["last_used"] = time.monotonic()
+    response = _card_battle_response(session, token)
+
+    if battle.get("finished"):
+        # Settled exactly once. The session is dropped in the same breath, so a replayed
+        # or duplicated request cannot pay for the same duel twice -- the second one finds
+        # no session and gets a 404 rather than a second purse.
+        request.app[_CARD_BATTLE_SESSIONS_KEY].pop(token, None)
+        response["reward"], response["state"] = await asyncio.to_thread(
+            _card_battle_settle, request.app[_ENTRY_KEY], me, session.get("opponent") or "",
+            battle, xp, request.app[_PREFIX_KEY],
+        )
+    return _ok(response, took=time.monotonic() - started)
 
 
 def _opponents_payload(entry: str, me: str, prefix: str) -> dict:
@@ -3913,6 +4246,7 @@ def attach(
     # Ephemeral by design: a restart ends prototypes instead of ever writing a result to
     # the real pet store. Opaque tokens and ownership checks isolate simultaneous users.
     app[_TEST_BATTLE_SESSIONS_KEY] = {}
+    app[_CARD_BATTLE_SESSIONS_KEY] = {}
     # Strong references to in-flight sprite jobs. The event loop only holds a task
     # weakly, so without this the garbage collector is free to cancel a generation
     # halfway through and nothing would ever say why.
@@ -3945,6 +4279,8 @@ def attach(
         web.get(prefix + "/api/test-battle", handle_test_battle_setup),
         web.post(prefix + "/api/test-battle/start", handle_test_battle_start),
         web.post(prefix + "/api/test-battle/action", handle_test_battle_action),
+        web.post(prefix + "/api/card-battle/start", handle_card_battle_start),
+        web.post(prefix + "/api/card-battle/action", handle_card_battle_action),
         web.get(prefix + "/api/mob", handle_mob),
         web.post(prefix + "/api/mob", handle_mob_attack),
         web.get(prefix + "/api/shop", handle_shop),
@@ -4489,11 +4825,12 @@ PAGE_HTML = """<!doctype html>
   /* --------------------------------------------------------------- the tab bar */
   .tabs {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-    display: grid; grid-template-columns: repeat(8, 1fr);
+    /* One equal column per VISIBLE tab: the review tab is admin-only and a closed
+       feature's tab is hidden, so a fixed count would leave empty slots. */
+    display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
     background: var(--card); border-top: 1px solid var(--line);
     padding-bottom: env(safe-area-inset-bottom);
   }
-  .tabs.has-review { grid-template-columns: repeat(9, 1fr); }
   /* Nine tabs on a narrow phone leave each label about 36px wide. Shrinking the label
      rather than the icon keeps the row scannable: the glyph is what a thumb aims at. */
   @media (max-width: 400px) {
@@ -4559,6 +4896,7 @@ PAGE_HTML = """<!doctype html>
   @keyframes pressspin { to { transform: rotate(360deg); } }
   @media (prefers-reduced-motion: reduce) {
     .go, .chip, .dungeon-enemy, .foe, .mobcard button, .item, .slot { transition: none; }
+    .card.dealt { animation: none; }
     .pressed::after { animation: none; }
   }
   .dungeon { overflow: hidden; padding: 0; border-color: rgba(232,185,35,.45); }
@@ -4904,6 +5242,342 @@ PAGE_HTML = """<!doctype html>
   .tierchip.gold { color: var(--gold); }
   .tierchip.loss { color: var(--hp); }
   .pw { color: var(--gold); font-weight: 700; }
+
+  /* An arena row is now two buttons, not one: the whole left side opens the ordinary
+     duel, and the card button on the right opens the card one. They are wrapped rather
+     than nested because a <button> inside a <button> is not valid HTML -- the browser
+     closes the outer one early and the row falls apart. `.foe` itself keeps working
+     unchanged for the leaderboard and the boss picker, which still use it as a button. */
+  .foewrap { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: stretch; }
+  .foewrap.solo { grid-template-columns: 1fr; }
+  .foewrap + .foewrap { margin-top: 8px; }
+  .foewrap .foe { grid-template-columns: auto 1fr; height: 100%; }
+  /* The opponent's power, moved off the right edge to above their name. The same gold it
+     has always been, two sizes down: it is the number you glance at before choosing, not
+     one of the things you are choosing between. */
+  .foewrap .pw.above { display: block; font-size: 11px; line-height: 1.3; margin-bottom: 1px; }
+  .cardfight {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 2px; width: 62px; padding: 8px 4px; border: 1px solid var(--r-legendary);
+    border-radius: 12px; background: rgba(176,107,224,.12); color: var(--r-legendary);
+    font-size: 10px; font-weight: 700; line-height: 1.15; text-align: center;
+    touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+  }
+  .cardfight .ic { font-size: 19px; }
+  .cardfight:active:not(:disabled) { transform: scale(.96); filter: brightness(1.25); }
+  .cardfight:disabled { opacity: .4; }
+
+  /* ------------------------------------------------------------------- card duel */
+  /* The duel takes the whole screen. The HUD's wallet, level and fight counter are not
+     spent on this board and the banner that used to sit here said what the first turn
+     shows anyway -- both were height charged to every turn of every duel. */
+  body.induel { --hud: 0px; }
+  body.induel .hud { display: none; }
+  /* The tab bar goes with it. A duel is paid for the moment it opens, so a stray tap on a
+     tab must not be the way out of one; the exit in the top bar asks first. */
+  body.induel .tabs { display: none; }
+
+  /* One table, laid out the way the genre lays it out: the opponent and the turn they have
+     announced at the top, the player under them, the hand and the button under the thumb.
+     Fixed to the viewport rather than scrolled as a page, so nothing a turn is decided on
+     sits below the fold -- the stacked panels this replaced put the announced turn there,
+     under two and a half cards of a five-card hand. It still scrolls as a whole on a phone
+     too short to hold it, rather than clipping the button. */
+  .cardduel { position: fixed; inset: 0; z-index: 30; background: var(--bg);
+              display: flex; flex-direction: column; gap: 8px;
+              padding: calc(8px + env(safe-area-inset-top)) 12px
+                       calc(10px + env(safe-area-inset-bottom));
+              overflow-y: auto; overscroll-behavior: contain; }
+  .cardtop { flex: none; display: grid; grid-template-columns: 38px 1fr 38px;
+             align-items: center; }
+  .cardtop button { width: 36px; height: 36px; padding: 0; border-radius: 10px;
+                    border: 1px solid var(--line); background: var(--sunken); font-size: 15px;
+                    display: flex; align-items: center; justify-content: center; }
+  .cardtop button:last-child { justify-self: end; }
+  .cardturn { text-align: center; font-size: 12px; font-weight: 800; color: var(--muted);
+              letter-spacing: .08em; text-transform: uppercase; line-height: 1.25; }
+  /* The two piles, under the turn number: counted once a turn, so they share the top
+     bar instead of costing the player's panel a row the hand needs. */
+  .cardturn small { display: block; font-size: 10px; font-weight: 600; letter-spacing: 0;
+                    text-transform: none; }
+
+  /* The stage grows into whatever height the phone has, and the gap it grows is the
+     middle of the table: where a played card is held up before it is thrown. */
+  .cardstage { flex: 1 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  /* A faint line with crossed swords across the middle, so the space a tall phone leaves
+     there reads as the ground between two fighters rather than as a gap in the layout. It
+     is simply clipped away on a phone too short to leave any. */
+  .cardmid { flex: 1 1 0; min-height: 6px; overflow: hidden; display: flex;
+             align-items: center; gap: 10px; color: var(--muted); opacity: .45; }
+  .cardmid::before, .cardmid::after { content: ""; flex: 1; height: 1px;
+                                      background: linear-gradient(90deg, transparent, var(--line)); }
+  .cardmid::after { background: linear-gradient(90deg, var(--line), transparent); }
+  .cardmid span { font-size: 14px; line-height: 1; }
+  .cardmid.tight > span, .cardmid.tight::before, .cardmid.tight::after { display: none; }
+  .cardside { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 10px;
+              align-items: center; background: var(--card); border: 1px solid var(--line);
+              border-radius: 14px; padding: 9px 10px;
+              transition: border-color .25s, box-shadow .25s; }
+  /* Whose turn it is is said by the frame, in the colours every other fight in the game
+     already uses for the two sides -- not by a label somebody has to read. */
+  .cardside.player .who { color: var(--mine); }
+  .cardside.enemy .who { color: var(--foe); }
+  .cardside.player.acting { border-color: rgba(98,174,240,.6);
+                            box-shadow: 0 0 14px rgba(98,174,240,.16); }
+  .cardside.enemy.acting { border-color: rgba(217,138,90,.65);
+                           box-shadow: 0 0 14px rgba(217,138,90,.18); }
+  .cardside .av { width: 48px; height: 48px; border-radius: 12px; overflow: hidden;
+                  background: var(--sunken); flex: none; }
+  .cardside .av .shot, .cardside .av img { display: block; width: 100%; height: 100%;
+                                           object-fit: cover; }
+  /* Bigger faces where the phone has the height: the portraits are the players' own
+     painted miniatures, and a tall screen has nothing better to spend the room on. */
+  @media (min-height: 720px) {
+    .cardside .av { width: 54px; height: 54px; border-radius: 13px; }
+  }
+  .cardwho { min-width: 0; }
+  .cardhead { display: flex; align-items: center; gap: 8px; min-width: 0; }
+  .cardside .who { flex: 1; min-width: 0; font-weight: 700; font-size: 14px;
+                   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* Block is not a status -- it is gone again at the start of the next turn -- so it sits
+     on the health bar's own line rather than in the badge row, which is for what
+     survives. The bar grows a blue rim while it is up, the way a shield reads in the
+     genre: the hit lands on the rim first. */
+  .cardblock { flex: none; font-size: 12px; font-weight: 800; color: #fff; line-height: 1.5;
+               background: var(--r-rare); border-radius: 999px; padding: 0 8px; }
+  .cardblock:empty { display: none; }
+  .cardhp { position: relative; height: 16px; border-radius: 999px; margin-top: 5px;
+            background: rgba(0,0,0,.38); overflow: hidden; transition: box-shadow .2s; }
+  .cardside.blocked .cardhp { box-shadow: 0 0 0 2px var(--r-rare); }
+  .cardhp > i { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; }
+  /* Two layers: the red drops the moment a hit lands, and the pale one under it follows
+     a beat later -- so the size of a hit stays on screen long enough to be seen. */
+  .cardhp .trail { background: #f2b8be; transition: width .45s ease-in .32s; }
+  .cardhp .fill { background: var(--hp); transition: width .3s ease-out; }
+  /* The slice the forecast says goes if the turn ends now. Striped over the red rather
+     than cut out of it: it is a warning about the bar, not a change to it. */
+  .cardhp .ghost { width: 0; border-radius: 0;
+                   background: repeating-linear-gradient(135deg, rgba(255,255,255,.62) 0 3px,
+                                                         rgba(255,255,255,.08) 3px 7px);
+                   animation: cardghost 1.1s ease-in-out infinite alternate; }
+  @keyframes cardghost { from { opacity: .45; } to { opacity: 1; } }
+  /* Block layout on purpose: as a flex box the " / 360" after the bold number becomes its
+     own item, and a flex item drops its leading space. */
+  .cardnums { position: absolute; inset: 0; text-align: center; line-height: 16px;
+              font-size: 11px; font-weight: 700; color: #fff;
+              text-shadow: 0 1px 2px rgba(0,0,0,.8); font-variant-numeric: tabular-nums; }
+  .cardnums b { font-weight: 800; }
+  .cardstatus { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+  .cardstatus:empty { display: none; }
+  .cardstatus button { font-size: 11px; font-weight: 700; line-height: 1.45; color: var(--fg);
+                       border-radius: 999px; padding: 0 7px; border: 1px solid var(--line);
+                       background: var(--sunken); }
+  .cardside .av.hit { animation: cardhit .34s ease-out; }
+  @keyframes cardhit {
+    0%, 100% { transform: translateX(0); filter: none; }
+    20% { transform: translateX(-5px); filter: brightness(1.7) saturate(.4); }
+    45% { transform: translateX(4px); }
+    70% { transform: translateX(-2px); }
+  }
+  .cardside .av.ko { filter: grayscale(.85) brightness(.5); transform: rotate(-8deg);
+                     transition: filter .5s, transform .5s; }
+
+  /* The opponent's whole announced turn, as a row of tiles along the bottom of their own
+     panel: what each card mainly does and by how much. The whole card is one tap away;
+     the tiles are for reading a turn in the same glance as the bar it will cut into. */
+  .cardintent { grid-column: 1 / -1; margin-top: 3px; padding-top: 6px;
+                border-top: 1px dashed rgba(217,138,90,.3); }
+  .cardintent h3 { margin: 0 0 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
+  .cardintent.stunned .cardtiles { opacity: .4; }
+  .cardtiles { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cardtile { position: relative; width: 52px; height: 44px; padding: 0; color: var(--fg);
+              display: flex; flex-direction: column; align-items: center; justify-content: center;
+              gap: 2px; border-radius: 11px; border: 1px solid rgba(217,138,90,.5);
+              background: rgba(217,138,90,.10); touch-action: manipulation; }
+  .cardtile.r-legendary { border-color: var(--r-legendary); background: rgba(176,107,224,.14); }
+  .cardtile.r-magic { border-color: var(--r-rare); background: rgba(51,144,236,.12); }
+  .cardtile.r-ultimate { border-color: var(--xp); background: rgba(76,175,114,.12); }
+  .cardtile .ti { font-size: 16px; line-height: 1; }
+  .cardtile .tn { font-size: 12px; font-weight: 800; line-height: 1.1;
+                  font-variant-numeric: tabular-nums; }
+  .cardtile .tx { position: absolute; top: -6px; right: -6px; font-size: 10px; line-height: 1;
+                  padding: 2px 3px; border-radius: 999px; background: var(--bg);
+                  border: 1px solid var(--line); }
+
+  /* Energy as orbs rather than "2 / 3": a count read in the same glance as the cost
+     bubbles it is spent on, and green like them. On the player's name line, so it takes
+     no row of its own away from the hand. */
+  .cardenergy { flex: none; display: flex; align-items: center; gap: 3px; font-size: 13px;
+                font-weight: 800; color: var(--xp); }
+  .cardenergy i { width: 12px; height: 12px; border-radius: 50%;
+                  border: 2px solid var(--xp); opacity: .45; }
+  .cardenergy i.on { background: var(--xp); opacity: 1; box-shadow: 0 0 7px rgba(76,175,114,.55); }
+
+  /* The whole hand at once, three to a row -- never a sideways scroller that hides half
+     of it. No height cap of its own: with every card's rules printed on it, a hand can
+     be taller than a short phone, and then the whole table scrolls under the pinned
+     button rather than the hand scrolling inside it. min-height, so the block keeps its
+     size when the hand empties at the end of a turn: without it the page jumps at
+     exactly the moment the opponent's cards start flying. */
+  .cardhand { flex: none; display: flex; flex-direction: column; }
+  .cardrow { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px;
+             padding: 4px 3px 2px; min-height: 96px; overscroll-behavior: contain; }
+  .cardwait { flex: 1; align-items: center; justify-content: center; text-align: center;
+              color: var(--muted); font-size: 13px; font-style: italic; }
+  .cardempty { align-self: center; }
+
+  .card { flex: 0 0 calc((100% - 12px) / 3); max-width: 132px; min-height: 94px;
+          display: flex; flex-direction: column; gap: 3px; text-align: left;
+          background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 27px 7px 7px; position: relative; color: var(--fg);
+          touch-action: manipulation; -webkit-tap-highlight-color: transparent;
+          transition: transform .14s ease-out, box-shadow .14s ease-out, opacity .14s; }
+  .card.r-legendary { border-color: var(--r-legendary); box-shadow: 0 0 12px rgba(176,107,224,.28);
+                      background: linear-gradient(180deg, rgba(176,107,224,.16), var(--card) 55%); }
+  /* Magic reads as its own tier rather than borrowing the legendary purple: a scroll and
+     a legendary weapon are different things to hold and should not look alike. */
+  .card.r-magic { border-color: var(--r-rare); box-shadow: 0 0 10px rgba(51,144,236,.22);
+                  background: linear-gradient(180deg, rgba(51,144,236,.14), var(--card) 55%); }
+  .card.r-ultimate { border-color: var(--xp); box-shadow: 0 0 13px rgba(120,200,120,.26);
+                     background: linear-gradient(180deg, rgba(76,175,114,.16), var(--card) 55%); }
+  /* A card the turn cannot pay for is dimmed -- not so far that its rules stop being
+     readable -- and its cost goes red. Never disabled: a tap on it says why it will not
+     play, where a disabled button would just ignore the finger. */
+  .card.poor { opacity: .55; }
+  .card.poor .cardcost { background: var(--hp); color: #fff; }
+  .card:active:not(.poor) { transform: translateY(-3px); filter: brightness(1.2); }
+  /* Dealing a new hand. Each card turns face-up in place, a beat after the one before it,
+     so a turn opens with something to watch instead of five cards appearing at once. */
+  @keyframes carddeal {
+    from { opacity: 0; transform: translateY(16px) rotateY(84deg) scale(.94); }
+    to   { opacity: 1; transform: none; }
+  }
+  .card.dealt { animation: carddeal .34s cubic-bezier(.2,.75,.35,1) backwards;
+                transform-origin: 50% 60%; }
+  /* The cost sits in the corner the eye checks first, because it is the one number that
+     decides whether the rest of the card is an option at all this turn. */
+  .cardcost { position: absolute; top: 7px; left: 7px; width: 21px; height: 21px;
+              border-radius: 50%; background: var(--xp); color: #0f1720;
+              font-size: 12px; font-weight: 800; display: flex; align-items: center;
+              justify-content: center; }
+  .cardicon { position: absolute; top: 7px; right: 8px; font-size: 15px; }
+  .cardname { font-size: 12px; font-weight: 700; line-height: 1.2; overflow: hidden;
+              display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .cardtags { display: flex; flex-wrap: wrap; gap: 3px; }
+  .cardtags i { font-style: normal; font-size: 10px; font-weight: 700; line-height: 1.4;
+                border-radius: 5px; padding: 1px 5px; background: var(--sunken);
+                color: var(--accent); }
+  /* The rules text lives on the card itself, always: one tap plays a card, so what it
+     does has to be readable before that tap, not after it. */
+  .cardtext { font-size: 10px; line-height: 1.28; color: var(--muted); }
+
+  /* Over the button: what ending the turn now would cost. Pinned to the bottom edge: on
+     a phone too short for the whole table the hand scrolls under it, and the button a
+     turn ends with never leaves the screen. */
+  .cardbar { flex: none; display: grid; gap: 8px; position: sticky; bottom: 0; z-index: 2;
+             background: var(--bg); padding-top: 4px; }
+  /* ...with a short fade over its top edge, so a hand scrolled under it looks like it
+     carries on rather than like it was cut off. */
+  .cardbar::before { content: ""; position: absolute; left: 0; right: 0; top: -10px;
+                     height: 10px; pointer-events: none;
+                     background: linear-gradient(rgba(23,33,43,0), var(--bg)); }
+  .carddetail { min-height: 20px; font-size: 13px; line-height: 1.35; text-align: center;
+                color: var(--muted); }
+  .carddetail .harm { color: var(--hp); }
+  .carddetail .safe { color: var(--xp); }
+  .cardbtns { display: grid; gap: 8px; }
+  .cardbtns.one { grid-template-columns: 1fr; }
+  .cardbtns.two { grid-template-columns: 1fr 1fr; }
+  .cardbtns .go { min-height: 48px; font-size: 15px; }
+  /* Nothing left in the hand the turn can pay for: the button says so by breathing. */
+  .go.pulse { animation: cardpulse 1.3s ease-in-out infinite; }
+  @keyframes cardpulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(51,144,236,0); }
+    50%      { box-shadow: 0 0 0 5px rgba(51,144,236,.38); }
+  }
+
+  /* The end of a duel is the one moment worth a big word: it cost a fight and moved money. */
+  .cardresult { flex: none; border-radius: 14px; padding: 14px 12px 12px; text-align: center;
+                border: 1px solid var(--line); background: var(--card);
+                animation: rise .25s ease-out; }
+  .cardresult.win { border-color: var(--gold);
+                    background: linear-gradient(180deg, rgba(232,185,35,.18), var(--card) 70%); }
+  .cardresult.loss { border-color: rgba(224,82,96,.6);
+                     background: linear-gradient(180deg, rgba(224,82,96,.15), var(--card) 70%); }
+  .cardresult h2 { margin: 0; font-size: 24px; line-height: 1.2; }
+  .cardresult.win h2 { color: var(--gold); }
+  .cardresult .sub { font-size: 12px; color: var(--muted); margin: 3px 0 10px; }
+  .cardresult .note { font-size: 11px; color: var(--muted); margin-top: 7px; }
+  .cardreward { text-align: left; border-radius: 10px; background: var(--sunken);
+                padding: 7px 12px; margin-bottom: 12px; }
+  .cardreward .row { display: flex; justify-content: space-between; font-size: 13px;
+                     padding: 2px 0; }
+
+  /* The travelling copy of a played card. Fixed to the viewport rather than parented to
+     the row it came from, so it flies over the panels between it and the face it is aimed
+     at instead of being clipped by the first scroller it meets. Card-sized whatever it
+     came out of, with its rules text showing: the opponent's cards come out of tiles and
+     this is the one moment their text is on the table. */
+  .cardfly { position: fixed; left: 0; top: 0; z-index: 95; pointer-events: none;
+             transform-origin: 50% 50%; will-change: transform, opacity; }
+  .cardfly .card { width: 132px; max-width: none; min-height: 0; overflow: hidden;
+                   box-shadow: 0 14px 30px rgba(0,0,0,.5); }
+  /* What a card just did, said over the face it did it to. */
+  .cardfloat { position: fixed; z-index: 96; pointer-events: none; white-space: nowrap;
+               font-size: 19px; font-weight: 800; text-shadow: 0 2px 5px rgba(0,0,0,.8);
+               transform: translate(-50%, -50%); animation: cardfloat 1s ease-out both; }
+  .cardfloat.harm { color: #ff6b78; }
+  .cardfloat.heal { color: #6fdc92; }
+  .cardfloat.block { color: #8cc4ff; font-size: 16px; }
+  .cardfloat.status { color: var(--fg); font-size: 14px; }
+  @keyframes cardfloat {
+    0%   { opacity: 0; transform: translate(-50%, -30%) scale(.7); }
+    15%  { opacity: 1; transform: translate(-50%, -65%) scale(1.15); }
+    100% { opacity: 0; transform: translate(-50%, -190%) scale(1); }
+  }
+  /* A word in the middle of the table when the turn comes back to the player. */
+  .turnflash { position: fixed; left: 50%; z-index: 94; pointer-events: none;
+               transform: translate(-50%, -50%); padding: 7px 18px; border-radius: 999px;
+               background: rgba(0,0,0,.72); color: var(--mine); font-size: 14px;
+               font-weight: 800; letter-spacing: .05em; text-transform: uppercase;
+               animation: turnflash 1.1s ease-out both; }
+  @keyframes turnflash {
+    0%   { opacity: 0; transform: translate(-50%, -50%) scale(.85); }
+    18%  { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+    70%  { opacity: 1; }
+    100% { opacity: 0; }
+  }
+  /* A short phone: every part of the table a notch smaller, so a five-card hand and the
+     button under it still fit without scrolling. */
+  @media (max-height: 700px) {
+    .cardduel { gap: 6px; padding-top: calc(6px + env(safe-area-inset-top)); }
+    .cardtop button { width: 32px; height: 32px; }
+    .cardside { padding: 7px 9px; }
+    .cardside .av { width: 40px; height: 40px; border-radius: 10px; }
+    .cardintent { padding-top: 5px; }
+    .cardintent h3 { margin-bottom: 4px; }
+    .cardtiles { gap: 5px; }
+    .cardtile { width: 48px; height: 40px; }
+    .cardtile .ti { font-size: 15px; }
+    .card { min-height: 84px; padding-top: 27px; }
+    .cardbtns .go { min-height: 44px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .cardhp .ghost, .go.pulse, .cardside .av.hit { animation: none; }
+    .cardhp .trail, .cardhp .fill { transition: none; }
+  }
+
+  /* One card, read in full: an announced card tapped on its tile. */
+  .cardpeek { display: flex; justify-content: center; padding: 4px 0 2px; }
+  .cardpeek .card { flex: none; width: 220px; max-width: none; padding: 34px 12px 12px; }
+  .cardpeek .cardname { font-size: 15px; -webkit-line-clamp: 3; }
+  .cardpeek .cardtags i { font-size: 12px; }
+  .cardpeek .cardtext { font-size: 12px; }
+  .cardlog { max-height: 55vh; overflow-y: auto; font-size: 12px; line-height: 1.5; }
+  .cardlog div { padding: 2px 0; border-bottom: 1px solid var(--line); }
+  .cardlog div:last-child { border-bottom: 0; }
+  .cardlog .head { padding-top: 9px; border-bottom: 0; color: var(--muted); font-size: 10px;
+                   font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 
   /* ----------------------------------------------------------------------- quests
      A quest card is read once and then acted on in the real world hours later, so it is
@@ -5609,15 +6283,17 @@ PAGE_HTML = """<!doctype html>
   <section class="screen" id="scr-more" hidden></section>
 </main>
 
+<!-- Quests lead the bar: painting is the game's main thread, and the moderators' review
+     tab rides beside it. The page still opens on the hero, where a creature is made. -->
 <nav class="tabs" id="tabs">
+  <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
+  <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
   <button data-tab="hero" class="on"><span class="ic">🛡</span>Герой</button>
   <button data-tab="bag"><span class="ic">🎒</span>Сумка</button>
   <button data-tab="shop"><span class="ic">🛒</span>Лавка</button>
   <button data-tab="arena"><span class="ic">⚔️</span>Арена</button>
   <button data-tab="dungeon"><span class="ic">🏰</span>Данж</button>
-  <button data-tab="farm"><span class="ic">🌾</span>Ферма</button>
-  <button data-tab="quests"><span class="ic">📜</span>Квесты</button>
-  <button id="questReviewTab" data-tab="review" hidden><span class="ic">🛡</span>Проверка</button>
+  <button id="farmTab" data-tab="farm" hidden><span class="ic">🌾</span>Ферма</button>
   <button data-tab="more"><span class="ic">☰</span>Ещё</button>
 </nav>
 
@@ -5648,6 +6324,20 @@ let S = null;            // the server's state, verbatim -- never edited on the 
 let TAB = "hero";
 let SHOP = null, FOES = null, ROSTER = null;
 let TEST_SETUP = null, TEST_BATTLE = null, TEST_SESSION = null, TEST_MODE = null, TEST_BUSY = false;
+// The card duel, held exactly the way the turn-based test above is: the server owns
+// the deck, the shuffle and every rule, and these are only the last answer it gave.
+// CARD_LAST_FOE is who a rematch goes back to, so the result screen's second button
+// does not have to send the player to the roster to find the same name again.
+let CARD_BATTLE = null, CARD_SESSION = null, CARD_FACES = null, CARD_INFO = null,
+    CARD_BUSY = false, CARD_LAST_FOE = null, CARD_REWARD = null;
+// Which turn's hand has already been dealt on screen. Playing a card re-renders the same
+// turn, and re-running the deal on every tap would flip the whole hand back over.
+let CARD_DEALT_TURN = 0;
+// CARD_SHOWN is both fighters as last painted, which is what a hit is measured against.
+// CARD_LOG is the running record the server sends one action's worth of at a time.
+// CARD_PLAYBACK/CARD_SKIP/CARD_FLIGHT let a tap fast-forward the opponent's turn.
+let CARD_SHOWN = null, CARD_LOG = [], CARD_LOG_TURN = 1,
+    CARD_PLAYBACK = false, CARD_SKIP = false, CARD_FLIGHT = null;
 // Whether the farm tab is showing the meadow board instead of the farm/quarry panels.
 // Not derived from S.meadow.round alone: a FINISHED round stays in the store until the
 // next one starts, and that must read as "last result, still on screen" only while this
@@ -5716,6 +6406,7 @@ function haptic(kind) {
   if (!tg || !tg.HapticFeedback) return;
   if (kind === "ok") tg.HapticFeedback.notificationOccurred("success");
   else if (kind === "no") tg.HapticFeedback.notificationOccurred("error");
+  else if (kind === "hit") tg.HapticFeedback.impactOccurred("medium");
   else tg.HapticFeedback.selectionChanged();
 }
 
@@ -5926,7 +6617,9 @@ function levelUpPanel() {
       (short ? 'Нужно ' + up.cost + ' 💎 · есть ' + up.rubies
              : 'Поднять уровень · ' + up.cost + ' 💎') + '</button>' +
     (short ? "<div class='tiny muted' style='margin-top:7px;text-align:center'>" +
-             "Алмазы падают с мобов и добываются в карьере.</div>" : "") +
+             ((S.features || {}).farm ? "Алмазы падают с мобов и добываются в карьере."
+                                       : "Алмазы падают с мобов, с поляны и за квесты.") +
+             "</div>" : "") +
     '</div>';
 }
 
@@ -6175,12 +6868,23 @@ let ACH_ROWS = null;
 // farm shift, 🎫 digs the meadow. This row printed the farm reward with the meadow's 🎫,
 // which is why players kept arriving at the Поляна with an empty wallet. A ticket
 // achievement now pays -- and shows -- both.
+// How a "ticket" reward reads (quests, mobs): a farm ticket while the farm is open, a
+// meadow ticket while it is closed -- the server pays whichever (pets.grant_farm_ticket).
+function rewardTicket() {
+  return (S && (S.features || {}).farm)
+    ? { icon: "🎟", place: "ферма", to: "на ферму" }
+    : { icon: "🎫", place: "поляна", to: "на поляну" };
+}
+
 function achievementReward(row) {
   const bits = [];
   if (Number(row.rubies || 0)) bits.push("💎 " + Number(row.rubies));
   // Named, not just pictured. Three tickets share two icons across this game's screens,
   // and an unlabelled one is how the meadow reward went missing in the first place.
-  if (Number(row.farm_tickets || 0)) bits.push("🎟 " + Number(row.farm_tickets) + " ферма");
+  // The farm half is not paid while the farm is closed, so it is not promised either.
+  if (Number(row.farm_tickets || 0) && (S.features || {}).farm) {
+    bits.push("🎟 " + Number(row.farm_tickets) + " ферма");
+  }
   if (Number(row.farm_tickets || 0)) bits.push("🎫 " + Number(row.farm_tickets) + " поляна");
   if (Number(row.dungeon_tickets || 0)) bits.push("🎟 " + Number(row.dungeon_tickets) + " подземелье");
   return bits.join(" · ");
@@ -6267,7 +6971,16 @@ function renderDungeon() {
     box.innerHTML = '<div class="empty">Сначала нужно существо.</div>';
     return;
   }
-  box.innerHTML = dungeonPanel();
+  // The meadow lives here, below the entrance: its tickets drop in the dungeon, and it
+  // cannot be played during a run. A round with picks left keeps the whole screen, as it
+  // did on the old farm tab, so a spent ticket never goes unaccounted for.
+  const idle = !(S.dungeon || {}).active && !PHOENIX_END && !GATEKEEPER_END;
+  const meadow = S.meadow || {};
+  if (idle && (MEADOW_OPEN || (meadow.round && !meadow.round.finished))) {
+    renderMeadowScreen(box, meadow);
+    return;
+  }
+  box.innerHTML = dungeonPanel() + (idle ? meadowPanel(meadow) : "");
   paintShots(box);
 }
 
@@ -6641,15 +7354,24 @@ function personalPaintBonusText(target) {
 
 function personalPaintPanel() {
   const rows = (S.personal_paint && S.personal_paint.runes) || [];
-  if (!rows.length) return "";
+  const applied = (S.personal_paint && S.personal_paint.applied) || [];
+  if (!rows.length && !applied.length) return "";
   return '<div class="panel"><h2>🎨 Персональные руны · ' + rows.length + '</h2>' +
-    '<div class="small muted" style="margin-bottom:10px">Каждая хранит фото принятого покраса и применяется один раз только к своему типу. Для экипировки растут положительные статы, для хилки — лечение, для свитка — сила полезных чисел. Шансы и длительность не увеличиваются.</div>' +
-    '<div class="items">' + rows.map((rune) =>
+    '<div class="small muted" style="margin-bottom:10px">Каждая хранит фото принятого покраса и ставится только на свой тип. Для экипировки растут положительные статы, для хилки — лечение, для свитка — сила полезных чисел. Шансы и длительность не увеличиваются. Покрас можно снять, а при перековке или продаже вещи руна сама возвращается сюда. При подарке покрас пропадает — сначала сними его.</div>' +
+    (rows.length ? '<div class="items">' + rows.map((rune) =>
       '<button class="item r-rare" data-personalrune="' + esc(rune.id) + '">' +
       '<span class="art"><img src="' + esc(rune.image_url || "") + '" alt="" loading="lazy"><span class="flag">+30%</span></span>' +
       '<span class="nm">Руна · ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</span>' +
       '<span class="meta">Выбрать цель</span></button>'
-    ).join("") + '</div></div>';
+    ).join("") + '</div>' : '<div class="small muted">Свободных рун нет — все на вещах.</div>') +
+    (applied.length ? '<div style="margin-top:11px"><b class="small">Наложено · ' + applied.length + '</b>' +
+      applied.map((row) =>
+        '<div class="row spread" style="margin-top:6px;gap:8px">' +
+        '<span class="small"><img src="' + esc(row.image_url || "") + '" alt="" loading="lazy" style="width:28px;height:28px;object-fit:cover;border-radius:6px;vertical-align:middle"> ' +
+        esc(row.name || row.code) + '</span>' +
+        '<button class="go sec" style="width:auto;margin:0;padding:6px 10px" data-personalremove="' + esc(row.code) + '">↩️ Снять</button></div>'
+      ).join("") + '</div>' : '') +
+    '</div>';
 }
 
 function personalPaintCandidates(target) {
@@ -6674,7 +7396,7 @@ function openPersonalPaintRune(runeId) {
   const candidates = personalPaintCandidates(rune.target);
   sheet('<div class="hd"><img src="' + esc(rune.image_url || "") + '" alt=""><div><h3>🎨 Персональная руна</h3>' +
     '<div class="small muted">Цель: ' + esc(PERSONAL_TARGET_NAMES[rune.target] || rune.target) + '</div></div></div>' +
-    '<p class="small">После применения фото станет аватаркой цели; ' + esc(personalPaintBonusText(rune.target)) + '. Руна исчезнет; второй персональный покрас на ту же цель наложить нельзя.</p>' +
+    '<p class="small">После применения фото станет аватаркой цели; ' + esc(personalPaintBonusText(rune.target)) + '. Второй персональный покрас на ту же цель наложить нельзя. Покрас можно снять в любой момент — руна вернётся.</p>' +
     (candidates.length ? '<div class="items">' + candidates.map((target) => {
       const scroll = rune.target === "scroll";
       const art = scroll
@@ -6788,6 +7510,11 @@ function forgePanel() {
         '</b> · в сумке ' + recipe.available + '</div>' +
         (ingredients.length ? '<div class="tiny muted" style="margin:5px 0">Уйдут: ' +
           ingredients.map((item) => esc(item.name)).join(', ') + '</div>' : '') +
+        ((recipe.returned_paints || []).length ? '<div class="tiny gain" style="margin:5px 0">🎨 Покрас с ' +
+          recipe.returned_paints.map((code) => {
+            const item = (S.bag || []).find((row) => row.code === code);
+            return '«' + esc(item ? item.name : code) + '»';
+          }).join(', ') + ' вернётся в персональные руны.</div>' : '') +
         // Never disabled: the server only sends recipes that are ready to go. data-forgecursed
         // rides along so a tap on this exact recipe can't be mistaken for its ordinary twin.
         '<button class="go sec" data-reforge="' + recipe.rarity + '" data-forgeslot="' + recipe.slot + '" data-forgecursed="' + (recipe.cursed ? '1' : '') + '">' +
@@ -6941,6 +7668,7 @@ async function renderArena() {
   const box = $("scr-arena");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
   if (TEST_SETUP || TEST_BATTLE) { renderTestBattle(box); return; }
+  if (CARD_BATTLE) { renderCardBattle(box); return; }
   const arena = S.arena;
   if (!FOES || !MOBS) {
     box.innerHTML = '<div class="empty">Ищу соперников…</div>';
@@ -7476,7 +8204,7 @@ function showMobResult(data) {
                  "🪙" + money(reward.gold || 0), "✨" + Number(reward.xp || 0)];
   if (reward.rubies) parts.push("💎" + Number(reward.rubies));
   if (reward.rune && reward.rune.granted) parts.push("🔮" + reward.rune.element + " +" + Number(reward.rune.granted));
-  if (reward.farm_ticket) parts.push("🎟️ ферма +1");
+  if (reward.farm_ticket) parts.push(rewardTicket().icon + " " + rewardTicket().place + " +1");
   if (reward.dungeon_ticket) parts.push("🎫 подземелье +1");
   toast(parts.join(" · "), () => playDuel(data));
 }
@@ -7867,21 +8595,697 @@ function repeatTag(mark) {
     esc(mark.emoji || "") + " ×" + Number(mark.count) + "</span>";
 }
 
+// Two buttons on one row. The left one is the arena duel it has always been; the one on
+// the right opens a card duel against the same opponent. The power rating moved off the
+// right edge to sit above the name, small and still gold, to free that edge for the
+// second button -- a row that has to offer two fights cannot spend its widest column on
+// a number nobody taps.
+//
+// `canFight` gates the arena button only. A card duel spends nothing from the fight bank
+// and writes nothing, so an emptied bank and an opponent already fought today both leave
+// it open; the farm is the one thing that closes both, because a creature that is away
+// is away.
 function foeRow(foe, canFight) {
   const usable = canFight && foe.attackable;
   const repeats = foe.repeat_fights;
   const element = (((S.character_element || {}).choices || []).find(
     (row) => row.code === foe.element
   ) || {});
-  return '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
-    (usable ? "" : " disabled") + '>' +
-    '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
-    "<span><b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
-      "</span> " + (element.code ? esc(element.icon) + " " + esc(element.name) + " " : "") +
-      debuffTag(foe.debuff) + " " + repeatTag(repeats) +
-      "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
-      " · побед " + foe.wins + " из " + foe.fights + "</span></span>" +
-    "<span class='pw'>⚡ " + money(foe.power) + "</span></button>";
+  const cards = !((S.arena || {}).farming);
+  // Off entirely while the card duel is closed: no button, not a disabled one.
+  const cardDuel = Boolean((S.features || {}).card_duel);
+  return '<div class="foewrap' + (cardDuel ? "" : " solo") + '">' +
+    '<button class="foe' + (usable ? "" : " out") + '" data-foe="' + esc(foe.user_id) + '"' +
+      (usable ? "" : " disabled") + '>' +
+      '<span class="av">' + shot(foe.portrait, foe.crop) + "</span>" +
+      "<span><span class='pw above'>\u26a1 " + money(foe.power) + "</span>" +
+        "<b>" + esc(foe.name || "Существо") + "</b> <span class='muted small'>ур. " + foe.level +
+        "</span> " + (element.code ? esc(element.icon) + " " + esc(element.name) + " " : "") +
+        debuffTag(foe.debuff) + " " + repeatTag(repeats) +
+        "<br><span class='tiny muted'>" + esc(foe.owner_name || "") +
+        " · побед " + foe.wins + " из " + foe.fights + "</span></span></button>" +
+    (cardDuel
+      ? '<button class="cardfight" data-cardfoe="' + esc(foe.user_id) + '"' +
+        (cards ? "" : " disabled") + ' title="Карточный бой">' +
+        '<span class="ic">🃏</span>Карты</button>'
+      : "") + "</div>";
+}
+
+// ------------------------------------------------------------------------- card duel
+// A second way to fight the same opponent: played out of a hand instead of watched. The
+// server owns the deck, the shuffle and every rule (pets_cardbattle); everything here
+// draws the last state it sent back and posts one action at a time.
+
+// How a played card leaves the table. The player's own card lifts out of the hand into the
+// middle of the table and is thrown at the face it is aimed at. The opponent's is turned
+// over there first and HELD, because until then the player has only seen it as a tile.
+// The pause afterwards is what makes a three-card turn read as three separate blows
+// instead of one blur.
+const CARD_GROW_MS = 220, CARD_FLY_MS = 330, CARD_PAUSE_MS = 300;
+const CARD_REVEAL_MS = 260, CARD_HOLD_MS = 460;
+
+function reducedMotion() {
+  try { return window.matchMedia("(prefers-reduced-motion: reduce)").matches; }
+  catch (e) { return false; }
+}
+
+// A wait the player can cut short. The opponent's turn is several of these in a row, and a
+// player who has already read the plan should not have to sit through it (see CARD_SKIP).
+function wait(ms) {
+  return new Promise((done) => {
+    if (CARD_SKIP) { done(); return; }
+    setTimeout(done, ms);
+  });
+}
+
+// One card, either in the hand, in a flight, or read in full on its own. `playable` is
+// what turns it into a button -- a card in flight is the same markup with nothing to tap.
+// `deal` is the card's place in a freshly dealt hand, or -1 for a card that is already
+// on the table and must not flip again.
+function cardMarkup(card, playable, affordable, deal) {
+  const rows = (card.tags || []).map((row) => "<i>" + esc(row) + "</i>").join("");
+  const body =
+    '<span class="cardcost">' + Number(card.cost || 0) + "</span>" +
+    '<span class="cardicon">' + esc(card.icon || "🂠") + "</span>" +
+    '<span class="cardname">' + esc(card.name || "") + "</span>" +
+    (rows ? '<span class="cardtags">' + rows + "</span>" : "") +
+    (card.effect ? '<span class="cardtext">' + esc(card.effect) + "</span>" : "");
+  const tier = { legendary: " r-legendary", magic: " r-magic", ultimate: " r-ultimate" };
+  const kind = tier[card.rarity] || "";
+  const flip = Number(deal) >= 0
+    ? ' dealt" style="animation-delay:' + Number(deal) * 60 + 'ms'
+    : "";
+  if (!playable) return '<div class="card' + kind + flip + '">' + body + "</div>";
+  // One tap plays it. Dimmed when the turn cannot pay for it, but never disabled: the tap
+  // then says why nothing happened, where a disabled button would just ignore the finger.
+  return '<button class="card' + kind + (affordable ? "" : " poor") + flip +
+    '" data-cardplay="' + esc(card.uid || "") + '">' + body + "</button>";
+}
+
+// The one thing an announced card is mainly about, for the tile it is announced on: the
+// hit if it hits, otherwise the block, the heal or the first thing it puts on somebody.
+// Anything else it does is a small mark in the corner. The whole card is a tap away; the
+// tile is for reading the opponent's turn at a glance.
+function cardTile(card, index) {
+  const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
+  const icon = (key) => (meta[key] || {}).icon || "•";
+  const apply = Object.entries(card.apply || {});
+  const boost = Object.entries(card.boost || {});
+  let main = [card.icon || "🂠", ""];
+  const extra = apply.map((row) => icon(row[0])).concat(boost.map((row) => icon(row[0])));
+  if (card.damage) {
+    main = ["⚔️", card.damage + (card.hits > 1 ? "×" + card.hits : "")];
+    if (card.block) extra.unshift("🛡");
+  } else if (card.block) main = ["🛡", String(card.block)];
+  else if (card.heal) main = ["❤️", String(card.heal)];
+  else if (apply.length) { main = [icon(apply[0][0]), String(apply[0][1])]; extra.shift(); }
+  else if (boost.length) { main = [icon(boost[0][0]), "+" + boost[0][1]]; extra.shift(); }
+  else if (card.energy) main = ["⚡", (card.energy > 0 ? "+" : "") + card.energy];
+  else if (card.draw) main = ["🃏", "+" + card.draw];
+  const tier = { legendary: " r-legendary", magic: " r-magic", ultimate: " r-ultimate" };
+  return '<button class="cardtile' + (tier[card.rarity] || "") + '" data-cardpeek="' +
+    Number(index) + '" aria-label="' + esc(card.name || "") + '">' +
+    '<span class="ti">' + esc(main[0]) + '</span><span class="tn">' + esc(main[1]) + "</span>" +
+    (extra.length ? '<span class="tx">' + esc(extra.slice(0, 2).join("")) + "</span>" : "") +
+    "</button>";
+}
+
+// The parts of a fighter panel that change during a turn, kept as their own functions so
+// the flight animation can repaint just these without rebuilding the panel -- which would
+// throw away the health bar's width transition in the middle of a hit landing.
+function cardNums(fighter) {
+  return "<b>" + Number(fighter.hp || 0) + "</b> / " + Math.max(1, fighter.max_hp || 1);
+}
+
+function cardBlock(fighter) {
+  return fighter.block ? "🛡 " + Number(fighter.block) : "";
+}
+
+function cardHpPct(fighter) {
+  return Math.max(0, Math.min(100,
+    (100 * Number(fighter.hp || 0)) / Math.max(1, fighter.max_hp || 1)));
+}
+
+// Tappable, because the only other way to learn what 💔 means on a phone was a `title`
+// tooltip, and a touch screen never shows one.
+function cardBadges(fighter) {
+  const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
+  return Object.keys(fighter.status || {}).map((key) => {
+    const row = meta[key] || {};
+    return '<button data-cardstatus="' + esc(key) + '">' + esc(row.icon || "•") + " " +
+      esc(row.name || key) + " " + Number(fighter.status[key]) + "</button>";
+  }).join("");
+}
+
+// One fighter's panel: face, name, block, health bar, and whatever is stuck to them.
+// `extra` is what spans the panel's foot -- the opponent's announced turn on theirs --
+// and `badge` goes at the end of the name line: the player's energy. The bars are drawn
+// where they stood on screen before this render, so paintCardSide can slide them to
+// where they stand now.
+function cardSide(fighter, face, side, extra, acting, badge) {
+  const shown = cardHpPct((CARD_SHOWN && CARD_SHOWN[side]) || fighter);
+  return '<div class="cardside ' + esc(side) + (acting ? " acting" : "") +
+    (fighter.block ? " blocked" : "") + '" data-side="' + esc(side) + '">' +
+    '<span class="av">' + shot((face || {}).portrait, (face || {}).crop) + "</span>" +
+    '<div class="cardwho"><div class="cardhead"><span class="who">' +
+      esc(fighter.name || "—") + '</span><span class="cardblock">' + cardBlock(fighter) +
+      "</span>" + (badge || "") + "</div>" +
+      '<div class="cardhp"><i class="trail" style="width:' + shown + '%"></i>' +
+        '<i class="fill" style="width:' + shown + '%"></i><i class="ghost"></i>' +
+        '<span class="cardnums">' + cardNums(fighter) + "</span></div>" +
+      '<div class="cardstatus">' + cardBadges(fighter) + "</div>" +
+    "</div>" + (extra || "") + "</div>";
+}
+
+// Bring one panel up to `fighter`, and say over the face what changed since it was last
+// painted. Called after every render and after each of the opponent's cards lands, so the
+// difference is always exactly one card's worth (or one turn change's).
+function paintCardSide(side, fighter) {
+  const root = document.querySelector('.cardside[data-side="' + side + '"]');
+  if (!root || !fighter) return;
+  const before = CARD_SHOWN && CARD_SHOWN[side];
+  const width = cardHpPct(fighter) + "%";
+  for (const bar of root.querySelectorAll(".cardhp .fill, .cardhp .trail")) {
+    void bar.offsetWidth;       // commit the old width first, or there is nothing to animate
+    bar.style.width = width;
+  }
+  const nums = root.querySelector(".cardnums");
+  if (nums) nums.innerHTML = cardNums(fighter);
+  const block = root.querySelector(".cardblock");
+  if (block) block.textContent = cardBlock(fighter);
+  root.classList.toggle("blocked", Number(fighter.block || 0) > 0);
+  const status = root.querySelector(".cardstatus");
+  if (status) status.innerHTML = cardBadges(fighter);
+  if (before) cardImpact(root, before, fighter, side);
+  CARD_SHOWN = Object.assign({}, CARD_SHOWN || {});
+  CARD_SHOWN[side] = fighter;
+}
+
+// What a card just did to one fighter, over their face: the hit in red, healing in green,
+// block gained in blue, and each status that went up. Worked out from the two snapshots
+// either side of it, so it can only ever show what the server says happened. Block and
+// statuses running down are not announced -- that is the turn changing, not a card.
+function cardImpact(root, before, after, side) {
+  const floats = [];
+  const hp = Number(after.hp || 0) - Number(before.hp || 0);
+  const block = Number(after.block || 0) - Number(before.block || 0);
+  if (hp < 0) floats.push(["harm", "−" + (-hp)]);
+  else if (hp > 0) floats.push(["heal", "+" + hp]);
+  if (block > 0) floats.push(["block", "🛡 +" + block]);
+  const meta = (CARD_BATTLE && CARD_BATTLE.statuses) || {};
+  for (const key of Object.keys(after.status || {})) {
+    const grew = Number(after.status[key] || 0) - Number((before.status || {})[key] || 0);
+    if (grew > 0) floats.push(["status", ((meta[key] || {}).icon || "•") + " +" + grew]);
+  }
+  const face = root.querySelector(".av");
+  if (!face || !floats.length) return;
+  if (hp < 0) {
+    face.classList.remove("hit");
+    void face.offsetWidth;          // restart the shake if the last one is still running
+    face.classList.add("hit");
+    if (side === "player") haptic("hit");
+  }
+  if (reducedMotion()) return;
+  const box = face.getBoundingClientRect();
+  // Stacked one above the other rather than side by side: "🛡 +79" is wider than the face
+  // it rises from, and two of them next to each other overprint.
+  floats.forEach((row, index) => {
+    const node = document.createElement("div");
+    node.className = "cardfloat " + row[0];
+    node.textContent = row[1];
+    node.style.left = (box.left + box.width / 2) + "px";
+    node.style.top = (box.top + box.height / 2 + 12 - index * 24) + "px";
+    node.style.animationDelay = index * 90 + "ms";
+    document.body.appendChild(node);
+    setTimeout(() => node.remove(), 1150 + index * 90);
+  });
+}
+
+// The slice of each health bar that goes if the turn ends now, from the server's own dry
+// run of the opponent's turn (pets_cardbattle.forecast). It shrinks as block goes up.
+function paintForecast() {
+  const battle = CARD_BATTLE;
+  const future = battle && !battle.finished ? battle.forecast : null;
+  for (const side of ["player", "enemy"]) {
+    const ghost = document.querySelector('.cardside[data-side="' + side + '"] .cardhp .ghost');
+    if (!ghost) continue;
+    const fighter = battle.fighters[side] || {};
+    const after = future ? Number(future[side + "_hp"]) : NaN;
+    const lost = Number(fighter.hp || 0) - after;
+    if (!(lost > 0)) { ghost.style.width = "0"; continue; }
+    const max = Math.max(1, fighter.max_hp || 1);
+    ghost.style.left = (100 * Math.max(0, after)) / max + "%";
+    ghost.style.width = (100 * lost) / max + "%";
+  }
+}
+
+// The line over the end-turn button: what ending the turn now would cost, in the words
+// the decision needs.
+function cardForecastLine(battle) {
+  const future = battle.forecast;
+  if (!future) return "";
+  const lost = Number(battle.fighters.player.hp || 0) - Number(future.player_hp || 0);
+  if (future.outcome === "loss") return '<b class="harm">Этот ход тебя добьёт</b> — нужен блок или лечение';
+  if (future.outcome === "draw") return "Если закончить ход — ничья";
+  if (future.outcome === "win") return '<b class="safe">Соперник не переживёт свой ход</b>';
+  if (lost > 0) return 'Если закончить ход: <b class="harm">−' + lost + " HP</b>";
+  if (lost < 0) return 'Если закончить ход: <b class="safe">+' + (-lost) + " HP</b>";
+  return 'Если закончить ход: <b class="safe">без потерь</b>';
+}
+
+// The energy left this turn, one orb per point.
+function cardEnergy(battle) {
+  const energy = Number(battle.energy || 0);
+  const orbs = Math.min(8, Math.max(energy, Number(battle.max_energy || 0)));
+  let marks = "";
+  for (let i = 0; i < orbs; i++) marks += '<i class="' + (i < energy ? "on" : "") + '"></i>';
+  return '<span class="cardenergy" aria-label="Энергия ' + energy + '">⚡' + marks +
+    (energy > 8 ? " " + energy : "") + "</span>";
+}
+
+// Under the hand: the forecast, and the button that ends the turn.
+function cardActions(battle) {
+  const payable = battle.hand.some((card) => Number(card.cost || 0) <= Number(battle.energy || 0));
+  return '<div class="cardbar"><div class="carddetail">' + cardForecastLine(battle) + "</div>" +
+    '<div class="cardbtns one"><button class="go' + (payable ? "" : " pulse") +
+      '" data-cardbattle="end">⏭ Закончить ход</button></div></div>';
+}
+
+// What the duel came to, in place of the hand once it is over.
+function cardResult(battle) {
+  const won = battle.winner === "player";
+  const kind = battle.draw ? "draw" : won ? "win" : "loss";
+  const title = battle.draw ? "🤝 Ничья" : won ? "🏆 Победа" : "💀 Поражение";
+  const mine = battle.fighters.player, foe = battle.fighters.enemy;
+  const standing = battle.draw ? null : won ? mine : foe;
+  const sub = (standing
+    ? esc(standing.name || "") + ": " + Number(standing.hp || 0) + " / " +
+      Number(standing.max_hp || 0) + " HP · "
+    : "") + "ходов: " + Number(battle.turn || 0);
+  // A rematch is a new duel and costs a new arena fight, so the button says so and does
+  // not offer one the bank cannot pay for. A duel still open when the mode was closed
+  // plays to its end, but cannot rematch at all.
+  const arena = (S && S.arena) || {};
+  const left = arena.available == null ? null : Number(arena.available);
+  const again = Boolean((S.features || {}).card_duel);
+  return '<div class="cardresult ' + kind + '"><h2>' + title + '</h2><div class="sub">' +
+    sub + "</div>" + cardRewardPanel() +
+    '<div class="cardbtns ' + (again ? "two" : "one") + '">' +
+      (again
+        ? '<button class="go" data-cardbattle="again"' + (left === 0 ? " disabled" : "") +
+          ">🃏 Ещё раз</button>"
+        : "") +
+      '<button class="go sec" data-cardbattle="close">◀ На арену</button></div>' +
+    (again ? '<div class="note">' + (left === 0 ? "Бои арены кончились — подожди следующий."
+      : "Реванш стоит 1 бой арены" + (left == null ? "" : " · осталось " + left)) + "</div>" : "") +
+    "</div>";
+}
+
+// Which face a card is aimed at. Anything that deals damage travels to the other side;
+// everything else -- block, healing, energy, a card drawn -- stays home with whoever
+// played it, so a defensive turn does not read as an attack that missed.
+function cardTargetSide(card, caster) {
+  const other = caster === "player" ? "enemy" : "player";
+  return Number(card.damage || 0) > 0 ? other : caster;
+}
+
+function cardAvatar(side) {
+  return document.querySelector('.cardside[data-side="' + side + '"] .av');
+}
+
+// The middle of the table, where a card is held up before it is thrown.
+function cardStagePoint() {
+  const mid = $("cardMid");
+  const box = mid ? mid.getBoundingClientRect() : null;
+  if (box && box.width) return { x: box.left + box.width / 2, y: box.top + box.height / 2 };
+  return { x: window.innerWidth / 2, y: window.innerHeight / 2 };
+}
+
+// The flight itself. Resolves when the card has landed -- and resolves anyway if the
+// browser never reports the animation finished, because a duel that stops taking taps
+// over a missing animation event is far worse than one that skips a flourish.
+function flyCard(fromEl, targetEl, card) {
+  return new Promise((resolve) => {
+    if (!fromEl || !targetEl || reducedMotion() || CARD_SKIP) { resolve(); return; }
+    const from = fromEl.getBoundingClientRect();
+    const to = targetEl.getBoundingClientRect();
+    if (!from.width || !to.width) { resolve(); return; }
+    // The opponent's cards come out of the tiles under their name, and are turned over and
+    // held before they are thrown; the player's own, already read in the hand, only lift.
+    const reveal = Boolean(fromEl.closest(".cardintent"));
+
+    const ghost = document.createElement("div");
+    ghost.className = "cardfly";
+    ghost.style.opacity = "0";
+    ghost.innerHTML = cardMarkup(card, false, false);
+    document.body.appendChild(ghost);
+    const w = ghost.offsetWidth, h = ghost.offsetHeight;
+    // The original stays where it is but goes invisible, so the row it left does not
+    // reflow and shuffle every other card sideways in the middle of the flight.
+    fromEl.style.visibility = "hidden";
+
+    const stage = cardStagePoint();
+    const at = (x, y, scale, opacity, easing) => ({
+      transform: "translate(" + (x - w / 2) + "px," + (y - h / 2) + "px) scale(" + scale + ")",
+      opacity, easing,
+    });
+    const fx = from.left + from.width / 2, fy = from.top + from.height / 2;
+    const tx = to.left + to.width / 2, ty = to.top + to.height / 2;
+    const lift = reveal ? CARD_REVEAL_MS : CARD_GROW_MS;
+    const hold = reveal ? CARD_HOLD_MS : 0;
+    const total = lift + hold + CARD_FLY_MS;
+    const frames = [
+      Object.assign(at(fx, fy, from.width / w, reveal ? .5 : 1, "cubic-bezier(.2,.8,.3,1)"),
+                    { offset: 0 }),
+      Object.assign(at(stage.x, stage.y, 1.12, 1, "linear"), { offset: lift / total }),
+    ];
+    if (hold) {
+      frames.push(Object.assign(at(stage.x, stage.y, 1.12, 1, "cubic-bezier(.5,0,.8,.3)"),
+                                { offset: (lift + hold) / total }));
+    } else {
+      frames[1].easing = "cubic-bezier(.5,0,.8,.3)";
+    }
+    frames.push(Object.assign(at(tx, ty, .2, .15), { offset: 1 }));
+
+    let settled = false, run = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (CARD_FLIGHT === run) CARD_FLIGHT = null;
+      ghost.remove();
+      resolve();
+    };
+    try {
+      run = ghost.animate(frames, { duration: total, fill: "forwards" });
+      ghost.style.opacity = "";
+      CARD_FLIGHT = run;
+      run.addEventListener("finish", finish, { once: true });
+    } catch (e) { finish(); return; }
+    setTimeout(finish, total + 400);          // backstop, see above
+  });
+}
+
+// A word in the middle of the table when the turn comes back to the player. The deal says
+// it too, but only to somebody looking at the hand; this is for somebody looking at the
+// faces, where the opponent's turn has just been playing out.
+function turnFlash(text) {
+  if (reducedMotion()) return;
+  const old = document.querySelector(".turnflash");
+  if (old) old.remove();
+  const node = document.createElement("div");
+  node.className = "turnflash";
+  node.textContent = text;
+  node.style.top = cardStagePoint().y + "px";
+  document.body.appendChild(node);
+  setTimeout(() => node.remove(), 1200);
+}
+
+// The hand's own block, kept at its height and relabelled while the opponent acts. It is
+// the same piece of screen their cards are about to fly across, and letting it collapse
+// would jump the page at exactly the wrong moment.
+function showOpponentTurn() {
+  const hand = $("cardHand");
+  if (hand) {
+    hand.style.minHeight = hand.offsetHeight + "px";
+    hand.innerHTML = '<div class="cardrow cardwait">Ход соперника… нажми, чтобы ускорить</div>';
+  }
+  // Disabled, and without the in-flight spinner the tap put on it: the wait from here on
+  // is the opponent's cards, which are on screen, not a request.
+  const end = document.querySelector('[data-cardbattle="end"]');
+  if (end) { end.disabled = true; end.classList.remove("pulse", "pressed"); }
+  const line = document.querySelector(".carddetail");
+  if (line) line.innerHTML = "";
+  // The forecast is about the turn now playing out, so it gives way to the real thing.
+  for (const ghost of document.querySelectorAll(".cardhp .ghost")) ghost.style.width = "0";
+  // Said by the frame moving to the opponent's panel, not by a word in the middle: the
+  // middle of the table is where their first card is about to be turned over.
+  for (const side of document.querySelectorAll(".cardside")) {
+    side.classList.toggle("acting", side.dataset.side === "enemy");
+  }
+}
+
+function renderCardBattle(box) {
+  const battle = CARD_BATTLE;
+  const faces = CARD_FACES || {};
+  const mine = battle.fighters.player;
+  const foe = battle.fighters.enemy;
+  const over = battle.finished;
+  const intent = battle.enemy_intent || [];
+  // A hand is dealt once per turn. Re-rendering the same turn (which every played card
+  // does) must not flip the remaining cards back over.
+  const dealing = battle.turn !== CARD_DEALT_TURN;
+  const stunned = Number((foe.status || {}).stun || 0) > 0;
+
+  // The opponent's whole announced turn sits on the opponent's own panel -- where the
+  // genre puts it, and in the same glance as the bar it is about to cut into. As a row of
+  // small tiles it no longer pushes the hand down, which was the reason it used to go
+  // below the hand and, with it, below the fold.
+  const plan = over ? "" :
+    '<div class="cardintent' + (stunned ? " stunned" : "") + '"><h3>Соперник в следующий ход' +
+      (stunned ? " · 💫 оглушён, пропустит" : "") + "</h3>" +
+      (intent.length
+        ? '<div class="cardtiles">' + intent.map(cardTile).join("") + "</div>"
+        : '<div class="tiny muted">Ничего не сыграет — карт не осталось.</div>') +
+    "</div>";
+
+  // Order matters here: the hand sits directly under the player's panel, because that is
+  // both where it is reachable without scrolling and where the flight to either face is
+  // short enough to stay on screen end to end.
+  box.innerHTML = '<div class="cardduel" id="cardDuel">' +
+    '<div class="cardtop">' +
+      '<button data-cardbattle="' + (over ? "close" : "leave") + '" aria-label="Выйти">✕</button>' +
+      '<span class="cardturn">' + (over ? "Бой окончен" : "Ход " + Number(battle.turn) +
+        // Only counted: the order of the draw pile is the server's.
+        "<small>Колода " + Number(battle.deck.draw) + " · Сброс " +
+        Number(battle.deck.discard) + "</small>") + "</span>" +
+      '<button data-cardbattle="log" aria-label="Ход боя">📜</button>' +
+    "</div>" +
+    '<div class="cardstage" id="cardStage">' +
+      cardSide(foe, faces.enemy, "enemy", plan, false) +
+      '<div class="cardmid" id="cardMid"><span>⚔️</span></div>' +
+      cardSide(mine, faces.player, "player", "", !over, over ? "" : cardEnergy(battle)) +
+    "</div>" +
+    (over
+      ? cardResult(battle)
+      : '<div class="cardhand" id="cardHand"><div class="cardrow">' +
+          (battle.hand.length
+            ? battle.hand.map((card, index) => cardMarkup(
+                card, true, card.cost <= battle.energy, dealing ? index : -1)).join("")
+            : "<div class='tiny muted cardempty'>Рука пуста.</div>") +
+        "</div></div>" + cardActions(battle)) +
+    "</div>";
+  paintShots(box);
+  paintCardSide("enemy", foe);
+  paintCardSide("player", mine);
+  paintForecast();
+  const mid = $("cardMid");
+  if (mid) mid.classList.toggle("tight", mid.offsetHeight < 30);
+  if (over && !battle.draw) {
+    const fallen = cardAvatar(battle.winner === "player" ? "enemy" : "player");
+    if (fallen) fallen.classList.add("ko");
+  }
+  if (dealing && !over) turnFlash("Ход " + Number(battle.turn));
+  CARD_DEALT_TURN = battle.turn;
+}
+
+// What the duel actually paid, shown once it is over. A card duel costs a real arena
+// fight and moves real money, so the result cannot be left to the wallet quietly
+// changing behind the HUD -- which this screen hides anyway.
+function cardRewardPanel() {
+  const paid = CARD_REWARD;
+  if (!paid) return "";
+  const rows = [];
+  const line = (label, value) => rows.push("<div class='row'><span>" + label +
+    "</span><b>" + value + "</b></div>");
+  if (paid.gold) line("💰 Награда", "+" + money(paid.gold));
+  if (paid.transfer_gold) line("🪙 Снято с соперника", "+" + money(paid.transfer_gold));
+  if (paid.loss_gold) line("🪙 Ушло сопернику", "−" + money(paid.loss_gold));
+  if (paid.transfer_rubies) line("💎 Снято с соперника", "+" + Number(paid.transfer_rubies));
+  if (paid.loss_rubies) line("💎 Ушло сопернику", "−" + Number(paid.loss_rubies));
+  if (paid.xp) line("✨ Опыт", "+" + money(paid.xp));
+  if (paid.levels_gained) line("⬆️ Уровень", "+" + Number(paid.levels_gained));
+  if (!rows.length) line("Ничья", "без выплат");
+  return '<div class="cardreward">' + rows.join("") + "</div>";
+}
+
+// The server answers each action with that action's lines only. Kept here as one running
+// record, a heading per turn, for the log sheet.
+function cardLogAdd(battle) {
+  for (const text of battle.log || []) CARD_LOG.push({ text });
+  const turn = Number(battle.turn || 1);
+  if (turn > CARD_LOG_TURN && !battle.finished) CARD_LOG.push({ head: "Ход " + turn });
+  CARD_LOG_TURN = Math.max(CARD_LOG_TURN, turn);
+  if (CARD_LOG.length > 300) CARD_LOG.splice(0, CARD_LOG.length - 300);
+}
+
+function showCardLog() {
+  const info = CARD_INFO || {};
+  sheet('<h3>📜 Ход боя</h3><div class="cardlog" id="cardLog">' +
+      (CARD_LOG.map((row) => row.head
+        ? '<div class="head">' + esc(row.head) + "</div>"
+        : "<div>" + esc(row.text) + "</div>").join("") ||
+        "<div class='muted'>Пока ничего не произошло.</div>") +
+    "</div>" +
+    "<div class='tiny muted' style='margin-top:9px;text-align:center'>" +
+      "Колода: " + Number((info.deck_size || {}).player || 0) + " карт · 🟣 " +
+      Number(info.legendaries || 0) + " · 📜 " + Number(info.scrolls || 0) +
+      " · у обоих " + Number(info.max_hp || 0) + " HP и удар " +
+      Number(info.attack || 0) + "</div>" +
+    '<div class="acts"><button class="go sec" data-cardbattle="shut">Закрыть</button></div>');
+  const log = $("cardLog"); if (log) log.scrollTop = log.scrollHeight;
+}
+
+// One announced card, in full.
+function peekEnemyCard(index) {
+  const intent = (CARD_BATTLE && CARD_BATTLE.enemy_intent) || [];
+  const card = intent[index];
+  if (!card) return;
+  sheet('<div class="cardpeek">' + cardMarkup(card, false, false, -1) + "</div>" +
+    "<div class='small muted' style='text-align:center;margin-top:8px'>Соперник сыграет её " +
+      (intent.length > 1 ? (index + 1) + "-й из " + intent.length + " " : "") +
+      "в свой ход, по порядку.</div>" +
+    '<div class="acts"><button class="go sec" data-cardbattle="shut">Понятно</button></div>');
+}
+
+function cardStatusHint(key) {
+  const row = ((CARD_BATTLE && CARD_BATTLE.statuses) || {})[key];
+  if (row) toast(row.icon + " " + row.name + ": " + row.hint);
+}
+
+// Leaving a duel in the middle throws away the arena fight it was paid with and pays
+// nothing, and the button for it sits a thumb's width from the end-turn button's old
+// place -- so it asks first. A finished duel has nothing left to lose and just closes.
+function confirmCardLeave() {
+  if (!CARD_BATTLE || CARD_BATTLE.finished) { closeCardBattle(); return; }
+  sheet("<h3>Выйти из боя?</h3>" +
+    "<p class='small muted' style='margin:6px 0 0'>Бой уже оплачен боем арены: выход его не " +
+      "вернёт, а за брошенный бой ничего не платят.</p>" +
+    '<div class="acts"><button class="go warn" data-cardbattle="close">Выйти</button>' +
+      '<button class="go sec" data-cardbattle="shut">Остаться в бою</button></div>');
+}
+
+function cardBattleState(data) {
+  CARD_BATTLE = data.battle;
+  CARD_SESSION = data.session;
+  CARD_FACES = data.faces || null;
+  CARD_INFO = { deck_size: data.deck_size, legendaries: data.legendaries,
+                scrolls: data.scrolls, attack: data.attack, max_hp: data.max_hp };
+  if (data.reward !== undefined) CARD_REWARD = data.reward;
+  cardLogAdd(CARD_BATTLE);
+  // The duel spent a fight and moved money, so the wallet and the fight counter behind
+  // this screen are both stale until the settlement hands back fresh state.
+  if (data.state) { S = data.state; FOES = null; }
+}
+
+// The shared tail of both actions: adopt the new state, say how it went, and repaint.
+function settleCardBattle(data) {
+  cardBattleState(data);
+  if (CARD_BATTLE.finished) {
+    haptic(CARD_BATTLE.winner === "player" ? "ok" : "no");
+    // The server drops the session the moment a duel ends, so keeping its token here
+    // would only earn a 404 on the next tap.
+    CARD_SESSION = null;
+  } else haptic();
+  render();
+}
+
+async function openCardBattle(opponentId) {
+  if (CARD_BUSY) return;
+  CARD_BUSY = true;
+  try {
+    CARD_REWARD = null; CARD_SHOWN = null;
+    CARD_LOG = []; CARD_LOG_TURN = 1;
+    CARD_DEALT_TURN = 0;                    // the opening hand deals itself
+    cardBattleState(await api("/api/card-battle/start", { opponent_id: opponentId }));
+    CARD_LAST_FOE = opponentId;
+    lockSwipes("cardduel");
+    document.body.classList.add("induel");
+    render();
+  } catch (e) { haptic("no"); toast(e.message); }
+  finally { CARD_BUSY = false; }
+}
+
+// One tap plays the card: its rules are printed on it, so there is nothing left to read
+// first. A card the turn cannot pay for says so instead of silently doing nothing.
+async function playCard(uid) {
+  if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
+  const card = (CARD_BATTLE.hand || []).find((row) => row.uid === uid);
+  if (!card) return;
+  if (Number(card.cost || 0) > Number(CARD_BATTLE.energy || 0)) {
+    haptic("no"); toast("Не хватает энергии на эту карту."); return;
+  }
+  CARD_BUSY = true;
+  const el = document.querySelector('.cardhand [data-cardplay="' + uid + '"]');
+  try {
+    // The flight and the request run together rather than one after the other, so the
+    // animation is what the wait for the server is spent on instead of being added to it.
+    const answers = await Promise.all([
+      api("/api/card-battle/action", { session: CARD_SESSION, action: "play", card: uid }),
+      flyCard(el, cardAvatar(cardTargetSide(card, "player")), card),
+    ]);
+    settleCardBattle(answers[0]);
+  } catch (e) {
+    if (el) el.style.visibility = "";        // the card never left: put it back
+    cardActionFailed(e);
+  } finally { CARD_BUSY = false; }
+}
+
+// A refused action. When what was refused is the duel itself -- its session ran out of
+// time, or a deploy restarted the server that held it -- there is no table left to play
+// on, so the screen closes instead of taking taps that can only fail the same way again.
+function cardActionFailed(error) {
+  haptic("no");
+  toast(error.message);
+  if (error.code === "NO_CARD_SESSION") closeCardBattle();
+  else render();
+}
+
+async function endCardTurn() {
+  if (!CARD_SESSION || CARD_BUSY || !CARD_BATTLE || CARD_BATTLE.finished) return;
+  CARD_BUSY = true;
+  try {
+    const data = await api("/api/card-battle/action",
+                           { session: CARD_SESSION, action: "end_turn" });
+    // What the opponent ACTUALLY resolved, which is not always what they announced -- a
+    // stun cancels the turn outright, and a killing blow cuts it short. Each entry brings
+    // both fighters as they stood right after that card, so a health bar drops as the
+    // card lands rather than everything settling at once when the turn is over.
+    const played = (data.battle && data.battle.enemy_played) || [];
+    if (played.length && !reducedMotion()) {
+      CARD_PLAYBACK = true;
+      showOpponentTurn();
+      const announced = document.querySelectorAll(".cardintent .cardtile");
+      for (let i = 0; i < played.length; i++) {
+        const row = played[i] || {};
+        await flyCard(announced[i], cardAvatar(cardTargetSide(row.card || {}, "enemy")),
+                      row.card || {});
+        paintCardSide("player", (row.fighters || {}).player);
+        paintCardSide("enemy", (row.fighters || {}).enemy);
+        await wait(CARD_PAUSE_MS);
+      }
+    }
+    settleCardBattle(data);
+  } catch (e) { cardActionFailed(e); }
+  finally { CARD_BUSY = false; CARD_PLAYBACK = false; CARD_SKIP = false; }
+}
+
+// A tap anywhere on the table while the opponent's turn plays out fast-forwards it: the
+// card in the air lands at once and the pauses after it are skipped. Capturing, so it runs
+// before the delegated handler and whatever was under the finger still gets its tap.
+document.addEventListener("click", (event) => {
+  if (!CARD_PLAYBACK || !event.target.closest(".cardduel")) return;
+  CARD_SKIP = true;
+  if (CARD_FLIGHT) { try { CARD_FLIGHT.finish(); } catch (e) {} }
+}, true);
+
+function closeCardBattle() {
+  CARD_BATTLE = null; CARD_SESSION = null; CARD_FACES = null; CARD_INFO = null;
+  CARD_REWARD = null; CARD_DEALT_TURN = 0; CARD_SHOWN = null;
+  CARD_LOG = [];
+  closeSheet();
+  unlockSwipes("cardduel");
+  document.body.classList.remove("induel");
+  render();
 }
 
 // ------------------------------------------------------------------------ farm screen
@@ -7914,12 +9318,6 @@ function figurinePanel(farm) {
 function renderFarm() {
   const box = $("scr-farm");
   if (!S.pet) { box.innerHTML = '<div class="empty">Сначала нужно существо.</div>'; return; }
-  const meadow = S.meadow || {};
-  // A round with picks left has no cancel action -- on purpose, so it keeps covering the
-  // whole farm tab across a re-render, a tab switch, or a reload rather than letting a
-  // ticket already spent quietly go unaccounted for. A FINISHED round does not force this
-  // open by itself: that would trap a fresh page load on last round's result forever.
-  if (MEADOW_OPEN || (meadow.round && !meadow.round.finished)) { renderMeadowScreen(box, meadow); return; }
   const farm = S.farm;
   if (!farm.level) {
     box.innerHTML = '<div class="panel"><h2>Ферма</h2>' +
@@ -8016,18 +9414,7 @@ function renderFarm() {
       'Зарядов кирки: ' + (quarry.pickaxe_unlimited ? '∞' : (quarry.pickaxe_runs || 0)) +
       (quarry.pickaxe_upgraded ? ' · руническая · +50% ко всей добыче' : '') + '</div>' +
       pickaxeQuestNote + quarryControls + '</div>';
-  const meadowPanel = '<div class="panel"><h2>🌼 Поляна</h2>' +
-    '<div class="small muted">Копай клетки: под ними алмазы, суперприз или пусто. ' +
-    'Билеты падают со смен на ферме и из подземелья.</div>' +
-    '<div class="small muted" style="margin-top:4px">🎫 Билетов на поляну: ' + (meadow.tickets || 0) + '</div>' +
-    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">' +
-    (meadow.meadows || []).map((row) =>
-      '<button class="go sec" style="font-size:13px;padding:10px 6px" data-meadowstart="' + row.size + '"' +
-      (row.can_start ? '' : ' disabled') + '>' + esc(row.title) + '<br><span class="tiny muted">' +
-      row.side + '×' + row.side + ' · 💎' + row.diamonds + ' · ' + row.picks + ' попыток<br>🎫 ' +
-      row.tickets + '</span></button>'
-    ).join('') + '</div></div>';
-  box.innerHTML = shift + quarryPanel + meadowPanel +
+  box.innerHTML = shift + quarryPanel +
     '<div class="panel"><h2>Ферма · уровень ' + farm.level + " из " + farm.max_level + "</h2>" +
       '<div class="small muted">Пассивный доход: ' + money(passive.rate || 0) + " монет/час, накоплено " +
         money(passive.stored || 0) + " из " + money(passive.cap || 0) + "</div>" +
@@ -8061,9 +9448,27 @@ function featureName(key) { return FEATURE_NAMES[key] || key; }
 // and the layout, per pets_meadow.public_state.
 const MEADOW_CELL_ICON = { empty: "▪️", diamond: "💎", jackpot: "🏆", refill: "🔄" };
 
+// The meadow's entry panel on the dungeon screen. A round with picks left has no cancel
+// action -- on purpose, so it keeps covering the screen across a re-render, a tab switch,
+// or a reload. A FINISHED round does not force it open by itself: that would trap a fresh
+// page load on last round's result forever.
+function meadowPanel(meadow) {
+  return '<div class="panel"><h2>🌼 Поляна</h2>' +
+    '<div class="small muted">Копай клетки: под ними алмазы, суперприз или пусто. ' +
+    esc(meadow.ticket_sources || "") + '</div>' +
+    '<div class="small muted" style="margin-top:4px">🎫 Билетов на поляну: ' + (meadow.tickets || 0) + '</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">' +
+    (meadow.meadows || []).map((row) =>
+      '<button class="go sec" style="font-size:13px;padding:10px 6px" data-meadowstart="' + row.size + '"' +
+      (row.can_start ? '' : ' disabled') + '>' + esc(row.title) + '<br><span class="tiny muted">' +
+      row.side + '×' + row.side + ' · 💎' + row.diamonds + ' · ' + row.picks + ' попыток<br>🎫 ' +
+      row.tickets + '</span></button>'
+    ).join('') + '</div></div>';
+}
+
 function renderMeadowScreen(box, meadow) {
   const round = meadow.round;
-  if (!round) { MEADOW_OPEN = false; renderFarm(); return; }
+  if (!round) { MEADOW_OPEN = false; renderDungeon(); return; }
   const board = round.finished ? (round.board || []) : null;
   const cells = [];
   for (let index = 0; index < round.cells; index++) {
@@ -8095,7 +9500,7 @@ function renderMeadowScreen(box, meadow) {
 async function meadowStart(size) {
   const ok = await act("meadow_start", { size });
   // Opened only on success: a refusal (not enough tickets, a round still in progress)
-  // must land the player back on the ordinary farm screen with its message, not on an
+  // must land the player back on the ordinary dungeon screen with its message, not on an
   // empty board.
   if (ok) MEADOW_OPEN = true;
   render();
@@ -8764,8 +10169,8 @@ function rewardLine(reward) {
       "-м принятом квесте сложности 4–5</span>"
     : "";
   return "<span class='gain'>💰 " + money(reward.gold) + "</span> · " +
-    "<span class='gain'>✨ " + money(reward.xp) + "</span> · 🎟 " + (reward.tickets || 0) +
-    " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic +
+    "<span class='gain'>✨ " + money(reward.xp) + "</span> · " + rewardTicket().icon + " " +
+    (reward.tickets || 0) + " " + rewardTicket().to + " · 🎁 " + Math.round((reward.drop_chance || 0) * 100) + "%" + dungeonMagic +
     personalPaint + toolMasterwork + scroll;
 }
 
@@ -9048,7 +10453,7 @@ function reviewQueue(data) {
     (data.rewards || []).map((row) =>
       '<div class="rwrow"><span class="small">' + pips(row.difficulty) + "</span>" +
       ["gold", "xp", "tickets", "drop_chance"].map((field) =>
-        '<label class="tiny muted">' + ({ gold: "💰", xp: "✨", tickets: "🎟", drop_chance: "🎁" })[field] +
+        '<label class="tiny muted">' + ({ gold: "💰", xp: "✨", tickets: rewardTicket().icon, drop_chance: "🎁" })[field] +
         '<input class="rwin" type="number" step="' + (field === "drop_chance" ? "0.01" : "1") +
         '" value="' + row[field] + '" data-reward="' + field + '" data-level="' + row.difficulty +
         '"></label>').join("") + "</div>").join("") + "</div>";
@@ -9094,7 +10499,7 @@ const MAIL_TONES = { win: "win", loss: "loss", draw: "" };
 
 function mailFeed(rows) {
   if (!rows.length) {
-    return '<div class="empty">Пока пусто.<br>Здесь будут бои, смены на ферме и подарки.</div>';
+    return '<div class="empty">Пока пусто.<br>Здесь будут бои, квесты и подарки.</div>';
   }
   let out = "", day = null;
   for (const row of rows) {
@@ -9141,7 +10546,9 @@ function mailRow(row) {
   if (row.xp && (row.kind === "farm" || row.kind === "quest_ok")) {
     meta.push("<span class='gain'>+" + money(row.xp) + " ✨</span>");
   }
-  if (row.kind === "quest_ok" && row.tickets) meta.push("<span class='gain'>+" + row.tickets + " 🎟</span>");
+  if (row.kind === "quest_ok" && row.tickets) {
+    meta.push("<span class='gain'>+" + row.tickets + " " + rewardTicket().icon + "</span>");
+  }
   if (row.scroll_name && row.kind !== "scroll") {
     meta.push("<span class='find'>📜 " + esc(row.scroll_name) + "</span>");
   }
@@ -9234,13 +10641,15 @@ function openItem(code) {
       (item.locked || spareCopies < 1 ? ""
         : btn("💰 Продать · " + money(item.resale), "sell", item.code, "sec")) + "</div>");
     if (!item.locked && spareCopies > 0) actions.push(btn("🎁 Подарить", "gift", item.code, "sec"));
+    if (item.personal_paint) actions.push(btn("↩️ Снять покрас · руна вернётся", "unpaint", item.code, "sec"));
   }
   if (!item.owned && item.source === "shop") {
     actions.push('<button class="go" data-act="buy" data-code="' + esc(item.code) + '"' +
       (affordable(item.price) ? "" : " disabled") + ">Купить · " + money(item.price) + "</button>");
   }
   if (!item.owned && item.source === "drop") {
-    actions.push('<div class="small muted">Такое не продаётся — только выпадает в бою или на ферме.</div>');
+    actions.push('<div class="small muted">Такое не продаётся — только выпадает в бою' +
+      ((S.features || {}).farm ? ' или на ферме' : ' или за квесты') + '.</div>');
   }
 
   sheet(
@@ -9321,6 +10730,29 @@ function btn(label, action, argument, kind) {
     esc(argument) + '">' + label + "</button>";
 }
 
+// Telegram reads a vertical drag inside the web view as "collapse the Mini App", and
+// two things here need that gesture for themselves: a bottom sheet's own scroller, and
+// the card duel, whose hand and intent row are sideways scrollers -- a finger that starts
+// on a card and moves down never scrolls them, so without this the whole swipe goes
+// straight to Telegram and drags the window down instead of the page.
+//
+// Counted by reason rather than toggled on and off, because the two can overlap: a sheet
+// opened during a duel and then closed must not hand the gesture back while the duel is
+// still on screen. Nothing outside these two functions may call the Telegram methods
+// directly -- that is what the pairing depends on, and a test enforces it.
+const SWIPE_LOCKS = new Set();
+
+function lockSwipes(reason) {
+  SWIPE_LOCKS.add(reason);
+  try { if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+}
+
+function unlockSwipes(reason) {
+  SWIPE_LOCKS.delete(reason);
+  if (SWIPE_LOCKS.size) return;         // something else still wants the gesture
+  try { if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (e) {}
+}
+
 function sheet(html, extraClass) {
   closeSheet();
   const veil = document.createElement("div");
@@ -9330,14 +10762,13 @@ function sheet(html, extraClass) {
   veil.innerHTML = '<div class="sheet' + sheetClass + '">' + html + "</div>";
   veil.addEventListener("click", (event) => { if (event.target === veil) closeSheet(); });
   document.body.appendChild(veil);
-  // Telegram otherwise treats an upward drag on a long bottom sheet as an attempt to
-  // collapse the Mini App. While a sheet is open, the drag belongs to its own scroller.
-  try { if (tg && tg.disableVerticalSwipes) tg.disableVerticalSwipes(); } catch (e) {}
+  // While a sheet is open the drag belongs to its own scroller, not to Telegram.
+  lockSwipes("sheet");
 }
 function closeSheet() {
   const v = $("veil");
   if (v) v.remove();
-  try { if (tg && tg.enableVerticalSwipes) tg.enableVerticalSwipes(); } catch (e) {}
+  unlockSwipes("sheet");
 }
 
 // A rare item is worth a second look before it is gone -- the same rule pets.py enforces
@@ -9354,7 +10785,12 @@ async function giftPicker(code) {
   if (!ROSTER) ROSTER = await api("/api/leaderboard");
   const others = ROSTER.rows.filter((row) => row.user_id !== ROSTER.me);
   if (!others.length) { toast("Некому дарить — больше ни у кого нет существа."); return; }
-  sheet("<h3>Кому подарить?</h3>" + others.map((row) =>
+  // Melting or selling hands a paint's rune back; a gift of the last copy does not.
+  const item = (S.bag || []).find((row) => row.code === code);
+  const losesPaint = item && item.personal_paint && Number(item.count || 1) <= 1;
+  sheet("<h3>Кому подарить?</h3>" +
+    (losesPaint ? '<p class="small loss">🎨 На этой вещи твой персональный покрас. При подарке он пропадёт — руна не вернётся. Чтобы сохранить руну, сначала сними покрас.</p>' : "") +
+    others.map((row) =>
     '<button class="go sec" style="margin-bottom:8px" data-gift="' + esc(row.user_id) + '" ' +
     'data-code="' + esc(code) + '">' + esc(row.owner_name || row.name) + "</button>").join(""));
 }
@@ -9967,6 +11403,11 @@ function render() {
   } else if (bar) {
     bar.remove();
   }
+  // A closed farm has no tab. Somebody who was standing on it when the switch flipped
+  // lands on the dungeon, which is where the meadow moved to.
+  const farmOpen = Boolean(S && (S.features || {}).farm);
+  $("farmTab").hidden = !farmOpen;
+  if (TAB === "farm" && !farmOpen && S) TAB = "dungeon";
   for (const name of ["hero", "bag", "shop", "arena", "dungeon", "farm", "quests", "more"]) {
     $("scr-" + name).hidden = name !== TAB;
   }
@@ -10060,11 +11501,11 @@ $("hudCreate").addEventListener("click", () => {
 // or a duplicated one behind.
 const CLICKABLE = "[data-item],[data-slot],[data-up],[data-do],[data-act]," +
     "[data-elementset]," +
-    "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-more]," +
+    "[data-bagslot],[data-bagrarity],[data-bagsort],[data-shopslot],[data-foe],[data-arenaretry],[data-more]," +
     "[data-farmstart],[data-quarrystart],[data-meadowstart],[data-meadowpick],[data-feature],[data-gift],[data-equipnow],[data-shoptab],[data-replay],[data-deathreplay]," +
     "[data-quest],[data-questopen],[data-questreroll],[data-questgroup],[data-questidea],[data-questedit],[data-reviewideas],[data-accept],[data-reject],[data-queston],[data-mob],[data-mobfight],[data-reforge],[data-enchantpick],[data-enchantapply]," +
-    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
-    "[data-personalrune],[data-personalapply]," +
+    "[data-ach],[data-testbattle],[data-testmode],[data-testaction],[data-testcatalog],[data-cardfoe],[data-cardplay],[data-cardpeek],[data-cardstatus],[data-cardbattle],[data-bosstest],[data-liveskill],[data-liveskillset],[data-audithours],[data-statsdays],[data-statsmetric]," +
+    "[data-personalrune],[data-personalapply],[data-personalremove]," +
     "[data-congratulate],[data-birthdayset],[data-birthdayclear],[data-peek]," +
     "[data-debuffpick],[data-debuffset],[data-debuffclear],[data-dungeon]," +
     "[data-grantpick],[data-grantset],[data-grantsign],[data-support],[data-maint],[data-claim]";
@@ -10159,6 +11600,21 @@ async function handleClick(event, target) {
   if (d.testmode) { await startTestBattle(d.testmode); return; }
   if (d.testaction) { await testBattleAction(d.testaction); return; }
   if (d.testcatalog !== undefined) { showTestCatalog(); return; }
+  if (d.cardfoe) { haptic(); await openCardBattle(d.cardfoe); return; }
+  if (d.cardplay) { await playCard(d.cardplay); return; }
+  if (d.cardpeek !== undefined) { peekEnemyCard(Number(d.cardpeek)); return; }
+  if (d.cardstatus) { cardStatusHint(d.cardstatus); return; }
+  if (d.cardbattle === "end") { await endCardTurn(); return; }
+  if (d.cardbattle === "leave") { confirmCardLeave(); return; }
+  if (d.cardbattle === "log") { showCardLog(); return; }
+  if (d.cardbattle === "shut") { closeSheet(); return; }
+  if (d.cardbattle === "close") { closeCardBattle(); return; }
+  if (d.cardbattle === "again") {
+    const foe = CARD_LAST_FOE;
+    closeCardBattle();
+    if (foe) await openCardBattle(foe);
+    return;
+  }
   if (d.liveskill) { openLiveSkillPicker(d.liveskill); return; }
   if (d.personalrune) { openPersonalPaintRune(d.personalrune); return; }
   if (d.personalapply) {
@@ -10166,6 +11622,7 @@ async function handleClick(event, target) {
     await act("apply_personal_paint", { rune_id: d.personalapply, code: d.personalcode });
     return;
   }
+  if (d.personalremove) { await act("remove_personal_paint", { code: d.personalremove }); return; }
   if (d.elementset) {
     closeSheet();
     await act("set_character_element", { element: d.elementset });
@@ -10328,6 +11785,7 @@ async function handleClick(event, target) {
                   () => act("sell", { code, confirm: true }));
     }
     else if (d.act === "gift") { closeSheet(); giftPicker(code); }
+    else if (d.act === "unpaint") { closeSheet(); await act("remove_personal_paint", { code }); }
     return;
   }
 
@@ -10468,7 +11926,10 @@ function tick() {
   if (S.pve && S.pve.seconds_until_reset) {
     S.pve.seconds_until_reset = Math.max(0, S.pve.seconds_until_reset - TIMER_TICK_SECONDS);
     if (!S.pve.seconds_until_reset) dirty = true;
-    else if (TAB === "arena") renderArena();
+    // A card duel covers the arena tab and shows none of these counters, so a
+    // minute passing must not repaint it: that would throw away the hand's
+    // sideways scroll position in the middle of somebody's turn.
+    else if (TAB === "arena" && !CARD_BATTLE) renderArena();
   }
   if (S.farm && S.farm.seconds_left) {
     S.farm.seconds_left = Math.max(0, S.farm.seconds_left - TIMER_TICK_SECONDS);

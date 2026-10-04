@@ -43,10 +43,10 @@ RESULTS_DIR = VOTING_DIR / "results"
 # imported lazily in collect_entries so this module stays importable on its own.
 CONTEST_HASHTAG = "#итогинедели"
 
-# A collection covers the CONTEST WEEK -- Monday 00:00 local through the moment of
-# collecting -- rather than a rolling number of days. Collecting happens on Sunday, and a
-# rolling window either misses the Monday-to-Friday posts or, run a day late, reaches back
-# into the previous week and pulls its works into the new poll.
+# A collection covers whole CONTEST WEEKS -- from Monday 00:00 local through the moment of
+# collecting -- rather than a rolling number of days. A rolling window's reach depends on
+# the day it is run, so the same button would find a different set of works on Sunday
+# than on Monday; a calendar boundary finds the same ones whenever it is pressed.
 CONTEST_WEEK_STARTS_ON = 0  # Monday, matching datetime.weekday()
 
 
@@ -150,39 +150,44 @@ async def collect_entries(
     media_dir: Path,
     hashtag: str = CONTEST_HASHTAG,
     skip_entry_ids=frozenset(),
-    weeks_ago: int = 0,
+    weeks: int = 1,
+    stop_at_known: bool = True,
     progress=None,
     log=print,
 ) -> list[Entry]:
-    """Reads one CONTEST WEEK of `chat_ref` and returns one Entry per NEWLY found nominated
-    post, downloading every attached photo into `media_dir`.
+    """Reads the last `weeks` CONTEST WEEKS of `chat_ref` and returns one Entry per NEWLY
+    found nominated post, downloading every attached photo into `media_dir`.
 
-    `weeks_ago` picks the week: 0 is the one in progress (Monday 00:00 local through now),
-    1 is the week before it -- closed at BOTH ends, Monday 00:00 through the following
-    Monday 00:00, so a poll for a finished week never swallows what has been posted since.
-    The Monday case is what it exists for: the voting for a week happens after that week is
-    over, and on Monday "this week" is a few hours old and empty.
+    `weeks` counts calendar weeks ending with the one in progress: 1 is Monday 00:00 local
+    through now, 2 reaches back to the Monday before that. /vote collects two -- the vote
+    is run around the turn of the week, so on a Monday the week in progress is a few hours
+    old and every work worth voting on sits in the week just ended, while on a Sunday it is
+    the other way round. Both weeks in one pass means the moderator never has to know which
+    of the two a work was posted in; they see all of it and admit what belongs.
 
-    The window is the week rather than a rolling span of days on purpose: collecting runs
-    on Sunday, so a rolling window is simultaneously too short (it misses everything posted
-    Monday through Friday) and, if collecting slips past midnight into Monday, too long --
-    it reaches back into the previous week and pulls its works into the new poll.
+    The window is whole weeks rather than a rolling span of days on purpose: a rolling
+    window's reach depends on the day it is run, so collecting a day late would quietly
+    drop the oldest day's works instead of finding the same set.
 
     `skip_entry_ids` -- entry ids (message ids, as strings) already known from a previous
-    collection -- do two things. They are never resolved further (no get_sender() round
-    trip, no photo download, no Entry built), and, more importantly, THE SCAN STOPS at the
+    collection -- are never resolved further: no get_sender() round trip, no photo
+    download, no Entry built. With `stop_at_known` (the default) THE SCAN ALSO STOPS at the
     first one it meets. The listing is newest-first, so everything past a work that was
-    already collected was already collected too; a re-collect that only wants today's
-    additions has no reason to read back to Monday. A first collection (no skip ids) still
-    reads the whole week.
+    already collected was collected too -- as long as the earlier collection read the same
+    window. A re-collect that only wants today's additions has no reason to read back to
+    Monday. A first collection (no skip ids) reads the whole window either way.
+
+    That "as long as" is why stopping is optional. It is wrong whenever the earlier
+    collection read LESS than this one: a poll collected for the week in progress holds
+    only this week's works, so a two-week collect that stops at the newest of them never
+    reaches the week before -- which is exactly how the first two-week collect in
+    production (2026-09-27) found two works from this week and none from last. It also
+    misses a post that gained the hashtag after it was first passed over (edited days
+    later). `stop_at_known=False` reads the whole window regardless and still skips the
+    known works, so it costs only the scan, never a second download.
 
     The caller is responsible for keeping those already-known entries around (see
     bot_listener.handle_vote_command) -- this function only ever reports what's new.
-
-    The cost of stopping early: a post that gained the hashtag AFTER it was first passed
-    over -- edited days later -- sits below the newest known work and is not picked up.
-    Clearing and collecting again finds it, and that is rarer than adding a few late
-    entries to a poll, which is the case this is for.
 
     Uses the Telethon session directly rather than telegram_fetch's cache: that cache
     stores plain text dicts, and this needs the media and the grouped_id, neither of which
@@ -196,10 +201,8 @@ async def collect_entries(
     # Shift "now" back whole weeks and take THAT week's Monday, rather than subtracting
     # days from the current Monday -- the two agree, and this one keeps working when the
     # shift crosses a DST change or a year boundary.
-    start_local = contest_week_start(now_local - timedelta(weeks=weeks_ago))
+    start_local = contest_week_start(now_local - timedelta(weeks=max(1, weeks) - 1))
     start_utc = start_local.astimezone(timezone.utc)
-    # A past week is closed at the far end too; the week in progress runs up to now.
-    end_utc = (start_local + timedelta(weeks=1)).astimezone(timezone.utc) if weeks_ago else None
 
     async def report(stage: str, done: int, total: int) -> None:
         """Tell the caller how far along this is, without letting that stop the scan.
@@ -220,37 +223,33 @@ async def collect_entries(
     await report("scan", 0, 0)
     async for message in client.iter_messages(entity, reverse=False):
         scanned += 1
-        # Counted on every message read, not on every message kept: collecting a PAST week
-        # walks back through the current one first, and progress that sat at zero for that
-        # whole stretch reads as a hung collection -- which is what the reporter is for.
+        # Counted on every message read, not on every message kept: two weeks of a busy
+        # chat is thousands of messages, most of them not nominations, and progress that
+        # sat still for that whole stretch reads as a hung collection -- which is what the
+        # reporter is for.
         if scanned % 250 == 0:
             await report("scan", scanned, 0)
         if message.date < start_utc:
             break
-        if end_utc is not None and message.date >= end_utc:
-            continue  # newer than the week being collected -- belongs to a different poll
         if message.action is not None:
             continue  # service message (join/leave/pin)
         messages.append(message)
         # Reaching a nomination that was already collected means everything below it was
         # too: the listing is newest-first, so a re-collect only has to walk back as far
         # as the first thing it recognises. Without this, adding one late entry re-read
-        # the whole week every time.
+        # the whole window every time. Only when asked -- see stop_at_known.
         #
         # The known message is kept rather than dropped, and the break happens after
         # appending it: in an album the entry id is the FIRST message's, which arrives
         # last here, so stopping before it would leave the album's other messages behind
         # as a headless group -- which reads as a brand-new nomination and gets collected
         # a second time.
-        if skip_entry_ids and str(message.id) in skip_entry_ids:
+        if stop_at_known and skip_entry_ids and str(message.id) in skip_entry_ids:
             stopped_at_known = True
             break
 
     groups = group_into_entries(messages, hashtag)
-    window = (
-        f"since {start_local.date()}" if end_utc is None
-        else f"for the week of {start_local.date()}"
-    )
+    window = f"since {start_local.date()}"
     log(
         f"[voting] {len(messages)} message(s) of {scanned} read "
         f"{'back to the first already-collected work' if stopped_at_known else window}"
@@ -385,6 +384,9 @@ class Poll:
     approved: list[str] = field(default_factory=list)
     # user_id (as a string, since JSON keys are strings) -> list of entry_ids.
     votes: dict[str, list[str]] = field(default_factory=dict)
+    # Whether the voter was subscribed when their latest ballot was accepted.  Keep the
+    # snapshot instead of inferring it later: the weekly figures need historical status.
+    subscriber_votes: dict[str, bool] = field(default_factory=dict)
     open: bool = True
     # Set once by close_and_announce, kept alongside the poll so a reloaded page (or a
     # second look days later) can still show who won without recomputing it from votes
@@ -416,6 +418,7 @@ class Poll:
             "entries": [e.to_dict() for e in self.entries],
             "approved": list(self.approved),
             "votes": {k: list(v) for k, v in self.votes.items()},
+            "subscriber_votes": {k: bool(v) for k, v in self.subscriber_votes.items()},
             "open": self.open,
             "winner_entry_id": self.winner_entry_id,
             "max_choices": self.max_choices,
@@ -425,13 +428,24 @@ class Poll:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Poll":
+        votes = {str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()}
+        raw_subscribers = raw.get("subscriber_votes")
+        # Before non-subscribers were allowed to vote, the web handler rejected them.
+        # Therefore every old recorded ballot was necessarily from a subscriber at the
+        # time; preserve that fact when adding the new snapshot field retroactively.
+        subscriber_votes = (
+            {str(k): bool(v) for k, v in raw_subscribers.items()}
+            if isinstance(raw_subscribers, dict)
+            else {voter_id: True for voter_id in votes}
+        )
         return cls(
             poll_id=str(raw.get("poll_id") or ""),
             entry=raw.get("entry") or "",
             created_at=raw.get("created_at") or "",
             entries=[Entry.from_dict(e) for e in raw.get("entries") or []],
             approved=[str(e) for e in raw.get("approved") or []],
-            votes={str(k): [str(e) for e in v] for k, v in (raw.get("votes") or {}).items()},
+            votes=votes,
+            subscriber_votes=subscriber_votes,
             open=bool(raw.get("open", True)),
             winner_entry_id=(str(raw["winner_entry_id"]) if raw.get("winner_entry_id") else None),
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
@@ -641,9 +655,9 @@ def make_current(poll: Poll) -> Poll:
     """Marks `poll` as the newest, which is how latest_poll breaks a tie in rank.
 
     `created_at` is what polls are ordered on, and "newest created" only means "the week
-    being worked on" while weeks are collected in order. Collecting the PREVIOUS week --
-    the Monday case, where the finished week is the one that still has to be voted on --
-    breaks that: its poll may well be older than the poll of the week just started.
+    being worked on" while weeks are collected in order. A re-collect into a poll created
+    days ago breaks that -- another week's poll written in between would outrank it -- and
+    so did the old "collect the previous week" button, whose polls may still be on disk.
 
     This only settles a tie. It cannot promote a week PAST a live ballot: a poll with no
     admitted works ranks below one that has them however recently it was collected (see
@@ -678,6 +692,11 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         user_id: [e for e in choices if e in known]
         for user_id, choices in existing.votes.items()
     }
+    poll.subscriber_votes = {
+        user_id: subscribed
+        for user_id, subscribed in existing.subscriber_votes.items()
+        if user_id in poll.votes
+    }
     poll.open = existing.open
     if existing.winner_entry_id in known:
         poll.winner_entry_id = existing.winner_entry_id
@@ -690,11 +709,11 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
     return poll
 
 
-# Works no longer roll over between weeks. A poll contains exactly what was nominated in
-# its own Monday-to-Sunday window, so the only way a work appears in a vote is that
-# somebody posted it that week. The carry-over that used to re-seed a new poll with last
-# week's runners-up was removed: it re-filled a poll the moderator had just cleared, which
-# made "clear, then collect" impossible to express.
+# Works are not carried over from another poll. A poll contains exactly what the chat
+# scan found in its collection window (the previous and the current contest week, see
+# collect_entries), so the only way a work appears in a vote is that somebody posted it
+# with the hashtag in that window -- nothing is copied out of an older poll's file. The
+# carry-over that used to re-seed a new poll with last week's runners-up was removed.
 
 
 def set_approved(poll: Poll, entry_ids: list[str]) -> Poll:
@@ -705,14 +724,88 @@ def set_approved(poll: Poll, entry_ids: list[str]) -> Poll:
     return poll
 
 
-def record_vote(poll: Poll, user_id: int | str, entry_ids: list[str]) -> Poll:
+def record_vote(
+    poll: Poll, user_id: int | str, entry_ids: list[str], subscriber: bool | None = None,
+) -> Poll:
     """One ballot per user, replacing whatever they chose before -- voting again is
     changing your mind, not stuffing the box. Choices outside the admitted set are dropped
     rather than rejecting the whole ballot, so a page left open across a moderation change
     still records the choices that are still valid."""
     allowed = set(poll.approved)
-    poll.votes[str(user_id)] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
+    voter_id = str(user_id)
+    poll.votes[voter_id] = [e for e in dict.fromkeys(entry_ids) if e in allowed]
+    if subscriber is not None:
+        poll.subscriber_votes[voter_id] = bool(subscriber)
     return poll
+
+
+def weekly_vote_records(entry: str) -> list[dict]:
+    """Private voter-id sets for the weekly vote-report renderer, oldest first.
+
+    Clearing a vote archives its JSON, so the reporting view reads both the live and
+    archived files. Polls created before the subscription prompt are restored as
+    subscriber ballots because the old API rejected anybody else.
+    """
+    directory = _voting_dir()
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    paths = list(directory.glob(f"{prefix}*.json"))
+    archive = archive_dir()
+    if archive.exists():
+        paths.extend(archive.glob(f"{prefix}*.json"))
+
+    weeks: list[dict] = []
+    for path in paths:
+        try:
+            poll = Poll.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            continue
+        voter_ids = set(poll.votes)
+        weeks.append({
+            "week": poll.poll_id,
+            "voter_ids": voter_ids,
+            "subscriber_ids": {
+                voter_id for voter_id in voter_ids if poll.subscriber_votes.get(voter_id) is True
+            },
+            "non_subscriber_ids": {
+                voter_id for voter_id in voter_ids if poll.subscriber_votes.get(voter_id) is False
+            },
+        })
+    return sorted(weeks, key=lambda row: row["week"])
+
+
+def weekly_vote_stats(
+    entry: str, current_subscriber_ids: set[str] | None = None,
+    checked_voter_ids: set[str] | None = None, records: list[dict] | None = None,
+) -> list[dict]:
+    """Public weekly vote totals, without exposing voter identities.
+
+    ``subscribers`` is the subscription snapshot at vote time. ``subscribed_after`` and
+    ``not_subscribed`` use a fresh channel-membership lookup only for people who voted
+    while not subscribed, so they show conversion without reclassifying past ballots.
+    """
+    records = weekly_vote_records(entry) if records is None else records
+    weeks = []
+    for record in records:
+        non_subscriber_ids = record["non_subscriber_ids"]
+        if current_subscriber_ids is None:
+            subscribed_after = 0
+            not_subscribed = len(non_subscriber_ids)
+        else:
+            subscribed_after = len(non_subscriber_ids & current_subscriber_ids)
+            checked_ids = non_subscriber_ids if checked_voter_ids is None else checked_voter_ids
+            not_subscribed = len((non_subscriber_ids & checked_ids) - current_subscriber_ids)
+        weeks.append({
+            "week": record["week"],
+            "voters": len(record["voter_ids"]),
+            "subscribers": len(record["subscriber_ids"]),
+            # Kept for API compatibility with the first subscription-split view.
+            "non_subscribers": len(non_subscriber_ids),
+            "subscribed_after": subscribed_after,
+            "not_subscribed": not_subscribed,
+        })
+    return weeks
 
 
 # -------------------------------------------------------------------- announced results

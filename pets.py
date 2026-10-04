@@ -443,7 +443,7 @@ def _load(entry: str) -> dict:
     # collapsed this list to unique codes on every read, which silently destroyed those
     # ingredients. Catalogue aliases still rewrite retired designs one physical copy at a
     # time, so replacing several grey items never changes how many things the player owns.
-    for record in data["pets"].values():
+    for pet_user_id, record in data["pets"].items():
         if not isinstance(record, dict):
             continue
         purchased_stats = record.get("stats")
@@ -475,36 +475,6 @@ def _load(entry: str) -> dict:
             if isinstance(code, str):
                 normalised_inventory.append(code)
         record["inventory"] = normalised_inventory
-        personal = record.get("personal_enchantments")
-        if not isinstance(personal, dict):
-            personal = {}
-        # Only durable entries applied by this module are retained.  The code must
-        # still be owned, which makes a sale/gift unable to carry someone's artwork.
-        repaired_personal = {}
-        for original_code, row in personal.items():
-            if not isinstance(row, dict) or not isinstance(original_code, str):
-                continue
-            code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
-            target = str(row.get("target") or "")
-            if target == "scroll":
-                if code in legal_scrolls:
-                    repaired_personal[code] = dict(row)
-                continue
-            item = C.find_item(code)
-            healing_target = bool(
-                target == "vial" and item is not None
-                and str((getattr(item, "effect", {}) or {}).get("code") or "")
-                in PERSONAL_PAINT_HEALING_EFFECTS
-            )
-            if item is not None and code in normalised_inventory and (
-                (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
-                or healing_target
-            ):
-                # Prefer data already stored under the surviving code when several
-                # retired designs converge on one replacement.
-                if code not in repaired_personal or original_code == code:
-                    repaired_personal[code] = dict(row)
-        record["personal_enchantments"] = repaired_personal
         # Weapon history and elemental runes are keyed by catalogue code as well. Move
         # those keys with the physical item so a retired grey weapon does not lose its
         # nameplate statistics or enchantment during replacement.
@@ -544,6 +514,56 @@ def _load(entry: str) -> dict:
                 # A historic equipped object is still owned; preserve it rather than
                 # stripping it as a side effect of a duplicate-data migration.
                 normalised_inventory.append(code)
+        # After the equipped fold-in above, so a worn item missing from an old bag list
+        # still counts as owned. Only durable entries applied by this module stay on an
+        # item, and the code must still be owned, which makes a sale/gift unable to carry
+        # someone's artwork. A paint that can no longer stay is NOT dropped: it goes back
+        # to its owner's wallet as the same rune. Dropping it here is how a melted item
+        # used to take somebody's painted miniature with it.
+        personal = record.get("personal_enchantments")
+        if not isinstance(personal, dict):
+            personal = {}
+        repaired_personal = {}
+        unplaced = []
+        for original_code, row in personal.items():
+            if not isinstance(row, dict) or not isinstance(original_code, str):
+                continue
+            code = C.LEGACY_ITEM_CODES.get(original_code, original_code)
+            target = str(row.get("target") or "")
+            if target == "scroll":
+                if code in legal_scrolls:
+                    repaired_personal[code] = dict(row)
+                else:
+                    unplaced.append(row)
+                continue
+            item = C.find_item(code)
+            healing_target = bool(
+                target == "vial" and item is not None
+                and str((getattr(item, "effect", {}) or {}).get("code") or "")
+                in PERSONAL_PAINT_HEALING_EFFECTS
+            )
+            if item is not None and code in normalised_inventory and (
+                (item.slot == target and target in PERSONAL_PAINT_ITEM_SLOTS)
+                or healing_target
+            ):
+                # Prefer data already stored under the surviving code when several
+                # retired designs converge on one replacement; the other one's rune
+                # goes back to the wallet rather than vanishing.
+                if code not in repaired_personal:
+                    repaired_personal[code] = dict(row)
+                elif original_code == code:
+                    unplaced.append(repaired_personal[code])
+                    repaired_personal[code] = dict(row)
+                else:
+                    unplaced.append(row)
+            else:
+                unplaced.append(row)
+        record["personal_enchantments"] = repaired_personal
+        if unplaced:
+            applied_ids = {str(row.get("rune_id") or "") for row in repaired_personal.values()}
+            for row in unplaced:
+                if str(row.get("rune_id") or "") not in applied_ids:
+                    _return_personal_paint_rune(data, pet_user_id, row)
         # Older fight code could temporarily replace the player's chosen loadout and
         # leave a restore marker behind if the fight was interrupted. Automatic gear
         # changes are retired; repair any such stranded swap while loading the record.
@@ -660,14 +680,21 @@ def _load(entry: str) -> dict:
             record["owned_scrolls"] = list(dict.fromkeys([
                 *record.get("owned_scrolls", []), *wallet["unlocked"],
             ]))
-    # A personal rune is a single-use owner-bound receipt.  Do not try to infer or
-    # recreate historic ones: missing image/source data must never become a free buff.
+    # A personal rune is an owner-bound receipt, either in the wallet or on one item.
+    # Do not try to infer or recreate historic ones here: missing image/source data must
+    # never become a free buff (restore_lost_personal_paint_runes rebuilds from evidence).
     valid_targets = set(PERSONAL_PAINT_RUNE_QUEST_TARGETS.values())
     for user_id, rows in list(data["personal_paint_runes"].items()):
         if not isinstance(rows, list):
             data["personal_paint_runes"][str(user_id)] = []
             continue
-        seen_ids = set()
+        # A rune already on one of its owner's items is not also spendable: whichever way
+        # a copy got into both places, the item keeps it and the wallet one goes.
+        owner = data["pets"].get(str(user_id))
+        painted = owner.get("personal_enchantments") if isinstance(owner, dict) else None
+        seen_ids = {
+            str(row.get("rune_id") or "") for row in painted.values() if isinstance(row, dict)
+        } if isinstance(painted, dict) else set()
         repaired = []
         for row in rows:
             if not isinstance(row, dict):
@@ -1444,6 +1471,10 @@ def _farm_passive_terms(record: dict | None) -> tuple[int, int, int]:
     level = min(
         max(0, int((record or {}).get("farm_level", 0) or 0)), C.FARM_MAX_LEVEL,
     )
+    if not C.FARM_OPEN:
+        # A closed farm produces nothing. The ledger still advances its checkpoint at a
+        # zero rate, so reopening later does not back-pay the closed months.
+        return level, 0, 0
     hero_level = max(1, int((record or {}).get("level", 1) or 1))
     return (
         level,
@@ -2069,6 +2100,8 @@ def start_farm(
     pet level, plus features, here rather than reading them live at settlement guarantees
     that progress made while the pet is away affects only the NEXT trip.
     """
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     moment = now or app_now()
     # Finish both due runs first so a user who opens the menu after a shift ends is not
     # stuck waiting for the background poller -- and, since the quarry now blocks the farm,
@@ -2731,7 +2764,15 @@ def grant_farm_ticket(entry, user_id, reason: str = "") -> bool:
         key = str(reason or "")
         if key and key in row["granted"]:
             return False
-        row["count"] += 1
+        if C.FARM_OPEN:
+            row["count"] += 1
+        else:
+            # With the farm closed, a ticket that only shortens a shift is worth nothing,
+            # so every source that still pays one -- quests, #япокрасил posts, mob drops
+            # -- pays a meadow ticket instead. The replay key stays in this row, so a
+            # replayed event is refused exactly as before.
+            _meadow_row(data, user_id)["tickets"] += 1
+            _metric_add(data, "meadow_tickets_granted", 1)
         if key:
             row["granted"] = (row["granted"] + [key])[-FARM_TICKET_GRANT_MEMORY:]
         _save(entry, data)
@@ -2880,6 +2921,19 @@ RUNE_TOOL_MASTERWORKS = {
     "rune_paint_miner": "miner",
     "rune_paint_phoenix": "phoenix_totem",
 }
+# The masterworks that only do anything on the farm or in the quarry.
+FARM_TOOLS = frozenset({"pickaxe", "shovel", "farmer", "miner"})
+
+
+def closed_quest_codes() -> frozenset:
+    """Quests kept out of the deal because all they upgrade is a closed farm or quarry.
+
+    Out of the deal only, like a moderator's switch: a card already on somebody's board
+    stays, so nobody halfway through a painting has it taken away.
+    """
+    if C.FARM_OPEN:
+        return frozenset()
+    return frozenset(code for code, tool in RUNE_TOOL_MASTERWORKS.items() if tool in FARM_TOOLS)
 
 
 def _tool_masterworks(data: dict, user_id) -> dict[str, bool]:
@@ -3009,6 +3063,23 @@ def meadow_tickets(entry, user_id) -> int:
     return _meadow_row(_load(entry), user_id)["tickets"]
 
 
+def reward_ticket() -> dict[str, str]:
+    """How a "ticket" reward is labelled: a farm ticket while the farm is open, a meadow
+    ticket while it is closed (see grant_farm_ticket). Named in words as well as by icon,
+    because 🎫 also marks dungeon tickets in places. The Mini App's rewardTicket() mirrors
+    it. Read at call time, not import time, so the switch can be flipped either way.
+    """
+    if C.FARM_OPEN:
+        return {"icon": "🎟", "place": "ферма", "to": "на ферму"}
+    return {"icon": "🎫", "place": "поляна", "to": "на поляну"}
+
+
+def meadow_ticket_sources() -> str:
+    if C.FARM_OPEN:
+        return "Билеты падают со смен на ферме и из подземелья."
+    return "Билеты дают за квесты, покрас #япокрасил, мобов и подземелье."
+
+
 def grant_meadow_ticket(entry, user_id, count: int = 1, reason: str = "") -> int:
     """Hand over meadow tickets and return the new total.
 
@@ -3103,7 +3174,7 @@ def start_meadow(entry, user_id, size: str) -> tuple[bool, str]:
             need = rules.tickets - row["tickets"]
             return False, (
                 f"Нужно {rules.tickets} 🎫 на {rules.title.lower()}, не хватает {need}. "
-                "Билеты падают со смен на ферме и из подземелья."
+                + meadow_ticket_sources()
             )
         row["tickets"] -= rules.tickets
         round_id = secrets.token_hex(8)
@@ -3261,6 +3332,8 @@ def quarry_status(entry: str, user_id, now: datetime | None = None) -> dict:
 
 
 def buy_pickaxe(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -3279,6 +3352,8 @@ def unlock_nmm_pickaxe(entry: str, user_id) -> bool:
 
 
 def buy_shovel(entry: str, user_id, xp: int) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     data = _load(entry)
     record = _tamed_record(data, user_id)
     if record is None:
@@ -3294,6 +3369,8 @@ def buy_shovel(entry: str, user_id, xp: int) -> tuple[bool, str]:
 
 
 def start_quarry(entry: str, user_id, hours: int = C.QUARRY_DURATION_HOURS) -> tuple[bool, str]:
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     try:
         hours = int(hours)
     except (TypeError, ValueError):
@@ -3441,6 +3518,74 @@ def settle_quarry(entry: str, user_id, now: datetime | None = None) -> dict | No
     }
 
 
+def settle_closed_farm(entries, now: datetime | None = None) -> dict:
+    """While the farm is closed, pay out everything it still owes, once.
+
+    Run at startup, and does two things in one write per store:
+
+    * Every farm and quarry shift ends and is paid in full. A running shift ends the way
+      a ticket ends it: only `ready_at` moves, so the payout is for the whole planned
+      length. That matters beyond fairness -- a pet on a farm shift cannot fight, and
+      with the farm's screen gone there would be no button left to call it back. Farms
+      settle through the ordinary bulk path, which also queues the usual "back from the
+      farm" message. The quarry only ever settles when its owner opens the Mini App, so
+      finished-but-uncollected quarry runs are paid here too, or a Telegram-only player
+      would never see them.
+    * Every farm ticket still held becomes a meadow ticket, one for one: a ticket that
+      only shortens a shift buys nothing now.
+
+    Idempotent: while closed nothing can start a shift or add a farm ticket (see
+    grant_farm_ticket), so a later start reads the store once and writes nothing.
+    """
+    ended = {"farm": 0, "quarry": 0, "tickets": 0, "ticket_holders": 0}
+    if C.FARM_OPEN:
+        return ended
+    moment = now or app_now()
+    for entry in entries:
+        farms = 0
+        quarries = []
+        with _farm_settlement_lock:
+            data = _load(entry)
+            changed = False
+            wallet = data.get("farm_tickets")
+            converted = 0
+            for user_id, row in (wallet.items() if isinstance(wallet, dict) else ()):
+                count = _safe_nonnegative_int(row.get("count")) if isinstance(row, dict) else 0
+                if not count:
+                    continue
+                _meadow_row(data, user_id)["tickets"] += count
+                row["count"] = 0
+                converted += count
+                ended["ticket_holders"] += 1
+            if converted:
+                _metric_add(data, "meadow_tickets_granted", converted)
+                ended["tickets"] += converted
+                changed = True
+            for user_id, record in data.get("pets", {}).items():
+                if not isinstance(record, dict):
+                    continue
+                farm = record.get("farm_run")
+                if isinstance(farm, dict):
+                    farms += 1
+                    if not _farm_run_ready(farm, moment):
+                        farm["ready_at"] = moment.isoformat()
+                        changed = True
+                if isinstance(record.get("quarry_run"), dict):
+                    quarries.append(str(user_id))
+                    if not _farm_run_ready(record["quarry_run"], moment):
+                        record["quarry_run"]["ready_at"] = moment.isoformat()
+                        changed = True
+            if changed:
+                _save(entry, data)
+        if farms:
+            settle_completed_farms(entry, now=moment)
+        for user_id in quarries:
+            settle_quarry(entry, user_id, now=moment)
+        ended["farm"] += farms
+        ended["quarry"] += len(quarries)
+    return ended
+
+
 def use_farm_ticket(entry, user_id, now: datetime | None = None) -> tuple[bool, str]:
     """Spend a ticket to end the running shift right now, paid at its full planned length.
 
@@ -3530,6 +3675,8 @@ def cancel_farm(entry, user_id, now: datetime | None = None) -> tuple[bool, str]
 
 def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool, str]:
     """Upgrade the farm after banking passive gold at the old level's rate."""
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     moment = now or app_now()
     data = _load(entry)
     record = _tamed_record(data, user_id)
@@ -3561,6 +3708,8 @@ def upgrade_farm(entry, user_id, xp, now: datetime | None = None) -> tuple[bool,
 
 def upgrade_farm_feature(entry, user_id, xp, feature: str) -> tuple[bool, str]:
     """Buy one permanent farm feature (well, sprinkler, beds or tractor)."""
+    if not C.FARM_OPEN:
+        return False, C.FARM_CLOSED_NOTICE
     key = str(feature or "").strip().lower()
     spec = C.FARM_FEATURES.get(key)
     if spec is None:
@@ -4314,6 +4463,259 @@ def _public_personal_paint_rune(row: dict) -> dict:
     }
 
 
+def _personal_paint_rune_source(data: dict, user_id, rune_id: str) -> str:
+    """The grant ledger's source for one rune id, or "" when it predates the ledger."""
+    for source, row in (data.get("personal_paint_rune_sources") or {}).items():
+        if isinstance(row, dict) and str(row.get("rune_id") or "") == rune_id \
+                and str(row.get("user_id") or "") == str(user_id):
+            return str(source)
+    return ""
+
+
+def _return_personal_paint_rune(data: dict, user_id, painted: dict) -> dict | None:
+    """Put the rune behind one applied paint back into its owner's wallet.
+
+    A paint is somebody's own painted miniature, so it is never destroyed along with the
+    item carrying it: melting, selling, gifting or simply taking it off all hand back the
+    same rune (same id, same photo) to be put on something else. Idempotent by rune id,
+    so a replayed removal cannot mint a second copy. Returns the wallet row, or None for
+    an applied row too damaged to be a rune again (no id, target or photo).
+    """
+    rune_id = str(painted.get("rune_id") or "")
+    target = str(painted.get("target") or "")
+    image = painted.get("photo_file_id")
+    if not rune_id or target not in PERSONAL_PAINT_RUNE_QUEST_TARGETS.values() \
+            or not isinstance(image, str) or not image:
+        return None
+    wallet = _personal_paint_rune_wallet(data, user_id)
+    existing = next((row for row in wallet if str(row.get("id") or "") == rune_id), None)
+    if isinstance(existing, dict):
+        return existing
+    row = {
+        "id": rune_id, "target": target,
+        "source": str(painted.get("source") or "")
+        or _personal_paint_rune_source(data, user_id, rune_id) or f"returned:{rune_id}",
+        "quest_code": str(painted.get("quest_code") or ""), "photo_file_id": image,
+        # Stable across repeated loads: the loader calls this too, and a store that is
+        # read several times before its next save must rebuild the identical row.
+        "earned_at": str(painted.get("earned_at") or painted.get("applied_at") or ""),
+    }
+    wallet.append(row)
+    del wallet[:-100]
+    return row
+
+
+def _personal_paint_target_name(code: str) -> str:
+    label = SCROLLS.scroll(code) or C.find_item(code)
+    return str(label.get("name") if isinstance(label, dict) else getattr(label, "name", code))
+
+
+def remove_personal_paint_rune(entry: str, user_id, code: str) -> tuple[bool, str]:
+    """Take the paint off one item or scroll and return its rune to the wallet.
+
+    Free and unlimited: the rune is the player's own work, and the only thing a removal
+    changes is which of their things carries it. The +30% leaves with it.
+    """
+    code = str(code or "").strip()
+    if not code:
+        return False, "Выбери предмет с покрасом."
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо."
+        enchantments = record.get("personal_enchantments")
+        painted = enchantments.get(code) if isinstance(enchantments, dict) else None
+        if not isinstance(painted, dict):
+            return False, "На этом предмете нет персонального покраса."
+        if _return_personal_paint_rune(data, user_id, painted) is None:
+            return False, "Этот покрас повреждён: снять его в руну нельзя."
+        enchantments.pop(code, None)
+        _save(entry, data)
+    return True, (
+        f"Покрас снят с «{_personal_paint_target_name(code)}». Руна с картинкой "
+        "вернулась в персональные руны — её можно наложить снова."
+    )
+
+
+def _spend_personal_paint_rune(data: dict, user_id, rune_id: str | None, reason: str,
+                               moment: datetime) -> None:
+    """Mark a rune in the grant ledger as deliberately gone, not lost."""
+    for row in (data.get("personal_paint_rune_sources") or {}).values():
+        if isinstance(row, dict) and rune_id and str(row.get("rune_id") or "") == rune_id \
+                and str(row.get("user_id") or "") == str(user_id):
+            row["spent"] = reason
+            row["spent_at"] = moment.isoformat()
+
+
+def _paint_returns_note(names: list[str]) -> str:
+    if not names:
+        return ""
+    listed = ", ".join(f"«{name}»" for name in names)
+    return f" 🎨 Покрас с {listed} вернулся руной — его можно наложить снова."
+
+
+def restore_lost_personal_paint_runes(entries) -> dict:
+    """Give back every minted paint rune the current rules say its owner should still hold.
+
+    Before paints came back off melted and sold items, those paths deleted them, and the
+    store's loader quietly dropped any paint whose item had left the bag. The grant ledger
+    (`personal_paint_rune_sources`) still names every rune ever minted, and the accepted
+    quest submission still holds its photo, so a lost rune can be rebuilt exactly -- same
+    id, same picture -- rather than guessed. Fight-log snapshots are the fallback photo
+    source for a submission that has scrolled out of the quest store.
+
+    Gifting still spends a paint, so a rune that left with a gift stays gone. Gifts from
+    now on mark the ledger; older ones are recognised from the gift log, and a loss the
+    evidence cannot tell apart from a gift is reported rather than paid out.
+
+    Idempotent: a restored rune is in the wallet, so the next start finds nothing.
+    """
+    import quests
+
+    restored = []
+    gifted = []
+    unrecoverable = 0
+    for entry in entries:
+        data = _load(entry)
+        lost = _lost_personal_paint_runes(data)
+        if not lost:
+            continue
+        # Evidence is read outside the settlement lock: two whole-store parses have no
+        # business holding up a farm payout.
+        submissions = {
+            str(row.get("id")): row
+            for row in quests._load(entry).get("submissions", []) if isinstance(row, dict)
+        }
+        snapshots = None
+        rebuilt = {}
+        for source, user_id, rune_id in lost:
+            row = None
+            submission_id = source.partition("quest-personal-paint:")[2]
+            submission = submissions.get(submission_id) if submission_id else None
+            if isinstance(submission, dict):
+                code = quests.catalog.normalise_code(str(submission.get("code") or ""))
+                target = personal_paint_target_for_quest(code)
+                image = str(submission.get("photo_file_id") or "")
+                if target and image and str(submission.get("user_id")) == user_id:
+                    row = {"rune_id": rune_id, "target": target, "quest_code": code,
+                           "photo_file_id": image}
+            gifts = [
+                gift for gift in data.get("gift_history", [])
+                if isinstance(gift, dict) and str(gift.get("giver_id") or "") == user_id
+            ]
+            if (row is None or gifts) and snapshots is None:
+                snapshots = _personal_paint_snapshots(entry, data)
+            seen = (snapshots or {}).get((user_id, rune_id))
+            row = row or seen
+            if row is None:
+                unrecoverable += 1
+                continue
+            owner = data["pets"].get(user_id) if isinstance(data["pets"].get(user_id), dict) else {}
+            receipt = {"entry": entry, "user_id": user_id, "rune_id": rune_id,
+                       "target": row["target"], "username": owner.get("owner_username")}
+            if gifts and _lost_to_a_gift(gifts, row["target"], seen, submission):
+                gifted.append(receipt)
+                continue
+            rebuilt[(user_id, rune_id)] = ({**row, "source": source}, receipt)
+        if not rebuilt:
+            continue
+        with _farm_settlement_lock:
+            data = _load(entry)
+            still_lost = {(user_id, rune_id) for _source, user_id, rune_id in _lost_personal_paint_runes(data)}
+            returned = [
+                receipt for key, (row, receipt) in rebuilt.items()
+                if key in still_lost and _return_personal_paint_rune(data, key[0], row) is not None
+            ]
+            if returned:
+                _save(entry, data)
+        restored.extend(returned)
+    return {"restored": restored, "gifted": gifted, "unrecoverable": unrecoverable}
+
+
+def _iso_moment(value) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(value or ""))
+    except ValueError:
+        return None
+
+
+def _lost_to_a_gift(gifts: list[dict], target: str, seen: dict | None,
+                    submission: dict | None) -> bool:
+    """Whether one of the owner's recorded gifts could have taken this paint with it.
+
+    Only gifts made after the paint went on count: the replay snapshot's applied_at when
+    there is one, otherwise the moment the quest was accepted. With the painted item's
+    code known from a replay, only a gift of that exact design matches; without it, any
+    gift of an item the rune fits does -- a doubtful rune stays spent, not paid twice.
+    """
+    since = _iso_moment((seen or {}).get("applied_at")) \
+        or _iso_moment((submission or {}).get("reviewed_at"))
+    code = str((seen or {}).get("code") or "")
+    for gift in gifts:
+        moment = _iso_moment(gift.get("ts"))
+        try:
+            if since is not None and moment is not None and moment < since:
+                continue
+        except TypeError:          # one naive, one aware: no usable ordering, so count it
+            pass
+        gifted_code = str(gift.get("item_code") or "")
+        gifted_code = C.LEGACY_ITEM_CODES.get(gifted_code, gifted_code)
+        if code:
+            if gifted_code == code:
+                return True
+        elif _personal_paint_fits(target, C.find_item(gifted_code)):
+            return True
+    return False
+
+
+def _lost_personal_paint_runes(data: dict) -> list[tuple[str, str, str]]:
+    """(source, user_id, rune_id) for every ledger rune its owner no longer holds.
+
+    A rune the ledger marks as spent (given away with the item it was on) is not lost.
+    """
+    held: dict[str, set] = {}
+    for user_id, wallet in (data.get("personal_paint_runes") or {}).items():
+        if isinstance(wallet, list):
+            held.setdefault(str(user_id), set()).update(
+                str(row.get("id") or "") for row in wallet if isinstance(row, dict)
+            )
+    for user_id, record in (data.get("pets") or {}).items():
+        painted = record.get("personal_enchantments") if isinstance(record, dict) else None
+        if isinstance(painted, dict):
+            held.setdefault(str(user_id), set()).update(
+                str(row.get("rune_id") or "") for row in painted.values() if isinstance(row, dict)
+            )
+    lost = []
+    for source, row in (data.get("personal_paint_rune_sources") or {}).items():
+        if not isinstance(row, dict) or row.get("spent"):
+            continue
+        user_id, rune_id = str(row.get("user_id") or ""), str(row.get("rune_id") or "")
+        if user_id and rune_id and rune_id not in held.get(user_id, ()):
+            lost.append((str(source), user_id, rune_id))
+    return lost
+
+
+def _personal_paint_snapshots(entry: str, data: dict) -> dict:
+    """(user_id, rune_id) -> applied-paint row plus the `code` it was on, from replays.
+
+    The log is oldest first, so the latest sighting wins. Takes the already-loaded store
+    for the legacy inline log rather than calling fight_log_rows, which would parse the
+    whole store a second time.
+    """
+    legacy = data.get("fights") if isinstance(data.get("fights"), list) else []
+    found = {}
+    for fight in [*legacy, *_fight_sidecar_rows(entry)]:
+        snapshot = fight.get("combat_snapshot") if isinstance(fight, dict) else None
+        records = snapshot.get("records") if isinstance(snapshot, dict) else None
+        for user_id, record in (records.items() if isinstance(records, dict) else ()):
+            painted = record.get("personal_enchantments") if isinstance(record, dict) else None
+            for code, row in (painted.items() if isinstance(painted, dict) else ()):
+                if isinstance(row, dict) and row.get("rune_id") and row.get("photo_file_id"):
+                    found[(str(user_id), str(row["rune_id"]))] = {**row, "code": str(code)}
+    return found
+
+
 def grant_personal_paint_rune(
     entry: str, user_id, quest_code: str, submission_id: str, photo_file_id: str | None,
 ) -> dict:
@@ -4374,6 +4776,7 @@ def personal_paint_status(entry: str, user_id) -> dict:
                 continue
             applied.append({
                 "code": str(code), "target": str(row.get("target") or ""),
+                "name": _personal_paint_target_name(str(code)),
                 "rune_id": str(row.get("rune_id") or ""),
                 "photo_file_id": str(row.get("photo_file_id") or ""),
                 "quest_code": str(row.get("quest_code") or ""),
@@ -4421,8 +4824,14 @@ def personal_paint_candidates(entry: str, user_id, rune_id: str) -> list[dict]:
 def _personal_paint_target_is_owned(record: dict, target: str, code: str) -> bool:
     if target == "scroll":
         return code in _owned_scroll_codes_for(record) and SCROLLS.scroll(code) is not None
-    item = C.find_item(code)
-    if item is None or code not in record.get("inventory", []):
+    if code not in record.get("inventory", []):
+        return False
+    return _personal_paint_fits(target, C.find_item(code))
+
+
+def _personal_paint_fits(target: str, item) -> bool:
+    """Whether a rune of this target type can go on this catalogue item at all."""
+    if item is None:
         return False
     if target == "vial":
         # A healing vial uses the existing healing-equipment family rather than a sixth
@@ -4462,9 +4871,12 @@ def apply_personal_paint_rune(entry: str, user_id, rune_id: str, target_code: st
         enchantments = record.setdefault("personal_enchantments", {})
         if target_code in enchantments:
             return False, "Этот предмет уже несёт персональный покрас; второй нельзя наложить.", {}
+        # Source and earned_at ride along so taking the paint off later hands back the
+        # very rune that went on, not a lookalike.
         enchantment = {
             "target": target, "rune_id": rune["id"], "quest_code": rune.get("quest_code"),
             "photo_file_id": rune["photo_file_id"], "applied_at": app_now().isoformat(),
+            "source": str(rune.get("source") or ""), "earned_at": str(rune.get("earned_at") or ""),
         }
         enchantments[target_code] = enchantment
         wallet.pop(index)
@@ -6362,7 +6774,9 @@ def _credit_achievement_tickets(data: dict, user_id, items, *,
         # ago the farm key is simply gone and this loop would happily pay it a second time.
         # The farm half of an old claim was paid when it was claimed; only the meadow half
         # was ever missing.
-        for index in range(tickets if farm else 0):
+        # The farm half is skipped while the farm is closed: the meadow half below already
+        # pays the same count in the ticket that still buys something.
+        for index in range(tickets if farm and C.FARM_OPEN else 0):
             key = _achievement_farm_source(uid, item.code, index)
             if key in farm_row["granted"]:
                 continue
@@ -6403,13 +6817,72 @@ def _pay_achievement_tickets(entry: str, user_id, items, paid: dict) -> None:
     paid["meadow_tickets"] = paid.get("meadow_tickets", 0) + meadow
 
 
+def _settle_achievement_claim(entry: str, user_id, candidates, *, individual: bool = False) \
+        -> tuple[bool, str, dict, list]:
+    """Commit achievement rewards and their claimed marker in one store write.
+
+    Dungeon tickets have no independent replay key.  Reserving an achievement before
+    paying those tickets could therefore leave a crashed request permanently underpaid.
+    Store every wallet change and the marker together instead.
+    """
+    uid = str(user_id)
+    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0,
+            "dungeon_tickets": 0, "count": 0}
+    with _farm_settlement_lock:
+        data = _load(entry)
+        record = _tamed_record(data, user_id)
+        if record is None:
+            return False, "Сначала приручи существо.", paid, []
+        row = _achievement_row(record)
+        unlocked, claimed = set(row["unlocked"]), set(row["claimed"])
+        if individual:
+            item = candidates[0]
+            if item.code not in unlocked:
+                return False, "Эта ачивка ещё не заработана.", paid, []
+            if item.code in claimed:
+                return False, "Награда за эту ачивку уже получена.", paid, []
+        items = [item for item in candidates
+                 if item.code in unlocked and item.code not in claimed]
+        if not items:
+            return False, "Забирать пока нечего.", paid, []
+
+        ruby_wallet = _ruby_row(data)
+        ruby_sources = data.get("ruby_sources")
+        if not isinstance(ruby_sources, dict):
+            ruby_sources = data["ruby_sources"] = {}
+        for item in items:
+            amount = max(0, int(item.rubies))
+            source = _achievement_ruby_source(uid, item.code)
+            if not amount or source in ruby_sources:
+                continue
+            ruby_wallet[uid] = max(0, int(ruby_wallet.get(uid, 0) or 0)) + amount
+            ruby_sources[source] = {"user_id": uid, "amount": amount}
+            _metric_add(data, "rubies_minted", amount)
+            _stage_ruby_log(data, user_id, amount, source)
+            paid["rubies"] += amount
+
+        farm, meadow = _credit_achievement_tickets(data, uid, items)
+        paid["farm_tickets"] = farm
+        paid["meadow_tickets"] = meadow
+        dungeon = sum(max(0, int(item.dungeon_tickets)) for item in items)
+        if dungeon:
+            wallet = data.setdefault("dungeon_tickets", {})
+            if not isinstance(wallet, dict):
+                wallet = data["dungeon_tickets"] = {}
+            wallet[uid] = max(0, int(wallet.get(uid, 0) or 0)) + dungeon
+            paid["dungeon_tickets"] = dungeon
+
+        row["claimed"] = sorted(claimed | {item.code for item in items})
+        paid["count"] = len(items)
+        _save(entry, data)
+    return True, "", paid, items
+
+
 def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     """Pay for everything earned and not yet paid, in one press.
 
-    The claim list is written BEFORE the payouts and each payout is keyed on the row's
-    own code, so a crash halfway cannot pay twice -- grant_rubies_once and
-    grant_farm_ticket are both idempotent on their reason string, and the marking is what
-    stops a retry from starting over.
+    Wallets and the claimed marker are committed together, so an interrupted request
+    cannot leave any part of an achievement reward behind.
     """
     # Evaluated here as well as when the list is drawn: pressing the button is allowed to
     # be the FIRST thing somebody does, and a claim that only paid for rows a screen had
@@ -6418,35 +6891,11 @@ def claim_achievements(entry: str, user_id) -> tuple[bool, str, dict]:
     _repair_shared_achievement_rewards(entry, user_id)
     _repair_achievement_meadow_tickets(entry, user_id)
     refresh_achievements(entry, user_id)
-    with _farm_settlement_lock:
-        data = _load(entry)
-        record = _tamed_record(data, user_id)
-        if record is None:
-            return False, "Сначала приручи существо.", {}
-        row = _achievement_row(record)
-        pending = [
-            item for item in ACHIEVEMENTS.catalogue()
-            if item.code in set(row["unlocked"]) and item.code not in set(row["claimed"])
-        ]
-        if not pending:
-            return False, "Забирать пока нечего.", {}
-        row["claimed"] = sorted(set(row["claimed"]) | {item.code for item in pending})
-        _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0,
-            "count": len(pending)}
-    for item in pending:
-        if item.rubies:
-            # Counted off the row rather than off the call: grant_rubies_once returns the
-            # resulting BALANCE, so summing its answers reports somebody's whole purse as
-            # though this one press had paid it. The source key is unique per achievement
-            # and the claim was marked before any of this, so the row's own number is
-            # exactly what was minted.
-            grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
-            paid["rubies"] += item.rubies
-        for _ in range(max(0, int(item.dungeon_tickets))):
-            grant_dungeon_ticket(entry, user_id)
-            paid["dungeon_tickets"] += 1
-    _pay_achievement_tickets(entry, user_id, pending, paid)
+    ok, error, paid, pending = _settle_achievement_claim(
+        entry, user_id, ACHIEVEMENTS.catalogue(),
+    )
+    if not ok:
+        return False, error, {}
     parts = []
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
@@ -6469,28 +6918,11 @@ def claim_achievement(entry: str, user_id, code: str) -> tuple[bool, str, dict]:
     item = ACHIEVEMENTS.by_code(str(code or ""))
     if item is None:
         return False, "Такой ачивки нет.", {}
-    with _farm_settlement_lock:
-        data = _load(entry)
-        record = _tamed_record(data, user_id)
-        if record is None:
-            return False, "Сначала приручи существо.", {}
-        row = _achievement_row(record)
-        if item.code not in set(row["unlocked"]):
-            return False, "Эта ачивка ещё не заработана.", {}
-        if item.code in set(row["claimed"]):
-            return False, "Награда за эту ачивку уже получена.", {}
-        # Reserve before minting. Every currency path below is idempotent where it can be;
-        # the claimed flag is the durable guard for dungeon tickets.
-        row["claimed"] = sorted(set(row["claimed"]) | {item.code})
-        _save(entry, data)
-    paid = {"rubies": 0, "farm_tickets": 0, "meadow_tickets": 0, "dungeon_tickets": 0, "count": 1}
-    if item.rubies:
-        grant_rubies_once(entry, user_id, item.rubies, _achievement_ruby_source(user_id, item.code))
-        paid["rubies"] = item.rubies
-    _pay_achievement_tickets(entry, user_id, [item], paid)
-    for _ in range(max(0, int(item.dungeon_tickets))):
-        grant_dungeon_ticket(entry, user_id)
-        paid["dungeon_tickets"] += 1
+    ok, error, paid, _settled = _settle_achievement_claim(
+        entry, user_id, [item], individual=True,
+    )
+    if not ok:
+        return False, error, {}
     parts = []
     if paid["rubies"]:
         parts.append(f"{paid['rubies']} 💎")
@@ -6602,7 +7034,8 @@ def _repair_shared_achievement_rewards(entry: str, user_id) -> bool:
                     changed = True
 
             # The old loop credited index zero, then rejected the rest as duplicates.
-            for index in range(1, max(0, int(item.farm_tickets))):
+            # Nothing to top up while the farm is closed: a farm ticket buys nothing.
+            for index in range(1, max(0, int(item.farm_tickets)) if C.FARM_OPEN else 1):
                 source = _achievement_farm_source(uid, item.code, index)
                 if source in farm_row["granted"]:
                     continue
@@ -7265,6 +7698,8 @@ def forge_status(entry: str, user_id) -> dict:
         # make" has to be the whole screen, not a needle in it.
         if len(ingredients) < required:
             continue
+        consumed = Counter(item.code for item in ingredients[:required])
+        paints = record.get("personal_enchantments") or {}
         recipes.append({
             "rarity": rarity,
             "slot": slot,
@@ -7275,6 +7710,12 @@ def forge_status(entry: str, user_id) -> dict:
             "available": len(ingredients),
             "required": required,
             "ingredients": [item.code for item in ingredients[:required]],
+            # Painted designs whose last copy this recipe melts: their runes come back to
+            # the wallet, and the preview says so before the button is pressed.
+            "returned_paints": [
+                code for code, count in consumed.items()
+                if code in paints and record.get("inventory", []).count(code) <= count
+            ],
             # Always true, and kept so a client that reads it keeps working. The list
             # itself is now the answer: if a recipe is on it, it is ready.
             "can_forge": True,
@@ -7358,12 +7799,26 @@ def reforge_items(entry: str, user_id, rarity: str, slot: str = "",
         inventory = record.setdefault("inventory", [])
         for item in consumed:
             inventory.remove(item.code)
+        # A painted ingredient's rune comes back rather than melting with it. Paints are
+        # keyed by design, so only a design whose LAST copy went in gives one back; a
+        # spare melted beside a painted twin leaves the twin's paint where it is.
+        returned_paints = []
+        paints = record.get("personal_enchantments")
+        for code in dict.fromkeys(item.code for item in consumed):
+            painted = paints.get(code) if isinstance(paints, dict) else None
+            if code not in inventory and isinstance(painted, dict):
+                if _return_personal_paint_rune(data, user_id, painted) is not None:
+                    returned_paints.append(C.find_item(code).name)
+                paints.pop(code, None)
         inventory.append(result.code)
         _discover(record, result.code)
         _metric_add(data, "forges")
         _save(entry, data)
     names = ", ".join(f"«{item.name}»" for item in consumed)
-    return True, f"Перековано: {names}. Получено: «{result.name}»!", result.code
+    return True, (
+        f"Перековано: {names}. Получено: «{result.name}»!"
+        + _paint_returns_note(returned_paints)
+    ), result.code
 
 
 def begin_item_confirmation(entry, user_id, action: str, code: str) -> tuple[bool, str, str]:
@@ -7419,15 +7874,20 @@ def sell_item(entry, user_id, code, confirmation_token: str | None = None) -> tu
     record["inventory"].remove(item.code)
     # Code-keyed history/enchantments describe the retained design. Keep them while at
     # least one physical copy remains; deleting one forge spare must not wipe the worn one.
+    returned_paints = []
     if item.code not in record["inventory"]:
-        record.setdefault("personal_enchantments", {}).pop(item.code, None)
+        painted = record.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if isinstance(painted, dict) and _return_personal_paint_rune(data, user_id, painted):
+            returned_paints.append(item.name)
         if item.slot == "weapon":
             record.setdefault("weapon_enchantments", {}).pop(item.code, None)
             record.setdefault("weapon_records", {}).pop(item.code, None)
     _metric_add(data, "item_sale_gold", value)
     _save(entry, data)
     economy.grant(entry, user_id, value, f"sell:pet_item:{item.code}")
-    return True, f"Продано: «{item.name}» за {value} монет.", value
+    return True, (
+        f"Продано: «{item.name}» за {value} монет." + _paint_returns_note(returned_paints)
+    ), value
 
 
 def _gift_cooldown_message(seconds: float) -> str:
@@ -7437,6 +7897,13 @@ def _gift_cooldown_message(seconds: float) -> str:
     if hours:
         return f"Следующий подарок можно отправить через {hours} ч. {minutes} мин."
     return f"Следующий подарок можно отправить через {minutes} мин."
+
+
+def gift_spends_paint(entry, user_id, code) -> bool:
+    """Whether giving this item away now would take its personal paint with it."""
+    record = _tamed_record(_load(entry), user_id) or {}
+    return code in (record.get("personal_enchantments") or {}) \
+        and record.get("inventory", []).count(code) <= 1
 
 
 def gift_item(
@@ -7490,12 +7957,17 @@ def gift_item(
         if item.slot == "weapon" else None
     )
     # Personal paints are explicitly non-transferable; the recipient receives the base
-    # item only, while the spent rune cannot be recovered or duplicated.
-    # The base duplicate transfers; code-keyed personal artwork stays with the giver while
-    # another copy remains and is never copied to the recipient.
+    # item only. The base duplicate transfers; code-keyed personal artwork stays with the
+    # giver while another copy remains. Giving away the LAST copy spends the paint: unlike
+    # melting or selling, it does not come back as a rune -- the painting went with the
+    # gift. The ledger is told, so the startup repair never mistakes it for a lost one.
     giver["inventory"].remove(item.code)
+    gifted_paint = None
     if item.code not in giver["inventory"]:
-        giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+        painted = giver.setdefault("personal_enchantments", {}).pop(item.code, None)
+        if isinstance(painted, dict):
+            gifted_paint = str(painted.get("rune_id") or "") or None
+            _spend_personal_paint_rune(data, giver_id, gifted_paint, "gift", moment)
         if item.slot == "weapon":
             giver.setdefault("weapon_enchantments", {}).pop(item.code, None)
     else:
@@ -7520,6 +7992,7 @@ def gift_item(
     audit.append({
         "ts": moment.isoformat(), "giver_id": str(giver_id),
         "receiver_id": str(receiver_id), "item_code": item.code,
+        **({"personal_paint_rune_id": gifted_paint} if gifted_paint else {}),
     })
     if len(audit) > C.GIFT_AUDIT_LIMIT:
         del audit[:-C.GIFT_AUDIT_LIMIT]
@@ -8154,6 +8627,183 @@ def find_fight_audit(entry: str, fight_id_: str) -> dict | None:
     return row
 
 
+def spend_card_duel(entry, attacker_id, defender_id, now: datetime | None = None) -> None:
+    """Take the arena fight a card duel costs, at the moment the duel opens.
+
+    Charged up front on purpose, and this is the one place it can be. Settling the cost at
+    the end would let a player walk out of a duel they were losing and open another for
+    free until one went their way -- and since this is the mode that pays triple and takes
+    the loser's diamonds, that loop would quickly become the only way anybody played.
+
+    Raises ValueError with the line to show the player; the duel does not open.
+    """
+    moment = now or app_now()
+    data = _load(entry)
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    attacker = _tamed_record(data, attacker_uid)
+    defender = _tamed_record(data, defender_uid)
+    if attacker is None:
+        raise ValueError("Сначала приручи существо.")
+    if defender is None:
+        raise ValueError("Соперник больше не доступен.")
+    if _is_farming_record(attacker, moment):
+        raise ValueError("Существо сейчас занято и не может драться.")
+    if _dungeon_active(attacker):
+        raise ValueError("Сначала закончи забег в подземелье или выйди из него.")
+
+    capacity, *_ = _fight_bank_components(entry, attacker_uid, attacker, moment)
+    try:
+        _spend_arena_fight(attacker, capacity, moment)
+    except ValueError:
+        raise ValueError("Бои кончились — подожди, пока накопится следующий.") from None
+    _save(entry, data)
+
+
+def record_card_duel(entry, attacker_id, defender_id, winner_id, *,
+                     draw: bool = False, now: datetime | None = None) -> dict:
+    """Settle a finished card duel and return the result from the ATTACKER's side.
+
+    The arena fight was already taken when the duel opened (spend_card_duel), so nothing
+    here touches the bank. What is left differs from an ordinary arena win in exactly the
+    two ways this mode was asked for: the purse is CARD_DUEL_GOLD_MULTIPLIER times an
+    arena win, and the loser's diamonds move alongside their coins -- the only fight in
+    the game that now does that.
+
+    Deliberately NOT here: item drops and the legendary pity ladder. Those are the arena's
+    faucet and are tuned against the arena's win count, so feeding them from a second mode
+    would quietly raise the rate at which every collection fills. Card wins are kept in
+    their own pair of fields for the same reason, and the gold is added to the audit's
+    existing arena_reward_gold so the income page cannot under-report the faucet.
+    """
+    moment = now or app_now()
+    day = moment.date()
+    data = _load(entry)
+    attacker_uid, defender_uid = str(attacker_id), str(defender_id)
+    attacker = _tamed_record(data, attacker_uid)
+    defender = _tamed_record(data, defender_uid)
+    if attacker is None or defender is None:
+        raise ValueError("Соперник больше не доступен.")
+
+    fight_id_ = _new_fight_id(moment)
+    attacker["card_fights"] = int(attacker.get("card_fights", 0) or 0) + 1
+    defender["card_fights"] = int(defender.get("card_fights", 0) or 0) + 1
+
+    log_row = {
+        "fight_id": fight_id_,
+        "ts": moment.isoformat(),
+        "date": day.isoformat(),
+        # The mode is on the row so the fight audit can tell a card duel from an arena
+        # attack. Readers that predate it simply do not look.
+        "fight_mode": "card",
+        "attacker_id": attacker_uid,
+        "defender_id": defender_uid,
+        "attacker_name": attacker.get("name"),
+        "defender_name": defender.get("name"),
+        "attacker_owner": attacker.get("owner_name"),
+        "defender_owner": defender.get("owner_name"),
+        "dropped_item": None,
+        "combat_snapshot": None,
+    }
+
+    if draw or not winner_id:
+        _, attacker_levels = _apply_xp(attacker, C.DRAW_XP)
+        _, defender_levels = _apply_xp(defender, C.DRAW_XP)
+        _save(entry, data)
+        _append_fight(entry, {
+            **log_row, "winner_id": None, "loser_id": None, "draw": True,
+            "gold": 0, "loss_gold": 0, "transfer_gold": 0,
+            "loss_rubies": 0, "transfer_rubies": 0, "consolation_gold": 0,
+        })
+        return {
+            "fight_id": fight_id_, "draw": True, "won": False,
+            "gold": 0, "loss_gold": 0, "transfer_gold": 0,
+            "loss_rubies": 0, "transfer_rubies": 0,
+            "xp": C.DRAW_XP, "levels_gained": attacker_levels,
+            "level": attacker.get("level", 1),
+            "opponent_levels_gained": defender_levels,
+        }
+
+    winner_uid = str(winner_id)
+    loser_uid = defender_uid if winner_uid == attacker_uid else attacker_uid
+    winner = data["pets"][winner_uid]
+    loser = data["pets"][loser_uid]
+    winner["card_wins"] = int(winner.get("card_wins", 0) or 0) + 1
+
+    bonus_pct = C.CAGE_GOLD_BONUS_PCT[min(max(winner.get("cage_level", 1), 1),
+                                          C.CAGE_MAX_LEVEL) - 1]
+    reward_multiplier = C.arena_level_reward_multiplier(
+        winner.get("level", 1), loser.get("level", 1)
+    )
+    # Зеркало души removes the level-gap penalty here exactly as it does in the arena.
+    if _equipped_effect(winner, "mirror_soul"):
+        reward_multiplier = max(1.0, reward_multiplier)
+    gold_base = round(
+        random.randint(C.ARENA_WIN_GOLD_MIN, C.ARENA_WIN_GOLD_MAX)
+        * (1 + bonus_pct / 100)
+        * reward_multiplier
+        * C.CARD_DUEL_GOLD_MULTIPLIER
+    )
+    gold_multiplier = C.hero_gold_multiplier(winner.get("level", 1), "arena")
+    gold = C.gold_for_hero(gold_base, winner.get("level", 1), "arena")
+    _metric_add(data, "arena_reward_gold", gold)
+
+    # Both wallet stakes read the same five percent and the same two discounts the arena
+    # applies -- Выживший on the loser, and the repeat discount for coming back to the
+    # same opponent today. Only the coins are minted; both transfers are moves.
+    loser_xp = _chat_xp_for(entry, loser_uid)
+    survivor_share = _effect_fraction(_equipped_effect(loser, "survivor"))
+    prior_attacks = (
+        arena_attacks_against(entry, attacker_uid, defender_uid, day)
+        if winner_uid == attacker_uid else 0
+    )
+    transfer_share = C.arena_repeat_transfer_share(
+        C.ARENA_LOSS_TRANSFER_SHARE * (1 - min(1.0, max(0.0, survivor_share))),
+        prior_attacks,
+    )
+    paid = economy.settle_arena_reward(
+        entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
+    )
+
+    ruby_wallet = _ruby_row(data)
+    loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
+    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share, prior_attacks)
+    if paid_rubies:
+        ruby_wallet[loser_uid] = loser_rubies - paid_rubies
+        ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
+        _stage_ruby_log(data, loser_uid, -paid_rubies, "card-transfer-loss", winner_uid)
+        _stage_ruby_log(data, winner_uid, paid_rubies, "card-transfer-win", loser_uid)
+
+    winner_xp = max(1, round(C.WIN_XP * reward_multiplier))
+    _, winner_levels = _apply_xp(winner, winner_xp)
+    _, loser_levels = _apply_xp(loser, C.LOSS_XP)
+
+    _save(entry, data)
+    _append_fight(entry, {
+        **log_row,
+        "winner_id": winner_uid, "loser_id": loser_uid, "draw": False,
+        "gold": gold, "gold_base": gold_base, "gold_multiplier": gold_multiplier,
+        "loss_gold": paid, "transfer_gold": paid,
+        "loss_rubies": paid_rubies, "transfer_rubies": paid_rubies,
+        "consolation_gold": 0,
+    })
+
+    won = winner_uid == attacker_uid
+    return {
+        "fight_id": fight_id_,
+        "draw": False,
+        "won": won,
+        "gold": gold if won else 0,
+        "loss_gold": 0 if won else paid,
+        "transfer_gold": paid if won else 0,
+        "loss_rubies": 0 if won else paid_rubies,
+        "transfer_rubies": paid_rubies if won else 0,
+        "xp": winner_xp if won else C.LOSS_XP,
+        "levels_gained": winner_levels if won else loser_levels,
+        "level": attacker.get("level", 1),
+        "opponent_levels_gained": loser_levels if won else winner_levels,
+    }
+
+
 def record_fight(
     entry, attacker_id, defender_id, result, today, attacker_xp=None, combat_snapshot=None,
     now: datetime | None = None,
@@ -8321,17 +8971,13 @@ def record_fight(
         entry, winner_uid, gold, loser_uid, loser_xp, transfer_share,
     )
 
-    # Rubies live in the pet store already loaded for this settlement. Move them here so
-    # both wallets and the fight record land in the same save; this is a transfer, never
-    # part of the minted-ruby metric.
-    ruby_wallet = _ruby_row(data)
-    loser_rubies = max(0, int(ruby_wallet.get(loser_uid, 0) or 0))
-    paid_rubies = C.arena_loss_transfer(loser_rubies, survivor_share, prior_attacks)
-    if paid_rubies:
-        ruby_wallet[loser_uid] = loser_rubies - paid_rubies
-        ruby_wallet[winner_uid] = max(0, int(ruby_wallet.get(winner_uid, 0) or 0)) + paid_rubies
-        _stage_ruby_log(data, loser_uid, -paid_rubies, "arena-transfer-loss", winner_uid)
-        _stage_ruby_log(data, winner_uid, paid_rubies, "arena-transfer-win", loser_uid)
+    # An ordinary arena fight takes coins and nothing else. Diamonds used to move here on
+    # the same five-percent share, and now move only in a card duel (record_card_duel) --
+    # a fight somebody chose to sit through rather than one they were handed by a tap.
+    # The field stays in the log row and the return below at zero rather than being
+    # removed, because history() and the audit already read it for every fight ever
+    # recorded, and those fights really did move diamonds.
+    paid_rubies = 0
 
     dropped_code = None
     # Repeat designs are deliberate forge material. The pity counter is tied to wins,

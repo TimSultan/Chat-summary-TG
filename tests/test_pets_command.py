@@ -412,6 +412,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("pet", actions)
         self.assertIn("info", actions)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_tamed_pet_menu_uses_two_button_rows_including_fight_notifications(self):
         pets.buy_cage(CHAT, PLAYER["id"], RICH_XP)
         pets.tame(CHAT, PLAYER["id"], RICH_XP, "Боец", "file", "Player")
@@ -425,6 +426,8 @@ class PetsCommandTests(unittest.TestCase):
             pets_ui.parse_callback(row[0]["callback_data"])[1]
             for row in keyboard["inline_keyboard"] if len(row) == 1
         ]
+        # With the farm open, the farm has its slot beside the casino and the dungeon keeps
+        # a row of its own. (Closed, the dungeon takes that slot: see ClosedFarmTests.)
         self.assertEqual(wide, ["dailybonus", "dungeon"])
         last = [pets_ui.parse_callback(b["callback_data"])[1]
                 for b in keyboard["inline_keyboard"][-1]]
@@ -438,11 +441,13 @@ class PetsCommandTests(unittest.TestCase):
         self.assertIn("quests", actions)
         self.assertNotIn("cage", actions)
         self.assertNotIn("collection", actions)
+        self.assertIn("farm", actions)
 
         labels = [[button["text"] for button in row] for row in keyboard["inline_keyboard"]]
-        self.assertEqual(labels[0], ["⚔️ Арена", "🌾 Ферма"])
-        self.assertIn("📜 Квесты", labels[1][0])
-        self.assertEqual(labels[1][1], "🎰 Казино")
+        # Quests lead the menu; the fights sit beside them.
+        self.assertIn("📜 Квесты", labels[0][0])
+        self.assertEqual(labels[0][1], "⚔️ Арена")
+        self.assertEqual(labels[1], ["🌾 Ферма", "🎰 Казино"])
         self.assertEqual(labels[2], ["🛒 Магазин", "🎒 Снаряжение"])
 
     def test_unselected_character_element_is_the_first_full_width_action(self):
@@ -578,12 +583,14 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual(len(api.sent), 1)
         self.assertEqual(deletions, [])
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_how_to_play_button_opens_the_arena_rules(self):
         api = self._tap("info")
         self.assertIn("Как играть", api.edits[0]["text"])
         self.assertIn("/arena в личке бота", api.edits[0]["text"])
         self.assertIn("твой собственный покрас", api.edits[0]["text"])
         self.assertIn("Сражайся с игроками и мобами", api.edits[0]["text"])
+        self.assertIn("на ферму", api.edits[0]["text"])
         self.assertNotIn("Особые преимущества", api.edits[0]["text"])
 
     def test_creature_screen_owns_the_picture_and_cage_controls(self):
@@ -617,6 +624,7 @@ class PetsCommandTests(unittest.TestCase):
         }
         self.assertNotIn("search", actions)
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_farm_menu_offers_four_quick_duration_buttons_then_starts_and_cancels(self):
         economy.grant(CHAT, PLAYER["id"], C.CAGE_PRICE + C.FARM_UPGRADE_COSTS[0], "test")
         self.assertTrue(pets.buy_cage(CHAT, PLAYER["id"], 0)[0])
@@ -1455,6 +1463,7 @@ class PetsCommandTests(unittest.TestCase):
         self.assertEqual([item["chat_id"] for item in api.photo_files], [PLAYER["id"], 43])
         self.assertFalse(any(item["chat_id"] == MAIN_CHAT_ID for item in api.photo_files))
 
+    @patch("pets_config.FARM_OPEN", True)
     def test_stale_arena_card_redraws_privately_instead_of_publishing_a_refusal(self):
         """A card can become stale between search and tap; never publish that refusal.
 

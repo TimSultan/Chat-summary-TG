@@ -55,6 +55,13 @@ Run at minimum:
 python -m unittest tests.test_pets_web tests.test_pets_combat tests.test_pets_gatekeeper tests.test_pets_phoenix -q
 ```
 
+The effect-balance check is opt-in because it simulates 14,400 fights. Run it whenever an
+item passive's numbers or the combat maths change:
+
+```powershell
+$env:RUN_BALANCE_TESTS = '1'; python -m unittest tests.test_pets_combat.EffectKnobTests -q
+```
+
 For a focused web change, run the affected test by its full `unittest` name first, then
 the full command above before handoff. Avoid fragile absolute latency limits for normal
 local work: test concurrency with a deliberately blocked worker and events, so a slow CI

@@ -30,11 +30,40 @@ class PetUpdatesTests(unittest.TestCase):
         self.assertFalse(pets_updates.has_unread(entry, user_id))
         self.assertTrue(pets_updates.has_unread(entry, 43))
 
-    def test_latest_arena_stake_news_pays_five_diamonds(self):
+    def test_the_closing_note_says_what_closed_and_where_the_meadow_went(self):
+        note = {row.id: row for row in pets_updates.UPDATES}["202609-quests-arena-dungeon"]
+        for closed in ("Ферма", "карьер", "карточные бои"):
+            self.assertIn(closed, note.text)
+        self.assertIn("оплачены полностью", note.text)
+        self.assertIn("Поляна переехала в подземелье", note.text)
+
+    def test_latest_news_brings_the_farm_back_and_keeps_converted_tickets(self):
+        """Players read the closing note first, so this one has to take back its farm
+        half -- and say plainly that the tickets it converted are not converted back."""
         newest = pets_updates.latest("chat")
-        self.assertEqual(newest.id, "202608-arena-five-percent-stake")
-        self.assertEqual(newest.reward_rubies, 5)
-        self.assertIn("5%", newest.text)
+        self.assertEqual(newest.id, "202609-farm-and-quarry-return")
+        self.assertIn("Ферма и карьер", newest.title)
+        self.assertIn("билеты фермы", newest.text)
+        self.assertIn("такими и остаются", newest.text)
+        self.assertEqual((newest.reward_rubies, newest.reward_tickets), (0, 0))
+
+    def test_card_duel_news_pays_ten_diamonds(self):
+        note = {row.id: row for row in pets_updates.UPDATES}["202608-card-duels"]
+        self.assertEqual(note.reward_rubies, 10)
+        # The two numbers the note exists to announce.
+        self.assertIn("втрое", note.text)
+        self.assertIn("5%", note.text)
+
+    def test_the_card_duel_note_corrects_the_arena_stake_note_above_it(self):
+        """The older note still tells players an arena win takes 5% of the loser's
+        diamonds, and that stopped being true when the card duel took that stake over.
+        A shipped note is never rewritten, so the correction has to live IN the newer
+        one -- otherwise the log's own history would read as a contradiction."""
+        notes = {row.id: row for row in pets_updates.UPDATES}
+        self.assertIn("5% алмазов",
+                      notes["202608-arena-five-percent-stake"].text)
+        self.assertIn("алмазы больше не забирают",
+                      notes["202608-card-duels"].text)
 
     def test_log_has_compact_owner_bound_arrow_buttons(self):
         entry = "chat"

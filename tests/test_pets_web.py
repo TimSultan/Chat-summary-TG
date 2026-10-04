@@ -8,6 +8,7 @@ bot_listener's _attach_extra mounts it in production -- so these also prove pets
 coexists with the rest of the server without colliding.
 """
 
+import copy
 import hashlib
 import hmac
 import asyncio
@@ -40,6 +41,7 @@ import donations
 import economy
 import maintenance
 import pets
+import pets_cardbattle
 import pets_config as C
 import pets_mobs
 import pets_scroll_catalog as SCROLLS
@@ -312,6 +314,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             ("post", "/api/action"), ("post", "/api/attack"),
             ("post", "/api/updates/claim"),
             ("post", "/api/test-battle/start"), ("post", "/api/test-battle/action"),
+            ("post", "/api/card-battle/start"), ("post", "/api/card-battle/action"),
         ):
             response = await getattr(self.client, method)(pets_web.ROUTE_PREFIX + path, json={})
             self.assertEqual(response.status, 401, f"{method} {path} let an unsigned caller in")
@@ -432,6 +435,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(body["ok"], body["message"])
         self.assertTrue(body["state"]["has_cage"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_state_survives_a_running_farm_and_its_live_timestamps(self):
         """Everything in the state is forwarded straight from pets.py, and some of what it
         returns is a live datetime rather than a string -- passive_income_status's
@@ -449,6 +453,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(state["farm"]["passive"]["next_hour"], (str, type(None)))
         self.assertTrue(state["farm"]["running"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_quarry_exposes_four_reward_cards_and_starts_the_selected_duration(self):
         self._tame(PLAYER)
         data = pets._load(CHAT)
@@ -2388,6 +2393,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(refused.status, 403, f"{method} {path} let a player moderate")
             self.assertEqual((await refused.json())["error"], "NOT_AN_ADMIN")
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_a_moderator_accepts_a_quest_and_the_reward_lands_exactly_once(self):
         """Accept is a web button on a slow connection, so it will be double-tapped. The
         second press must find the row already decided and move no money at all."""
@@ -2524,6 +2530,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
 
     # ---- the farm ticket ----------------------------------------------------------------
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_a_farm_ticket_ends_the_shift_immediately_without_touching_the_payout(self):
         """The ticket buys the waiting, not the work: the eight-hour reward has to survive
         being collected eight hours early, or the button is just a worse «Забрать сейчас»."""
@@ -2554,6 +2561,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         again = await self._action(PLAYER, "farm_ticket")
         self.assertFalse(again["ok"])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_farm_screen_only_offers_a_ticket_that_would_do_something(self):
         self._tame(PLAYER)
         self.assertTrue(pets.upgrade_farm(CHAT, PLAYER["id"], RICH_XP)[0])
@@ -3054,10 +3062,55 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(tabs.index('data-tab="dungeon"'), tabs.index('data-tab="farm"'))
         hero = page.split("function renderHero()", 1)[1].split("function tile(", 1)[0]
         self.assertNotIn("dungeonPanel()", hero)
-        # The grid has to grow with the row, or the new tab overflows the bar.
-        self.assertIn("grid-template-columns: repeat(8, 1fr);", page)
-        self.assertIn(".tabs.has-review { grid-template-columns: repeat(9, 1fr); }", page)
+        # One column per VISIBLE tab: the admin review tab and a closed feature's tab come
+        # and go, and a fixed column count would leave holes in the bar.
+        self.assertIn("display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;", page)
+        self.assertNotIn("repeat(8, 1fr)", page.split("<nav", 1)[0].split(".tabs {", 1)[1][:400])
 
+    @patch("pets_config.FARM_OPEN", False)
+    @patch("pets_config.CARD_DUEL_OPEN", False)
+    async def test_the_closed_farm_and_card_duel_leave_no_door_open(self):
+        """Closed on the server, not just hidden: an old button or a crafted request is
+        refused, the itemless screen still gets no bag, and the page draws neither."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        body = await self._action(PLAYER, "farm_start", hours=4, view="dungeon")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["message"], C.FARM_CLOSED_NOTICE)
+        self.assertIsNone(body["state"]["bag"])
+        self.assertEqual(body["state"]["features"], {"farm": False, "card_duel": False})
+        self.assertIn("подземелье", body["state"]["meadow"]["ticket_sources"])
+
+        duel = await self._post("/api/card-battle/start", PLAYER,
+                                {"opponent_id": str(OPPONENT["id"])})
+        self.assertEqual(duel.status, 409, await duel.text())
+        self.assertEqual((await duel.json())["error"], "CARD_DUEL_CLOSED")
+
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        # The farm tab starts hidden and only the server's `features` can show it.
+        self.assertIn('<button id="farmTab" data-tab="farm" hidden>', page)
+        self.assertIn('$("farmTab").hidden = !farmOpen;', page)
+        # The meadow is drawn by the dungeon screen, and no longer by the farm's.
+        dungeon = page.split("function renderDungeon()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("meadowPanel(meadow)", dungeon)
+        self.assertIn("renderMeadowScreen(box, meadow)", dungeon)
+        farm = page.split("function renderFarm()", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("meadow", farm.lower())
+
+    @patch("pets_config.FARM_OPEN", True)
+    async def test_a_reopened_farm_shows_its_tab_and_names_its_tickets(self):
+        """The switch is read per request: flipping it back shows the tab again and the
+        meadow stops telling players that quests pay its tickets."""
+        self._tame(PLAYER)
+        state = await (await self._get("/api/state", PLAYER)).json()
+        self.assertTrue(state["features"]["farm"])
+        self.assertIn("ферм", state["meadow"]["ticket_sources"])
+        body = await self._action(PLAYER, "farm_start", hours=4, view="farm")
+        self.assertNotEqual(body["message"], C.FARM_CLOSED_NOTICE)
+        self.assertIsNone(body["state"]["bag"])
+
+    @patch("pets_config.FARM_OPEN", True)
     async def test_the_quarry_offers_the_same_early_recall_the_farm_does(self):
         page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
         self.assertIn('data-do="quarrycancel"', page)
@@ -3623,6 +3676,7 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(str(PLAYER["id"]), [row["user_id"] for row in body["candidates"]])
 
+    @patch("pets_config.FARM_OPEN", True)
     async def test_granting_each_resource_moves_the_real_balance(self):
         self._tame(PLAYER)
         before = economy.balance(CHAT, PLAYER["id"], RICH_XP)
@@ -3837,6 +3891,734 @@ class PetsWebApiTests(unittest.IsolatedAsyncioTestCase):
         celebrant_view = await (await self._get("/api/opponents", THIRD)).json()
         self.assertTrue(celebrant_view["birthday"]["is_me"])
 
+
+    # ---- card duel -------------------------------------------------------------------
+
+    def _legendary_codes(self, count):
+        return [item.code for item in C.ITEMS if item.rarity == "legendary"][:count]
+
+    def _give(self, user, codes):
+        """Drop item codes straight into the bag. The routes that grant items are proven
+        elsewhere; this only needs a bag with known contents in it."""
+        data = pets._load(CHAT)
+        record = data["pets"][str(user["id"])]
+        record.setdefault("inventory", []).extend(codes)
+        pets._save(CHAT, data)
+
+    async def _open_duel(self, user, opponent):
+        response = await self._post("/api/card-battle/start", user,
+                                    {"opponent_id": str(opponent["id"])})
+        self.assertEqual(response.status, 200, await response.text())
+        return await response.json()
+
+    async def _duel_action(self, user, session, action, card=""):
+        return await self._post("/api/card-battle/action", user,
+                                {"session": session, "action": action, "card": card})
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_card_duel_deals_a_hand_energy_and_the_opponents_whole_next_turn(self):
+        """The four things the mode promises on the first screen: five cards, three
+        energy, both fighters at full health, and what the opponent has already committed
+        to for the turn after this one."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        battle = opened["battle"]
+
+        self.assertTrue(opened["session"])
+        self.assertEqual(len(battle["hand"]), pets_cardbattle.HAND_SIZE)
+        self.assertEqual(battle["energy"], pets_cardbattle.ENERGY_PER_TURN)
+        self.assertEqual(battle["turn"], 1)
+        self.assertFalse(battle["finished"])
+        for side in ("player", "enemy"):
+            fighter = battle["fighters"][side]
+            self.assertEqual(fighter["hp"], fighter["max_hp"])
+            self.assertGreater(fighter["max_hp"], 0)
+        # The intent is a whole announced turn, and every card in it is one the opponent
+        # can actually afford -- the panel would be a lie otherwise.
+        self.assertTrue(battle["enemy_intent"])
+        self.assertLessEqual(
+            sum(max(0, card["cost"]) for card in battle["enemy_intent"])
+            - sum(card["energy"] for card in battle["enemy_intent"]),
+            pets_cardbattle.ENERGY_PER_TURN,
+        )
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_every_card_states_its_damage_and_its_effect(self):
+        """A card the player is asked to spend energy on has to say what it does before
+        the tap, not after: a number for everything it changes, and a sentence."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(PLAYER, self._legendary_codes(6))
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        for card in opened["battle"]["hand"] + opened["battle"]["enemy_intent"]:
+            self.assertTrue(card["name"])
+            self.assertTrue(card["effect"], card["name"])
+            self.assertTrue(card["tags"], card["name"])
+            self.assertIsInstance(card["cost"], int)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_every_legendary_in_the_bag_becomes_exactly_one_card(self):
+        """All of them, not the equipped ones -- and a duplicate is still one card."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        codes = self._legendary_codes(4)
+        # A duplicate legendary, and two commons that must not become cards at all.
+        self._give(PLAYER, codes + [codes[0], "stick", "bead"])
+
+        base = len(pets_cardbattle.base_deck(10, 200))
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["legendaries"], len(codes))
+        self.assertEqual(opened["deck_size"]["player"], base + len(codes))
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_the_turns_of_a_duel_never_touch_the_store(self):
+        """The performance rule for this mode. Opening a duel writes (it takes the arena
+        fight) and finishing one writes (it settles the stake), but everything in between
+        is dictionary work on a session already in memory -- so a twenty-turn duel costs
+        the store exactly as much as a two-turn one."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(PLAYER, self._legendary_codes(3))
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 60
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+
+        real_load, real_save = pets._load, pets._save
+        loads, saves = [], []
+
+        def counting_load(entry, *args, **kwargs):
+            loads.append(entry)
+            return real_load(entry, *args, **kwargs)
+
+        def counting_save(entry, *args, **kwargs):
+            saves.append(entry)
+            return real_save(entry, *args, **kwargs)
+
+        during_turns = {"loads": 0, "saves": 0}
+        with patch.object(pets, "_load", counting_load), \
+             patch.object(pets, "_save", counting_save):
+            turns = 0
+            while not battle["finished"] and turns < pets_cardbattle.TURN_LIMIT + 2:
+                played = True
+                while played and not battle["finished"]:
+                    played = False
+                    for card in list(battle["hand"]):
+                        if card["cost"] <= battle["energy"]:
+                            response = await self._duel_action(
+                                PLAYER, session, "play", card["uid"])
+                            self.assertEqual(response.status, 200, await response.text())
+                            battle = (await response.json())["battle"]
+                            played = True
+                            break
+                if battle["finished"]:
+                    break
+                response = await self._duel_action(PLAYER, session, "end_turn")
+                self.assertEqual(response.status, 200, await response.text())
+                battle = (await response.json())["battle"]
+                turns += 1
+                if not battle["finished"]:
+                    # Fold this turn into the running total and start the next one clean,
+                    # so whatever is left at the end belongs to the settlement alone.
+                    during_turns["loads"] += len(loads)
+                    during_turns["saves"] += len(saves)
+                    loads.clear()
+                    saves.clear()
+
+            self.assertTrue(battle["finished"], "the duel never resolved")
+
+        # Everything counted above belongs to the ONE turn that ended the duel; the
+        # counters were reset after each turn that did not, and `during_turns` is what
+        # they came to. A settlement that crept into every turn would show up here as a
+        # multiple of the turn count rather than as a single fight's worth of work.
+        self.assertGreater(turns, 3, "the duel was too short to prove anything")
+        self.assertEqual(during_turns["loads"], 0,
+                         f"an ordinary turn read the store {during_turns['loads']} times")
+        self.assertEqual(during_turns["saves"], 0,
+                         f"an ordinary turn wrote {during_turns['saves']} times")
+        # The finishing turn settles, and settling costs about what an ordinary arena
+        # attack costs -- both build the same state payload on the way out. Bounded as a
+        # number rather than left open, so a second settlement path could not slip in.
+        self.assertLessEqual(len(saves), 4, f"the settlement wrote {len(saves)} times")
+        self.assertLessEqual(len(loads), 60, f"the settlement read {len(loads)} times")
+
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_the_turn_reports_the_cards_the_opponent_really_played(self):
+        """The screen animates this list card by card, so it has to be what HAPPENED and
+        not what was announced -- a stun cancels the turn outright and a killing blow cuts
+        it short. Each entry carries both fighters as they stood right after that card, so
+        a health bar can drop as the card lands instead of everything settling at once."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["battle"]["enemy_played"], [],
+                         "nothing has been played on the opening screen")
+        announced = opened["battle"]["enemy_intent"]
+
+        response = await self._duel_action(PLAYER, opened["session"], "end_turn")
+        self.assertEqual(response.status, 200, await response.text())
+        played = (await response.json())["battle"]["enemy_played"]
+
+        self.assertTrue(played)
+        self.assertLessEqual(len(played), len(announced))
+        for index, row in enumerate(played):
+            self.assertEqual(row["card"]["name"], announced[index]["name"])
+            self.assertTrue(row["card"]["tags"], "an animated card still needs its numbers")
+            for side in ("player", "enemy"):
+                fighter = row["fighters"][side]
+                self.assertIn("hp", fighter)
+                self.assertIn("max_hp", fighter)
+        # The last snapshot is where the turn actually left the two of them.
+        final = (await response.json())["battle"]["fighters"]
+        self.assertEqual(played[-1]["fighters"]["player"]["hp"], final["player"]["hp"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_playing_a_card_clears_last_turns_playback(self):
+        """Otherwise the screen would replay the opponent's cards on top of the player's
+        own, every time a card is tapped."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        ended = await (await self._duel_action(
+            PLAYER, opened["session"], "end_turn")).json()
+        self.assertTrue(ended["battle"]["enemy_played"])
+
+        card = next(row for row in ended["battle"]["hand"]
+                    if row["cost"] <= ended["battle"]["energy"])
+        played = await (await self._duel_action(
+            PLAYER, opened["session"], "play", card["uid"])).json()
+        self.assertEqual(played["battle"]["enemy_played"], [])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_lost_duel_settles_too_and_hands_back_fresh_state(self):
+        """Standing still until the opponent wins is still a settled fight: the loser pays
+        their share, and the screen gets the wallet it has to draw next without asking a
+        second time."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        economy.grant(CHAT, PLAYER["id"], 800, "test-purse")
+        pets.grant_rubies_once(CHAT, PLAYER["id"], 60, "lost-duel-seed")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 60
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+        body = None
+        while not battle["finished"]:
+            response = await self._duel_action(PLAYER, session, "end_turn")
+            self.assertEqual(response.status, 200, await response.text())
+            body = await response.json()
+            battle = body["battle"]
+
+        self.assertEqual(battle["winner"], "enemy")
+        reward = body["reward"]
+        self.assertIsNotNone(reward)
+        self.assertFalse(reward["won"])
+        self.assertEqual(reward["gold"], 0)
+        # The loser pays on both wallets, which is what makes this mode the only place a
+        # diamond changes hands.
+        self.assertGreater(reward["loss_gold"], 0)
+        self.assertGreater(reward["loss_rubies"], 0)
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), 60 - reward["loss_rubies"])
+        self.assertIsNotNone(body.get("state"))
+
+
+    async def test_an_ordinary_arena_fight_no_longer_takes_diamonds(self):
+        """Coins still move on the same five percent. Diamonds do not move at all -- that
+        stake belongs to the card duel now, and to nothing else in the game."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        pets.grant_rubies_once(CHAT, OPPONENT["id"], 100, "test-seed")
+        pets.grant_rubies_once(CHAT, PLAYER["id"], 10, "test-seed-2")
+        before = pets.ruby_balance(CHAT, OPPONENT["id"])
+        self.assertEqual(before, 100)
+
+        for _ in range(6):
+            data = pets._load(CHAT)
+            data["pets"][str(PLAYER["id"])]["fight_bank"] = 99
+            pets._save(CHAT, data)
+            response = await self._post("/api/attack", PLAYER,
+                                        {"opponent_id": str(OPPONENT["id"])})
+            self.assertEqual(response.status, 200, await response.text())
+            body = await response.json()
+            self.assertEqual(body["reward"]["transfer_rubies"], 0)
+            self.assertEqual(body["reward"]["loss_rubies"], 0)
+            self.assertEqual(body["reward"]["opponent_loss_rubies"], 0)
+
+        self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]), before,
+                         "an arena fight moved diamonds")
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_card_duel_costs_a_fight_the_moment_it_opens(self):
+        """Charged up front, so walking out of a duel that is going badly is not free.
+        With triple pay on the line, settling the cost at the end would make abandon and
+        retry the whole game."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 2
+        pets._save(CHAT, data)
+
+        before = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        after = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        self.assertEqual(after, before - 1)
+
+        # Walking away without finishing does not give it back.
+        self.assertTrue(opened["session"])
+        again = (await (await self._get("/api/state", PLAYER)).json())["arena"]["available"]
+        self.assertEqual(again, before - 1)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_card_duel_with_an_empty_bank_is_refused(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 0
+        data["pets"][str(PLAYER["id"])]["fight_bank_at"] = pets.app_now().isoformat()
+        pets._save(CHAT, data)
+
+        refused = await self._post("/api/card-battle/start", PLAYER,
+                                   {"opponent_id": str(OPPONENT["id"])})
+        self.assertEqual(refused.status, 409, await refused.text())
+        self.assertEqual((await refused.json())["error"], "CANNOT_FIGHT")
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_won_card_duel_pays_triple_and_takes_the_losers_diamonds(self):
+        """The two things this mode was asked for, measured against an ordinary arena win
+        rather than against a hard-coded number, so a later retune of the arena purse
+        cannot quietly leave this test asserting the old economy."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        pets.grant_rubies_once(CHAT, OPPONENT["id"], 200, "duel-seed")
+        # A real purse to take a bite out of. The test fixture gives nobody recorded chat
+        # statistics, so a defender's derived balance is otherwise zero and the coin half
+        # of the stake would assert nothing.
+        economy.grant(CHAT, OPPONENT["id"], 1000, "test-purse")
+        loser_xp = pets._chat_xp_for(CHAT, str(OPPONENT["id"]))
+        loser_purse = economy.balance(CHAT, OPPONENT["id"], loser_xp)
+        self.assertGreaterEqual(loser_purse, 1000)
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 50
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        battle = opened["battle"]
+        # Force the win rather than playing it out: the engine's own rules are covered
+        # elsewhere, and what is under test here is the settlement.
+        store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
+        store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
+
+        card = next(row for row in battle["hand"] if row["damage"] and row["cost"] <= battle["energy"])
+        response = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(response.status, 200, await response.text())
+        body = await response.json()
+        self.assertTrue(body["battle"]["finished"])
+        self.assertEqual(body["battle"]["winner"], "player")
+
+        reward = body["reward"]
+        self.assertIsNotNone(reward, "a finished duel must settle")
+        self.assertTrue(reward["won"])
+        # Triple an arena win, before the level and cage modifiers this pet has none of.
+        floor = round(C.ARENA_WIN_GOLD_MIN * C.CARD_DUEL_GOLD_MULTIPLIER)
+        ceiling = round(C.ARENA_WIN_GOLD_MAX * C.CARD_DUEL_GOLD_MULTIPLIER * 1.5)
+        self.assertGreaterEqual(reward["gold"], floor)
+        self.assertLessEqual(reward["gold"], ceiling)
+        # Five percent of the loser's 200 diamonds.
+        self.assertEqual(reward["transfer_rubies"],
+                         C.arena_loss_transfer(200))
+        self.assertEqual(pets.ruby_balance(CHAT, PLAYER["id"]), reward["transfer_rubies"])
+        self.assertEqual(pets.ruby_balance(CHAT, OPPONENT["id"]),
+                         200 - reward["transfer_rubies"])
+        # Coins moved on the same five percent share an arena fight uses, and came out of
+        # the loser rather than being minted.
+        self.assertEqual(reward["transfer_gold"], C.arena_loss_transfer(loser_purse))
+        self.assertEqual(economy.balance(CHAT, OPPONENT["id"], loser_xp),
+                         loser_purse - reward["transfer_gold"])
+        # And the screen gets a fresh wallet without asking a second time.
+        self.assertIsNotNone(body.get("state"))
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_finished_duel_can_only_be_settled_once(self):
+        """The session is dropped in the same breath as the payout, so a replayed or
+        double-tapped request finds nothing rather than paying twice."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 50
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        store = self.app[pets_web._CARD_BATTLE_SESSIONS_KEY]
+        store[session]["battle"]["fighters"]["enemy"]["hp"] = 1
+        card = next(row for row in opened["battle"]["hand"]
+                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+
+        first = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(first.status, 200)
+        paid = (await first.json())["reward"]["gold"]
+        self.assertGreater(paid, 0)
+        purse = economy.balance(CHAT, PLAYER["id"], RICH_XP)
+
+        replay = await self._duel_action(PLAYER, session, "play", card["uid"])
+        self.assertEqual(replay.status, 404, await replay.text())
+        self.assertEqual(economy.balance(CHAT, PLAYER["id"], RICH_XP), purse)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_the_opponents_draw_pile_never_reaches_the_client(self):
+        """Only the turn they have announced. A duel where the other deck can be read out
+        of the response is not the game this screen is playing."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        self._give(OPPONENT, self._legendary_codes(5))
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        battle = opened["battle"]
+        self.assertNotIn("enemy_draw", battle)
+        self.assertNotIn("enemy_hand", battle)
+        self.assertNotIn("player_draw", battle)
+        # Sizes are fine to know; contents are not.
+        self.assertIn("enemy_draw", battle["deck"])
+        self.assertIsInstance(battle["deck"]["enemy_draw"], int)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_the_announced_turn_is_the_turn_that_gets_played(self):
+        """The intent panel is the whole feature. Whatever it showed has to be what lands
+        -- an opponent that re-picks after seeing the player's turn would make it a lie."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        announced = opened["battle"]["enemy_intent"]
+        response = await self._duel_action(PLAYER, opened["session"], "end_turn")
+        self.assertEqual(response.status, 200, await response.text())
+        log = "\n".join((await response.json())["battle"]["log"])
+        for card in announced:
+            if card["damage"] or card["block"] or card["heal"]:
+                self.assertIn(card["name"], log, card["name"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_card_nobody_can_pay_for_is_refused(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session, battle = opened["session"], opened["battle"]
+        # Spend the turn down to nothing, then try the cheapest card still in hand.
+        for card in list(battle["hand"]):
+            if card["cost"] and card["cost"] <= battle["energy"]:
+                battle = (await (await self._duel_action(
+                    PLAYER, session, "play", card["uid"])).json())["battle"]
+        stuck = next((card for card in battle["hand"] if card["cost"] > battle["energy"]),
+                     None)
+        if stuck is not None:
+            refused = await self._duel_action(PLAYER, session, "play", stuck["uid"])
+            self.assertEqual(refused.status, 409, await refused.text())
+            self.assertEqual((await refused.json())["error"], "BAD_CARD_ACTION")
+
+        missing = await self._duel_action(PLAYER, session, "play", "no-such-card")
+        self.assertEqual(missing.status, 409, await missing.text())
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_duel_belongs_to_the_player_who_opened_it(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        stolen = await self._duel_action(OPPONENT, opened["session"], "end_turn")
+        self.assertEqual(stolen.status, 403, await stolen.text())
+        self.assertEqual((await stolen.json())["error"], "WRONG_CARD_OWNER")
+
+        gone = await self._duel_action(PLAYER, "not-a-session", "end_turn")
+        self.assertEqual(gone.status, 404, await gone.text())
+        self.assertEqual((await gone.json())["error"], "NO_CARD_SESSION")
+
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_both_sides_of_a_card_duel_get_the_same_body(self):
+        """The mode's whole design: stats decide the arena, cards decide here. A pet
+        loaded with gear and levels and one that has never been touched sit down to the
+        same health and the same Strike, and only their decks differ."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+
+        data = pets._load(CHAT)
+        strong = data["pets"][str(PLAYER["id"])]
+        strong["level"] = 40
+        strong["stats"] = {key: 60 for key in C.STAT_KEYS}
+        weak = data["pets"][str(OPPONENT["id"])]
+        weak["level"] = 1
+        weak["stats"] = {key: C.STAT_MIN_LEVEL for key in C.STAT_KEYS}
+        pets._save(CHAT, data)
+        # The two really are far apart everywhere else.
+        self.assertGreater(pets._power_rating_for(strong), pets._power_rating_for(weak) * 3)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        mine = opened["battle"]["fighters"]["player"]
+        theirs = opened["battle"]["fighters"]["enemy"]
+        self.assertEqual(mine["max_hp"], theirs["max_hp"])
+        self.assertEqual(mine["max_hp"], pets_web.CARD_MAX_HP)
+        self.assertEqual(opened["attack"], pets_web.CARD_ATTACK)
+
+        # And the numbers on the cards are the fixed ones, not stat-derived: a Strike is
+        # a Strike for everybody, which is what lets a deck be learned once.
+        strike = next(card for card in opened["battle"]["hand"] + [
+            card for card in opened["battle"]["enemy_intent"]
+        ] if card["code"] == "strike")
+        self.assertEqual(strike["damage"], pets_web.CARD_ATTACK)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_levelling_up_changes_nothing_about_a_card_duel(self):
+        """Same player, same opponent, before and after a large stat gain."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        before = await self._open_duel(PLAYER, OPPONENT)
+
+        data = pets._load(CHAT)
+        record = data["pets"][str(PLAYER["id"])]
+        record["level"] = 50
+        record["stats"] = {key: 99 for key in C.STAT_KEYS}
+        pets._save(CHAT, data)
+
+        after = await self._open_duel(PLAYER, OPPONENT)
+        for side in ("player", "enemy"):
+            self.assertEqual(after["battle"]["fighters"][side]["max_hp"],
+                             before["battle"]["fighters"][side]["max_hp"])
+        self.assertEqual(after["deck_size"], before["deck_size"])
+
+    async def test_the_duel_screen_still_says_the_two_bodies_are_identical(self):
+        """The fact survived the banner that used to carry it: it is one muted line under
+        the log now, because it is true for the whole duel and worth a glance once."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("у обоих ", page)
+        self.assertIn("HP и удар ", page)
+        # ...and the purple block above the fighters really is gone.
+        self.assertNotIn("cardbanner", page)
+        self.assertNotIn("Бои арены не тратятся", page)
+
+
+    async def test_the_duel_screen_gives_up_the_hud_and_takes_the_whole_page(self):
+        """The HUD's wallet, level and fight counter are not spent on this board, and it
+        costs the same strip of height on every turn of every duel."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("body.induel { --hud: 0px; }", page)
+        self.assertIn("body.induel .hud { display: none; }", page)
+        # Put on when a duel opens and taken off again when it closes -- an unbalanced
+        # pair would leave the rest of the game with no HUD at all.
+        opened = page.split("async function openCardBattle(opponentId) {", 1)[1]
+        self.assertIn('document.body.classList.add("induel")', opened.split("\n}", 1)[0])
+        closed = page.split("function closeCardBattle() {", 1)[1]
+        self.assertIn('document.body.classList.remove("induel")', closed.split("\n}", 1)[0])
+
+    async def test_a_new_hand_is_dealt_face_up_once_per_turn(self):
+        """Every played card re-renders the same turn. Without the guard the whole hand
+        would flip itself back over on every tap."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("@keyframes carddeal", page)
+        self.assertIn("rotateY(", page)
+        render = page.split("function renderCardBattle(box) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("const dealing = battle.turn !== CARD_DEALT_TURN;", render)
+        self.assertIn("dealing ? index : -1", render)
+        self.assertIn("CARD_DEALT_TURN = battle.turn;", render)
+        # The stagger is what makes it a deal rather than five cards arriving at once.
+        self.assertIn("animation-delay:' + Number(deal) * 60", page)
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_every_scroll_in_the_collection_becomes_a_card(self):
+        """Magic joins the deck the same way legendaries did -- the whole collection, not
+        the four equipped slots. A duel has no loadout to build first, and a collection
+        that could only ever play four of its spells would be worse than none."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        record = data["pets"][str(PLAYER["id"])]
+        codes = [row["code"] for row in SCROLLS.REGULAR_SCROLLS[:3]]
+        codes.append(SCROLLS.ULTIMATE_SCROLLS[0]["code"])
+        record["owned_scrolls"] = list(codes)
+        record["fight_bank"] = 40
+        pets._save(CHAT, data)
+
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        self.assertEqual(opened["scrolls"], len(codes))
+        base = len(pets_cardbattle.base_deck(pets_web.CARD_ATTACK, pets_web.CARD_MAX_HP))
+        self.assertEqual(opened["deck_size"]["player"], base + len(codes))
+
+    async def test_a_spell_card_states_its_numbers_like_any_other(self):
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        data = pets._load(CHAT)
+        data["pets"][str(PLAYER["id"])]["fight_bank"] = 40
+        pets._save(CHAT, data)
+
+        for row in SCROLLS.SCROLLS:
+            card = pets_cardbattle.card_from_scroll(
+                {"code": row["code"], "name": row["name"], "icon": row.get("icon"),
+                 "short": row.get("short"), "ultimate": row.get("ultimate"),
+                 "effects": row.get("effects")},
+                pets_web.CARD_ATTACK, pets_web.CARD_MAX_HP,
+            )
+            self.assertTrue(card["tags"] if "tags" in card
+                            else pets_cardbattle.tags(card), row["code"])
+            self.assertTrue(card["effect"], row["code"])
+            self.assertGreaterEqual(card["cost"], 1)
+            self.assertLessEqual(card["cost"], 3)
+            # The catalogue's shared prefix is dead weight on a card 132 pixels wide.
+            self.assertNotIn("Магический свиток:", card["name"])
+            # An ultimate is a once-a-fight finisher in the arena and stays one here.
+            self.assertEqual(card["exhaust"], bool(row.get("ultimate")), row["code"])
+
+    async def test_a_cleansing_spell_lifts_the_harm_and_leaves_the_help(self):
+        """Regen decays like a curse does, so a cleanse written as "everything that ticks
+        down" would punish the player for casting it."""
+        battle = pets_cardbattle.start(
+            {"id": "a", "name": "A", "max_hp": 200, "attack": 20},
+            {"id": "b", "name": "B", "max_hp": 200, "attack": 20},
+            [pets_cardbattle.CardTemplate("purge", "Очищение", 1, cleanse=True).public()],
+            [], seed=5,
+        )
+        status = battle["fighters"]["player"]["status"]
+        status.update({"burn": 4, "poison": 3, "weak": 2, "vulnerable": 2,
+                       "regen": 5, "strength": 3})
+        battle = pets_cardbattle.play(battle, battle["hand"][0]["uid"])
+
+        after = battle["fighters"]["player"]["status"]
+        for harmful in ("burn", "poison", "weak", "vulnerable"):
+            self.assertEqual(after[harmful], 0, harmful)
+        self.assertEqual(after["regen"], 5, "a cleanse must not burn off regeneration")
+        self.assertEqual(after["strength"], 3, "a cleanse must not undo a buff")
+
+    # ---- the end-of-turn forecast -------------------------------------------------------
+
+    def _forecast_duel(self, enemy_cards, player_cards=None, seed=11):
+        strike = pets_cardbattle.CardTemplate("strike", "Удар", 1, damage=20).public()
+        guard = pets_cardbattle.CardTemplate("guard", "Защита", 1, block=17).public()
+        return pets_cardbattle.start(
+            {"id": "a", "name": "A", "max_hp": 360, "attack": 20},
+            {"id": "b", "name": "B", "max_hp": 360, "attack": 20},
+            player_cards or [guard] * 6, enemy_cards or [strike] * 6, seed=seed,
+        )
+
+    async def test_the_forecast_is_the_real_end_of_turn_and_changes_nothing(self):
+        """The screen draws the forecast as the slice of the health bar about to go, so it
+        has to be exactly what ending the turn does -- and working it out must not move the
+        duel on, deal a card or advance the shuffle."""
+        battle = self._forecast_duel(None)
+        # A burn on the player too, which ticks at the end of their own turn: the forecast
+        # has to count it along with the opponent's cards.
+        battle["fighters"]["player"]["status"]["burn"] = 4
+        before = copy.deepcopy(battle)
+
+        forecast = pets_cardbattle.forecast(battle)
+        self.assertEqual(battle, before, "a forecast must not touch the duel")
+
+        ended = pets_cardbattle.end_turn(battle)
+        self.assertEqual(forecast["player_hp"], ended["fighters"]["player"]["hp"])
+        self.assertEqual(forecast["enemy_hp"], ended["fighters"]["enemy"]["hp"])
+        self.assertIsNone(forecast["outcome"])
+        self.assertLess(forecast["player_hp"], 360 - 4, "three Strikes and a burn land")
+        # And the screen gets it with every state, recomputed as the turn changes.
+        self.assertEqual(pets_cardbattle.public(battle)["forecast"], forecast)
+
+    async def test_block_played_this_turn_shrinks_the_forecast_loss(self):
+        battle = self._forecast_duel(None)
+        bare = pets_cardbattle.forecast(battle)["player_hp"]
+        guarded = pets_cardbattle.play(battle, battle["hand"][0]["uid"])
+        self.assertEqual(guarded["fighters"]["player"]["block"], 17)
+        self.assertEqual(pets_cardbattle.forecast(guarded)["player_hp"], bare + 17)
+
+    async def test_the_forecast_names_a_killing_turn_and_is_absent_once_it_is_over(self):
+        battle = self._forecast_duel(None)
+        battle["fighters"]["player"]["hp"] = 15
+        self.assertEqual(pets_cardbattle.forecast(battle)["outcome"], "loss")
+        self.assertEqual(pets_cardbattle.forecast(battle)["player_hp"], 0)
+
+        battle["fighters"]["enemy"]["hp"] = 1
+        battle["fighters"]["enemy"]["status"]["burn"] = 3
+        battle["fighters"]["player"]["hp"] = 360
+        # The opponent's own burn ticks after their cards: they fall on their own turn.
+        self.assertEqual(pets_cardbattle.forecast(battle)["outcome"], "win")
+
+        battle["finished"] = True
+        self.assertIsNone(pets_cardbattle.forecast(battle))
+        self.assertIsNone(pets_cardbattle.public(battle)["forecast"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_every_duel_response_forecasts_the_turn_it_leaves_on_screen(self):
+        """Over HTTP, on the opening deal and after a turn: the forecast a response carries
+        is what the NEXT end_turn really leaves the player with."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        forecast = opened["battle"]["forecast"]
+        self.assertEqual(set(forecast), {"player_hp", "enemy_hp", "outcome"})
+
+        ended = await (await self._duel_action(PLAYER, opened["session"], "end_turn")).json()
+        if not ended["battle"]["finished"]:
+            self.assertEqual(ended["battle"]["fighters"]["player"]["hp"], forecast["player_hp"])
+            self.assertEqual(ended["battle"]["fighters"]["enemy"]["hp"], forecast["enemy_hp"])
+            self.assertIsNotNone(ended["battle"]["forecast"])
+
+    @patch("pets_config.CARD_DUEL_OPEN", True)
+    async def test_a_settled_duel_hands_back_the_arena_state_without_the_bag(self):
+        """The result screen reads the fight bank off this state to say what a rematch
+        costs, and draws no item -- so the inventory stays on the server."""
+        self._tame(PLAYER)
+        self._tame(OPPONENT, name="Соперник")
+        opened = await self._open_duel(PLAYER, OPPONENT)
+        session = opened["session"]
+        self.app[pets_web._CARD_BATTLE_SESSIONS_KEY][session]["battle"]["fighters"]["enemy"]["hp"] = 1
+        card = next(row for row in opened["battle"]["hand"]
+                    if row["damage"] and row["cost"] <= opened["battle"]["energy"])
+        body = await (await self._duel_action(PLAYER, session, "play", card["uid"])).json()
+
+        self.assertTrue(body["battle"]["finished"])
+        self.assertIsNone(body["battle"]["forecast"])
+        self.assertIsNone(body["state"]["bag"])
+        self.assertIn("available", body["state"]["arena"])
+
+    async def test_the_arena_row_puts_power_above_the_name_and_a_card_button_beside_it(self):
+        """The opponent row carries two fights now. The power rating moved to the left,
+        above the name and smaller, and the right-hand column it vacated is the card
+        button -- which must be a SIBLING of the arena button, never nested inside it."""
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        row = page.split("function foeRow(foe, canFight)", 1)[1].split("\n}", 1)[0]
+
+        self.assertIn("<div class=\"foewrap' + (cardDuel ? \"\" : \" solo\")", row)
+        self.assertIn("class='pw above'", row)
+        self.assertIn("data-cardfoe=", row)
+        # Drawn only while the card duel is open; closed, the arena button spans the row.
+        self.assertIn("const cardDuel = Boolean((S.features || {}).card_duel);", row)
+        self.assertLess(row.index("(cardDuel\n"), row.index("data-cardfoe="))
+        self.assertIn(".foewrap.solo { grid-template-columns: 1fr; }", page)
+        # The power is printed before the name, not after the fight counts.
+        self.assertLess(row.index("pw above"), row.index("esc(foe.name"))
+        # The arena button is closed before the card button opens.
+        self.assertLess(row.index("</button>"), row.index("data-cardfoe="))
+        # Smaller, same gold: the size is set in CSS, the colour is still .pw's.
+        self.assertIn(".foewrap .pw.above { display: block; font-size: 11px;", page)
+        self.assertIn(".pw { color: var(--gold); font-weight: 700; }", page)
+
+    async def test_the_duel_screen_draws_the_cost_the_numbers_and_the_rules_text(self):
+        page = await (await self.client.get(pets_web.ROUTE_PREFIX)).text()
+        self.assertIn("function cardMarkup(card, playable, affordable, deal)", page)
+        self.assertIn('class="cardcost"', page)
+        self.assertIn('class="cardtags"', page)
+        self.assertIn('class="cardtext"', page)
+        self.assertIn("Соперник в следующий ход", page)
+        self.assertIn('data-cardplay="', page)
+        self.assertIn('data-cardbattle="end"', page)
+
     async def test_clearing_takes_the_celebration_out_of_the_roster(self):
         self._tame(PLAYER)
         self._tame(THIRD, name="Именинник")
@@ -3897,6 +4679,267 @@ class AttachContractTests(unittest.TestCase):
         )
         self.assertIn(pets_web.ROUTE_PREFIX + "/api/state",
                       [getattr(route.resource, "canonical", "") for route in app.router.routes()])
+
+
+
+class ClickableContractTests(unittest.TestCase):
+    """Every control in the Mini App is a data- attribute, and the ONE delegated click
+    listener finds it with `event.target.closest(CLICKABLE)`. An attribute handleClick
+    branches on but CLICKABLE does not list is a dead button: the listener returns before
+    the handler runs, so the tap produces no action, no error and no toast -- there is
+    nothing on screen or in the console to notice.
+
+    That shipped twice. The arena's "Повторить" button was inert from the day it was
+    added, and every button of the card duel was inert on its first run. Both were one
+    missing selector, and nothing else in this suite reads the two halves together.
+    """
+
+    #: Attributes that ride ALONG with a trigger rather than being one. They live on the
+    #: same element as a registered attribute and only ever supply that branch a value
+    #: (data-times on a data-up button, data-floor on a data-bosstest button), so they are
+    #: read out of the dataset without ever being matched against CLICKABLE. A new name
+    #: here has to be a genuine parameter -- if a tap is supposed to START from it, it
+    #: belongs in CLICKABLE instead.
+    PARAMETERS = frozenset({
+        "choice", "code", "enabled", "fights", "floor", "forgecursed", "forgeslot",
+        "heal", "index", "personalcode", "times", "user",
+    })
+
+    def _page(self):
+        return pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+
+    def _halves(self):
+        script = re.findall(r"<script>(.*?)</script>", self._page(), re.S)[-1]
+        listed = re.search(
+            r"const CLICKABLE = (.*?);\r?\n\r?\nasync function handleClick", script, re.S,
+        )
+        self.assertIsNotNone(listed, "CLICKABLE is no longer declared before handleClick")
+        registered = set(re.findall(r"\[data-([a-z]+)\]", listed.group(1)))
+        body = script.split("async function handleClick(event, target) {", 1)[1]
+        referenced = set(re.findall(r"\bd\.([A-Za-z]+)", body))
+        return registered, referenced
+
+    def test_every_attribute_the_handler_branches_on_can_actually_be_tapped(self):
+        registered, referenced = self._halves()
+        dead = sorted((referenced - registered) - self.PARAMETERS)
+        self.assertEqual(dead, [], "handleClick reads these, but no tap can ever reach "
+                                   "them -- add each to CLICKABLE: " + ", ".join(dead))
+
+    def test_the_card_duel_controls_are_registered(self):
+        """Named outright, because these are the ones that shipped dead."""
+        registered, _ = self._halves()
+        for name in ("cardfoe", "cardplay", "cardbattle", "arenaretry"):
+            self.assertIn(name, registered, "data-" + name + " cannot be tapped")
+
+    def test_nothing_is_listed_as_clickable_that_no_branch_answers(self):
+        """The other direction: a selector kept after its handler was deleted makes a
+        button that presses, spins its `.pressed` state and then does nothing."""
+        registered, referenced = self._halves()
+        orphans = sorted(registered - referenced)
+        self.assertEqual(orphans, [], "CLICKABLE lists these, but handleClick answers "
+                                      "none of them: " + ", ".join(orphans))
+
+
+
+class VerticalSwipeContractTests(unittest.TestCase):
+    """Telegram treats a vertical drag inside the web view as "collapse the Mini App".
+    Anything on screen that owns a scroller of its own has to borrow that gesture while
+    it is open and hand it back afterwards -- and because two such things can overlap, the
+    borrowing is counted rather than toggled.
+
+    The card duel is the case that made this necessary: its hand and its intent row are
+    sideways scrollers, so a finger that starts on a card and drags down scrolls neither
+    of them, and the whole swipe reached Telegram, which dragged the window down instead
+    of the page.
+    """
+
+    def _script(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        return re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+
+    def test_only_the_counted_helpers_touch_telegrams_swipe_methods(self):
+        """The whole pairing rests on this. One stray enableVerticalSwipes() elsewhere
+        would hand the gesture back while a duel or a sheet was still holding it, and the
+        symptom -- a window that drags away under a finger -- is not one a reader would
+        trace back to the call."""
+        script = self._script()
+        for method in ("disableVerticalSwipes", "enableVerticalSwipes"):
+            sites = [line.strip() for line in script.splitlines()
+                     if "tg." + method in line]
+            self.assertEqual(len(sites), 1,
+                             method + " is called from " + str(len(sites)) +
+                             " places; it belongs only in lockSwipes/unlockSwipes")
+        # ...and those single call sites really are the two helpers.
+        lock = script.split("function lockSwipes(reason) {", 1)[1].split("\n}", 1)[0]
+        unlock = script.split("function unlockSwipes(reason) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("tg.disableVerticalSwipes()", lock)
+        self.assertIn("tg.enableVerticalSwipes()", unlock)
+        # The count is what makes overlapping holders safe.
+        self.assertIn("SWIPE_LOCKS.add(reason)", lock)
+        self.assertIn("if (SWIPE_LOCKS.size) return;", unlock)
+
+    def test_the_duel_and_the_sheet_each_take_and_return_the_gesture(self):
+        script = self._script()
+        for opener, closer, reason in (
+            ("function sheet(html, extraClass) {", "function closeSheet() {", "sheet"),
+            ("async function openCardBattle(opponentId) {",
+             "function closeCardBattle() {", "cardduel"),
+        ):
+            body = script.split(opener, 1)[1].split("\n}", 1)[0]
+            self.assertIn('lockSwipes("' + reason + '")', body, opener)
+            shut = script.split(closer, 1)[1].split("\n}", 1)[0]
+            self.assertIn('unlockSwipes("' + reason + '")', shut, closer)
+
+    def test_the_sideways_scrollers_do_not_chain_their_overscroll(self):
+        """The fallback for a client older than Bot API 7.7, which has no
+        disableVerticalSwipes to borrow in the first place."""
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        row = page.split(".cardrow {", 1)[1].split("}", 1)[0]
+        self.assertIn("overscroll-behavior: contain", row)
+
+
+
+class CardAnimationContractTests(unittest.TestCase):
+    """The duel screen's layout and its one animation, checked as source because neither
+    is reachable from an HTTP response: the hand has to sit where a thumb and a short
+    flight path both want it, and a flight that never resolves would leave the duel
+    refusing taps forever."""
+
+    def _script(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        return re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
+
+    def _render(self):
+        body = self._script().split("function renderCardBattle(box) {", 1)[1]
+        return body.split("\n}", 1)[0]
+
+    def _function(self, signature):
+        return self._script().split(signature, 1)[1].split("\n}", 1)[0]
+
+    def test_the_announced_turn_sits_on_the_opponents_panel_above_the_hand(self):
+        """The announced turn used to go under the hand, and with it under the fold: as
+        full-size cards it was the one thing that would not fit. As tiles it sits on the
+        opponent's own panel, and the whole table -- their plan, both faces, the hand and
+        the button -- fits one screen."""
+        render = self._render()
+        self.assertIn("'<div class=\"cardintent'", render)
+        self.assertIn('cardSide(foe, faces.enemy, "enemy", plan', render)
+        stage = render.index('id="cardStage"')
+        hand = render.index('id="cardHand"')
+        self.assertLess(stage, hand, "the hand must come after the two fighters")
+        self.assertLess(hand, render.index("cardActions(battle)"),
+                        "the button goes under the hand, where the thumb is")
+        # Tiles in the markup, and the playback flies out of those tiles.
+        self.assertIn("intent.map(cardTile)", render)
+        self.assertIn('".cardintent .cardtile"', self._function("async function endCardTurn() {"))
+
+    def test_one_tap_plays_a_card_whose_rules_are_printed_on_it(self):
+        """A tap plays the card outright, with nothing to confirm -- which is only fair
+        because every card in the hand carries its own rules text, readable before it."""
+        markup = self._function("function cardMarkup(card, playable, affordable, deal) {")
+        self.assertIn('data-cardplay="', markup)
+        self.assertIn('class="cardtext"', markup)
+        # Dimmed when unaffordable but never disabled, so the tap can say why.
+        self.assertNotIn('" disabled"', markup)
+        self.assertIn('" poor"', markup)
+        page = pets_web.PAGE_HTML
+        text = page.split("  .cardtext {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("display: none", text, "the rules must show on the card itself")
+        play = self._function("async function playCard(uid) {")
+        self.assertIn('toast("Не хватает энергии на эту карту.")', play)
+        self.assertNotIn("pickCard", self._script())
+        self.assertNotIn("data-cardpick", self._script())
+        actions = self._function("function cardActions(battle) {")
+        self.assertIn('data-cardbattle="end"', actions)
+        self.assertNotIn("data-cardplay", actions)
+
+    def test_leaving_a_paid_duel_asks_first(self):
+        """The duel is paid for when it opens; walking out of it pays nothing back."""
+        render = self._render()
+        self.assertIn('(over ? "close" : "leave")', render)
+        leave = self._function("function confirmCardLeave() {")
+        self.assertIn("if (!CARD_BATTLE || CARD_BATTLE.finished) { closeCardBattle(); return; }",
+                      leave)
+        self.assertIn("sheet(", leave)
+        self.assertIn('data-cardbattle="close"', leave)
+        self.assertIn('if (d.cardbattle === "leave") { confirmCardLeave(); return; }',
+                      self._script())
+        # ...and no tab is a way out of it either.
+        page = pets_web.PAGE_HTML
+        self.assertIn("body.induel .tabs { display: none; }", page)
+
+    def test_the_health_preview_is_the_servers_forecast_not_a_second_copy_of_the_rules(self):
+        paint = self._function("function paintForecast() {")
+        self.assertIn("battle.forecast", paint)
+        line = self._function("function cardForecastLine(battle) {")
+        self.assertIn("battle.forecast", line)
+        for rule in ("VULNERABLE", "WEAK", "vulnerable", "* 1.5", "* .67"):
+            self.assertNotIn(rule, paint + line)
+
+    def test_the_opponents_turn_can_be_fast_forwarded_and_always_ends(self):
+        """A tap lands the card in the air and skips the pauses; the flag is let go in a
+        `finally`, or one failed request would leave every later animation skipped."""
+        wait = self._function("function wait(ms) {")
+        self.assertIn("if (CARD_SKIP) { done(); return; }", wait)
+        fly = self._function("function flyCard(fromEl, targetEl, card) {")
+        self.assertIn("CARD_SKIP", fly)
+        self.assertIn("CARD_FLIGHT = run;", fly)
+        script = self._script()
+        self.assertIn("if (!CARD_PLAYBACK || !event.target.closest(\".cardduel\")) return;",
+                      script)
+        end = self._function("async function endCardTurn() {")
+        self.assertIn("finally { CARD_BUSY = false; CARD_PLAYBACK = false; CARD_SKIP = false; }",
+                      end)
+
+    def test_a_duel_whose_session_is_gone_closes_instead_of_failing_every_tap(self):
+        """Sessions live in the server's memory, so every deploy ends the duels in play.
+        The next tap is refused with NO_CARD_SESSION, and it must be the last one."""
+        failed = self._function("function cardActionFailed(error) {")
+        self.assertIn('if (error.code === "NO_CARD_SESSION") closeCardBattle();', failed)
+        for signature in ("async function playCard(uid) {", "async function endCardTurn() {"):
+            self.assertIn("cardActionFailed(e);", self._function(signature), signature)
+
+    def test_a_rematch_the_bank_cannot_pay_for_is_not_offered(self):
+        result = self._function("function cardResult(battle) {")
+        self.assertIn("arena.available", result)
+        self.assertIn('(left === 0 ? " disabled" : "")', result)
+
+    def test_a_flight_always_resolves_even_if_the_browser_goes_quiet(self):
+        """`finish` can fail to arrive -- a backgrounded tab, a cancelled animation. The
+        duel awaits every flight, so one that never resolved would wedge it: no further
+        card could be played and no turn ended, with nothing on screen to say why."""
+        fly = self._script().split("function flyCard(fromEl, targetEl, card) {", 1)[1]
+        fly = fly.split("\n}", 1)[0]
+        self.assertIn("setTimeout(finish, total + 400)", fly)
+        self.assertIn("if (settled) return;", fly)
+        # And it never even starts when the player has asked for less motion.
+        self.assertIn("reducedMotion()", fly)
+
+    def test_the_card_block_keeps_its_height_when_the_hand_empties(self):
+        """The hand is discarded the moment a turn ends, which is exactly when the
+        opponent's cards start flying across that part of the screen."""
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        row = page.split(".cardrow {", 1)[1].split("}", 1)[0]
+        self.assertIn("min-height", row)
+        self.assertIn("function showOpponentTurn()", page)
+
+    def test_the_opponents_cards_are_played_back_one_at_a_time(self):
+        end = self._script().split("async function endCardTurn() {", 1)[1].split("\n}", 1)[0]
+        # Driven by what the server said happened, not by the announced plan.
+        self.assertIn("enemy_played", end)
+        # Awaited in turn, with the pause between them, and the bars moved as each lands.
+        self.assertIn("await flyCard(", end)
+        self.assertIn("await wait(CARD_PAUSE_MS)", end)
+        self.assertIn('paintCardSide("player"', end)
+        self.assertIn('paintCardSide("enemy"', end)
+
+    def test_a_played_card_flies_at_the_face_it_is_aimed_at(self):
+        page = pets_web.PAGE_HTML.replace("__PREFIX__", "/pets")
+        target = page.split("function cardTargetSide(card, caster) {", 1)[1].split("\n}", 1)[0]
+        # Damage crosses to the other side; anything else stays with whoever played it.
+        self.assertIn("Number(card.damage || 0) > 0 ? other : caster", target)
+        play = page.split("async function playCard(uid) {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('cardTargetSide(card, "player")', play)
 
 
 class PageScriptSyntaxTests(unittest.TestCase):

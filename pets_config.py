@@ -112,6 +112,23 @@ CAGE_GOLD_BONUS_PCT = (0, 5, 10, 15, 25)             # % more gold from a win
 # longer a separate passive-income building or any way to buy these levels.
 LEGACY_HAMSTERATOR_UPGRADE_COSTS = (250, 750, 1_500, 3_000, 6_000)
 
+# ----------------------------------------------------------------- feature switches
+# Both were closed on 2026-09-26 to put the game's weight on quests, the arena and the
+# dungeon; the farm and the quarry reopened later that day. Flipping a switch either way
+# keeps every player's farm level, buildings and tools where they left them.
+#
+# FARM_OPEN covers the quarry too. They share one screen and one pair of painted
+# figurines, and neither makes sense as the only job left. While closed, no shift can
+# start, farm levels pay no passive income, every ticket the game still hands out is a
+# meadow ticket, and the quests that only upgrade farm or quarry tools leave the deal.
+# Closing is one-way for the tickets: pets.settle_closed_farm turns every held farm
+# ticket into a meadow ticket, and reopening does not turn them back (players may have
+# spent them). The meadow stays open either way and lives in the dungeon.
+FARM_OPEN = True
+FARM_CLOSED_NOTICE = "Ферма и карьер закрыты: игра теперь про квесты, арену и подземелье."
+CARD_DUEL_OPEN = True
+CARD_DUEL_CLOSED_NOTICE = "Карточные бои отключены."
+
 # ------------------------------------------------------------------------------ farm
 # A farm run is now a deliberate, player-chosen 1-8 hour shift: the pet cannot start a
 # fight while it works (but, unlike before, CAN still be attacked -- see _is_farming_record
@@ -658,6 +675,17 @@ ARENA_WIN_GOLD_MAX = 150
 # coins and rubies. It applies equally to attacker and defender and is calculated from
 # what the loser owns when the fight settles, never from the randomly rolled win purse.
 ARENA_LOSS_TRANSFER_SHARE = 0.05
+
+# A card duel costs the same arena fight an ordinary attack does, and pays this much more
+# for it. Three, because the mode asks for a dozen turns of decisions where the arena asks
+# for one tap -- the multiplier is what makes that trade worth taking rather than a slower
+# way to earn the same purse.
+#
+# It is also the ONLY fight in the game that moves diamonds between wallets: ordinary
+# arena fights used to take a five-percent bite out of the loser's diamonds and no longer
+# do. The share itself is unchanged (ARENA_LOSS_TRANSFER_SHARE above, the same five
+# percent that moves coins) -- the mechanic was relocated, not retuned.
+CARD_DUEL_GOLD_MULTIPLIER = 3.0
 # Coming back for the same wallet on the same day pays less. A rival is a rival, not a
 # renewable resource: without this, the best arena strategy is to find one rich, weak
 # player and hit them until their purse is empty, which costs the attacker nothing but

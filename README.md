@@ -196,6 +196,165 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### Turning the game off (`GAME_ENABLED`)
+
+The pet game and the chat share one process, so the game's code sits in the chat's memory
+whether or not anybody plays. `GAME_ENABLED` closes the game without deleting a line of it,
+and **quests keep running in full**.
+
+```
+GAME_ENABLED=0     # on the host, then restart
+```
+
+It defaults to **on**, because the default here is the deployment's business rather than
+the repository's — the same call `STATS_ENABLED` makes. Nothing touches the stores, so
+switching back returns every creature, coin, ticket and scroll exactly where its owner
+left it.
+
+What it costs and what it saves, measured with `tracemalloc` against this tree:
+
+| | Python objects held |
+|---|---|
+| everything loaded | ~91 MB |
+| `GAME_ENABLED=0` | ~74 MB |
+
+Effectively **all** of that difference is `pets_web.py`, which builds the Mini App's entire
+HTML/CSS/JS as module-level strings. Nothing else is worth skipping: `pets`, `pets_combat`,
+`pets_dungeon` and the catalogues are pulled in by `quests` regardless, and `casino` and
+`pets_updates` come free with `pets_ui`. So the switch does exactly one structural thing —
+it does not import `pets_web` — and everything else it does is behaviour.
+
+What still works with the game closed:
+
+- **Quest submission.** A painted post with `#quest_…` is recorded exactly as before.
+- **Moderator alerts.** They still arrive; the «🖥 Проверить в вебе» button is simply not
+  offered, because nothing is serving that route. «📲 Проверить в Telegram» stays.
+- **Review, accept, reject, and the moderator list** — `QUEST_MODERATION_ACTIONS` in
+  `bot_listener.py` is the exact allow-list, and it is deliberately much narrower than the
+  pause's `PAUSE_SAFE_PET_ACTIONS`: a pause lasts a deploy and keeps navigation open, a
+  close is indefinite and must not advertise a game nobody can open.
+- **Farm tickets and painting scrolls** are still granted for `#япокрасил` posts. They cost
+  one small write, and dropping them would quietly rob everybody who paints while the game
+  is shut.
+
+What stops:
+
+- `/arena`, `/pet`, `/duel`, `/testfight`, `/arenanews` and every play button answer
+  «Арена сейчас закрыта. Квесты работают как обычно…» — a different message from the
+  «чиню» one a genuinely broken game gives, because one is a decision and the other is a
+  bug (`GAME_CLOSED_NOTICE` vs `GAME_UNAVAILABLE_NOTICE`).
+- The Mini App is not served at all.
+- The farm-returns and daily-chatter-prize loops do not run — there is nothing to settle
+  and nobody who could spend what they paid out.
+
+Two things it deliberately does **not** touch: the weekly `#итогинедели` vote (`/vote`,
+`/vote2`) is a separate feature behind its own guard, and none of the stored progress is
+altered, so switching it back on returns everybody's creature, gold and tickets untouched.
+
+`tests/test_game_switch.py` pins the saving itself (in a fresh interpreter — a module
+cannot be un-imported) and the promise that came with it: quest moderation survives.
+
+### `/admin` — every management command in one panel
+
+The management commands are deliberately missing from Telegram's ☰ menu: publishing
+`/badge` and `/deletepokras` to all 190 members invites a wave of «нужны права
+администратора». The cost of that is that they are invisible to the people who *are*
+allowed to use them. `/admin` (`admin_menu.py`) is the other half — unadvertised,
+DM-only, and gated on being an administrator of the home chat or a hardcoded delegate
+(`PRIVILEGED_MANAGEMENT_USERNAMES`).
+
+```
+/admin
+```
+
+> 🛠 **Панель администратора**
+>
+> **Чат и посты** — `/send` · `/preview` · `/buttons` · `/viacleaner`
+> **Голосования** — `/vote` · `/vote2`
+> **Участники** — `/badge` · `/badgeadmin` · `/weekwinner` · `/deletepokras`
+> **Дерево** — `/plant` · `/plantreminder` · `/replant`
+> **Игра** — `/arenanews`
+
+Details worth knowing:
+
+- **It is an index, not a new permission.** Every button ends in the very handler the
+  typed command runs, and that handler checks the same rights again on its own. Nothing
+  here has its own copy of «post to the chat», which is what keeps the panel from
+  drifting from the commands within two releases.
+- **The legend names every command in full**, not just the buttons. These all still work
+  typed, and an admin who learns the spelling here stops needing the panel — a better
+  outcome than a panel nobody can work without.
+- **Three kinds of button, and the kind is not a style choice.**
+  - `open` presses straight through, and is reserved for actions whose whole effect is a
+    screen in the admin's own DM. A misclick costs them one message on their own screen.
+  - `ask` sends a force-reply and runs the command with whatever comes back — `/send`,
+    `/weekwinner`, `/deletepokras`, `/arenanews`. The prompt is consumed once, so a second
+    reply to it cannot post to the chat twice.
+  - `confirm` asks «точно?» first. Everything that writes into the group or resets
+    something shared is one of these: `/plant`, `/plantreminder`, `/replant`. One stray tap
+    may not post an invitation to 190 people or start the tree over.
+- **Adding an action is one entry** in `admin_menu.ACTIONS` plus one branch in
+  `bot_listener._run_admin_action`; `tests/test_admin_menu.py` fails if you add the first
+  without the second, and asserts by name which actions must stay behind a confirmation.
+
+`tests/test_admin_menu.py` pins the catalogue, the gate, that an `open` button reaches its
+handler, that a `confirm` button does *not* on the first press, and that an `ask` prompt is
+answered exactly once and only by the person it was asked of.
+
+### ViaCleaner — inline-bot posts are swept up after a delay
+
+A message posted through an inline bot — the ones Telegram labels **«via @…»** — is useful
+for about as long as it takes to look at it, and a chat that collects them stops being
+readable to anybody scrolling back. ViaCleaner (`via_cleaner.py`) leaves each one standing
+for a set time and then deletes it.
+
+Settings live in a menu, in the bot's DM:
+
+```
+/viacleaner          (or /via)
+```
+
+> 🧹 **ViaCleaner**
+>
+> Удаляет сообщения, отправленные через инлайн-ботов — те, что помечены «via …». Обычные
+> сообщения, ответы и пересылки не трогает.
+>
+> Чат: **Единый Чат Художников**
+> Сейчас: **включён**
+> Удаляет через: **5 минут**
+>
+> ⏹ Выключить · ⏱ Задержка: 5 минут
+
+Details worth knowing:
+
+- **It is off until somebody turns it on.** A bot that silently starts deleting messages
+  the day it is deployed is a bot that gets removed from the chat.
+- **The delay is the feature.** Deleting instantly reads as censorship — the person who
+  sent it never sees their own result. «Сразу» is on the menu (`DELAY_CHOICES`: сразу,
+  1 минута, 5 минут, 15 минут, 1 час, 3 часа, 24 часа) but the default is five minutes.
+- **DM-only, administrators only**, like `/badge` and `/badgeadmin`. The menu is not
+  published in the ☰ menu for the same reason those aren't.
+- **Pending deletions survive a restart.** They live in `via_cleaner.json` on the
+  persistent volume, not in an in-memory timer — a deploy is exactly when a batch of them
+  is most likely to be waiting, and losing those would mean via-messages surviving for
+  ever purely because they were lucky about their timing.
+- **Two observers, one queue.** Your personal session sees every via-message; the bot sees
+  them too whenever its privacy mode is off. Both call `via_cleaner.remember`, which
+  de-duplicates on (chat, message id), so one of the two halves being down doesn't stop
+  the cleaning. The deletion itself is always the bot's.
+- **The bot must be an admin with delete rights** — `deleteMessage` fails silently
+  without them, and the menu says so while the cleaner is on.
+- **Switching it off cancels what was already queued**, and shortening the delay re-times
+  it. Somebody who turns this off is asking for messages to stop disappearing, not for a
+  few more to go five minutes later.
+- **Anything Telegram will no longer delete is given up on.** Past roughly 48 hours
+  (`PENDING_EXPIRY_SECONDS`) there is nothing to retry, so the entry is dropped instead of
+  failing on every sweep for ever.
+
+`tests/test_via_cleaner.py` pins the detection (and, more importantly, that an ordinary
+message never matches), that a scheduled deletion survives a restart and is never queued
+twice, and that every button in the menu changes what it says it changes.
+
 ### XP, levels, coins, and badges
 
 `/top today|week|month|year|all` ranks tracked members by XP. The existing activity
@@ -627,7 +786,7 @@ page that changes shape depending on who opens it:
   many voted, the top 3 so far) and a button per command — the written-out list of the same
   commands used to sit above them and is gone, since every line of it was a slower way to
   press the button underneath. "Открыть голосование"/"Модерация" open the Mini App directly, while
-  "Заявки за эту неделю"/"За прошлую неделю"/"Объявление"/"Картинка итогов"/"Очистить" run the exact
+  "Собрать заявки"/"Объявление"/"Картинка итогов"/"Очистить" run the exact
   same code path as typing the
   command (`handle_vote_action_callback` builds a synthetic message and hands it straight
   to `handle_vote_command`, admin/DM check and all, rather than duplicating any of it).
@@ -644,19 +803,30 @@ page that changes shape depending on who opens it:
   "close the reel". Same ⛶ and the same reasoning as the arena's duel view
   (`arena_web.py`), so the bot's two voting systems agree on what "look closer" looks like.
   Telegram's back arrow steps out of the lens first and the reel second.
-- **`/vote собрать`** (DM, administrators only) scans the contest week for `#итогинедели`
-  posts and adds any that aren't already in the poll.
+- **`/vote собрать`** (DM, administrators only) scans the **previous and the current
+  contest week** for `#итогинедели` posts — Monday 00:00 a week ago through now
+  (`VOTE_COLLECT_WEEKS = 2`) — and adds any that aren't already in the current week's
+  poll. Everything it finds arrives **pending** and goes to moderation; nothing reaches
+  voters until an administrator admits it.
 
-  **Which week is a choice, and it is two buttons rather than a picker** — "Заявки за эту
-  неделю" and "За прошлую неделю" (`/vote собрать` and `/vote собрать прошлая`,
-  `_vote_collect_weeks_ago` parses both). The vote for a week is run once that week is
-  over, so on a Monday the default window is a few hours old and empty while every work
-  worth voting on sits in the week just ended. The previous week's window is closed at
-  **both** ends — Monday 00:00 through the following Monday 00:00 — so collecting it never
-  drags in what has been posted since; each week's works stay in that week's own poll.
-  Collecting also makes the week it collected **the newest** poll (`voting.make_current`),
-  which is how `latest_poll` breaks a tie — without it an untouched poll for the week that
-  has only just begun would outrank the week just filled.
+  **Both weeks in one pass.** The vote is run around the turn of the week: on a Monday the
+  works are all in the week just ended, on a Sunday in the week still running. It used to
+  be one button per week, each into that week's own poll, which made the moderator guess
+  which week a work was in. Now the moderator sees both weeks and admits what belongs. The
+  flip side: a work that was already in last week's poll can be found again — it comes in
+  pending, and last week's poll keeps its own admissions and votes.
+
+  **Two buttons, differing only in where the scan stops.** "Собрать все заявки"
+  (`/vote собрать`) reads the whole two-week window every time. "Добавить новые"
+  (`/vote добавить`) stops at the newest work the poll already has, which is quick but
+  only right when the poll was filled from the same window: on 2026-09-27 this week's poll
+  held two works from the old one-week collect, the first two-week collect stopped at them,
+  and nothing from last week came in. Neither re-downloads a work already collected
+  (`voting.collect_entries`, `stop_at_known`). The old "За прошлую неделю" button on
+  status messages sent before the change runs the full collect.
+  Collecting also makes the poll it collected **the newest** (`voting.make_current`),
+  which is how `latest_poll` breaks a tie — without it an older unmoderated poll still on
+  disk could outrank the one just filled.
 
   **Which week the page opens is a rank, not a timestamp** (`voting.latest_poll`,
   `_ballot_rank`): a poll with **admitted** works outranks one that is merely collected,
@@ -665,7 +835,7 @@ page that changes shape depending on who opens it:
   that week's file — and on a Monday that is the normal state of the week in progress. The
   rank is what stops a collect from taking the page away from a vote that is running: on
   2026-08-10 last week's poll was open with 15 admitted works and 34 ballots cast when a
-  routine "за эту неделю" found one new nomination, and that single pending work moved the
+  routine collect found one new nomination, and that single pending work moved the
   ballot to a poll with nothing admitted in it. No vote was lost (each week's are in its
   own file), but the ballot showed no candidates until the ordering was fixed. The
   consequence to know about: while a vote is running, a week you collect **stays behind

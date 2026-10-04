@@ -36,8 +36,8 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
 and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
 including an admin (also a status/control panel for one); "/vote выбрать" (DM, admin-only)
-is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans
-#итогинедели posts into the poll, this week's or -- with "прошлая" -- the week before's;
+is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans the
+previous and the current week's #итогинедели posts into the poll;
 "/vote очистить" (DM, admin-only, tap-to-confirm)
 deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
 the chats the admin picks; "/vote картинка" (DM, admin-only) renders the standings as one
@@ -64,6 +64,7 @@ from pathlib import Path
 import aiohttp
 from telethon import utils as tl_utils
 
+import admin_menu
 import cabinet
 import button_builder
 import donations
@@ -74,6 +75,7 @@ import quests
 import post_stats_web
 import preview
 import stats
+import via_cleaner
 import vote_image
 import vote_web
 import voting
@@ -98,6 +100,44 @@ import voting
 # dungeon shop closing the voting the chat runs its contest on.
 GAME_IMPORT_ERROR: str | None = None
 ARENA_IMPORT_ERROR: str | None = None
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
+
+
+# GAME_ENABLED=0 closes the pet game without removing a line of it (see game_open below).
+#
+# WHY AN ENVIRONMENT VARIABLE AND NOT THE PAUSE FILE. maintenance.py argues, correctly,
+# that a pause belongs on the volume because flipping an env var IS a restart. This is the
+# opposite case: the whole point of this switch is to NOT IMPORT pets_web, and a module
+# cannot be un-imported. Closing the game this way is a restart however it is spelled, so
+# it may as well be spelled the way the host already restarts things.
+#
+# WHAT IT SAVES. Measured with tracemalloc against this tree: the process holds ~91 MB of
+# Python objects with everything loaded and ~70 MB with the game off. Effectively ALL of
+# that difference is pets_web, which builds the Mini App's entire HTML/CSS/JS as
+# module-level strings. Every other game module is either already pulled in by quests
+# (pets, pets_combat, pets_dungeon, the catalogues) or free once pets_ui is there (casino,
+# pets_updates), so skipping those would buy nothing measurable and cost a dozen
+# None-checks on paths quest moderation still runs through.
+#
+# WHAT STAYS RUNNING. Quests, in full: the hashtag submission, the moderator alerts, and
+# review inside Telegram (see QUEST_MODERATION_ACTIONS). Only the WEB review surface goes,
+# because that surface IS pets_web. Figurine farm tickets and painting scrolls keep being
+# granted as well -- they cost one small write, and dropping them would quietly rob
+# everybody who paints while the game is shut.
+# Defaults to ON, and the default is the deployment's business rather than the
+# repository's -- same as STATS_ENABLED. It was briefly flipped to off here to express
+# "the game is closed" in the code, and that was wrong twice over: seventy-odd tests
+# exercise play surfaces and would have had to be told to open the game first, and
+# somebody running a single test file directly would have got a closed game with no
+# obvious reason why. Closing the game is one variable on the host, where every other
+# operational choice this bot makes already lives.
+GAME_ENABLED = _env_flag("GAME_ENABLED", True)
 try:
     import pets
     import pets_combat
@@ -105,8 +145,13 @@ try:
     import pets_image
     import pets_ui
     import pets_updates
-    import pets_web
     import casino
+
+    if GAME_ENABLED:
+        import pets_web
+    else:
+        # The one import actually worth skipping, and the only reason this switch exists.
+        pets_web = None
 except Exception:  # noqa: BLE001 -- ANY failure here must still leave the chat running
     GAME_IMPORT_ERROR = traceback.format_exc()
     pets = pets_combat = C = pets_image = pets_ui = pets_updates = pets_web = None
@@ -121,8 +166,22 @@ except Exception:  # noqa: BLE001
 
 
 def game_available() -> bool:
-    """Whether the pet game loaded. False means answer players, do not crash at them."""
+    """Whether the pet game's modules loaded.
+
+    Deliberately NOT the same question as "may people play" (see game_open). This one asks
+    whether the code is here at all, and it is what quest moderation depends on: reviewing
+    a painting draws pets_ui screens and reads the pets store, so it needs the modules
+    present -- but it does not need the game to be OPEN, and closing the game must not
+    close the review queue.
+    """
     return GAME_IMPORT_ERROR is None
+
+
+def game_open() -> bool:
+    """Whether anybody may play right now: the modules are here AND the owner has not
+    switched the game off. Every play surface asks this; the quest surfaces ask
+    game_available instead."""
+    return GAME_IMPORT_ERROR is None and GAME_ENABLED
 
 
 def arena_available() -> bool:
@@ -133,6 +192,14 @@ def arena_available() -> bool:
 GAME_UNAVAILABLE_NOTICE = (
     "Игра сейчас недоступна — чиню. Остальные команды чата работают как обычно."
 )
+# Said instead when the game is CLOSED rather than broken (GAME_ENABLED=0). Two
+# wordings because they are two different situations and a player deserves to know
+# which one they are in: "чиню" promises it is coming back today, and a game switched
+# off deliberately makes no such promise. Quests are named because they are the one
+# thing that keeps working, and the people who care are the ones still painting.
+GAME_CLOSED_NOTICE = (
+    "Арена сейчас закрыта. Квесты работают как обычно — присылайте покрасы с хештегом квеста, их по-прежнему проверяют."
+)
 ARENA_UNAVAILABLE_NOTICE = (
     "Голосование сейчас недоступно — чиню. Остальные команды чата работают как обычно."
 )
@@ -140,6 +207,29 @@ ARENA_UNAVAILABLE_NOTICE = (
 # exactly what may be missing when this is needed, and a router that cannot route without
 # the thing it is routing around is no router. Pinned against the real value by a test.
 PETS_CALLBACK_PREFIX_LITERAL = "pet"
+
+
+def _game_down_notice(arena: bool) -> str:
+    """What to tell somebody whose command or button just bounced.
+
+    A game that is switched off and a game that failed to import look identical from the
+    outside and are nothing alike: one is a decision, the other is a bug, and telling a
+    player "чиню" about a decision is a promise nobody is going to keep.
+    """
+    if arena:
+        return ARENA_UNAVAILABLE_NOTICE
+    if GAME_IMPORT_ERROR is not None:
+        return GAME_UNAVAILABLE_NOTICE
+    return GAME_CLOSED_NOTICE
+
+
+def _game_down_reason(arena: bool) -> str:
+    """The same distinction for the log, where it decides whether anybody is paged."""
+    if arena:
+        return "the weekly vote's modules never loaded:\n" + (ARENA_IMPORT_ERROR or "")
+    if GAME_IMPORT_ERROR is not None:
+        return "the game's modules never loaded:\n" + GAME_IMPORT_ERROR
+    return "the game is switched off (GAME_ENABLED=0)"
 
 
 async def _decline_game_command(
@@ -151,14 +241,13 @@ async def _decline_game_command(
     player with a command that did nothing and no idea whether they typed it wrong.
     The chat commands around it keep working, which is the whole point of the guard.
     """
-    if arena_available() if arena else game_available():
+    if arena_available() if arena else game_open():
         return False
-    log("[bot_listener] refused a command, modules never loaded:\n"
-        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    notice = _game_down_notice(arena)
+    log(f"[bot_listener] refused a command: {_game_down_reason(arena)}")
     try:
         await api.send_message(
-            (message.get("chat") or {}).get("id"),
-            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
+            (message.get("chat") or {}).get("id"), notice,
             reply_to_message_id=message.get("message_id"), parse_mode=None,
         )
     except Exception:
@@ -170,15 +259,11 @@ async def _decline_game_callback(
     api: "TelegramBotAPI", callback: dict, log=print, *, arena: bool = False,
 ) -> bool:
     """The same for a button. An unanswered callback spins on screen for ever."""
-    if arena_available() if arena else game_available():
+    if arena_available() if arena else game_open():
         return False
-    log("[bot_listener] refused a button, modules never loaded:\n"
-        + ((ARENA_IMPORT_ERROR if arena else GAME_IMPORT_ERROR) or ""))
+    log(f"[bot_listener] refused a button: {_game_down_reason(arena)}")
     try:
-        await api.answer_callback_query(
-            callback.get("id"),
-            ARENA_UNAVAILABLE_NOTICE if arena else GAME_UNAVAILABLE_NOTICE,
-        )
+        await api.answer_callback_query(callback.get("id"), _game_down_notice(arena))
     except Exception:
         log("[bot_listener] could not answer a button:\n" + traceback.format_exc())
     return True
@@ -282,6 +367,21 @@ PREVIEW_COMMAND = "/preview"
 BUTTON_BUILDER_COMMAND = button_builder.COMMAND
 BUTTON_BUILDER_FLOW_TTL_SECONDS = button_builder.FLOW_TTL_SECONDS
 
+# The management panel. Deliberately absent from PRIVATE_CHAT_COMMANDS for the same
+# reason every command it contains is: Telegram's menu is published to all 190 members,
+# and advertising the panel would advertise the commands inside it.
+ADMIN_MENU_COMMAND = admin_menu.COMMAND
+ADMIN_PANEL_REFUSAL = "Панель доступна только администраторам чата."
+
+# The ViaCleaner settings menu. DM-only and unadvertised, exactly like /badgeadmin and
+# /preview: it switches on message deletion in a chat of 190 people, so it belongs in
+# front of the administrators who can already do that by hand and nobody else.
+VIA_CLEANER_COMMANDS = via_cleaner.COMMANDS
+# How long the sweeper backs off after a pass that found work it could not do -- the only
+# case being a chat whose id would not resolve. Without it those items stay permanently
+# due and the loop spins on them at full speed.
+VIA_CLEANER_STUCK_BACKOFF_SECONDS = 60
+
 # Opens the planting ceremony. Two spellings for one action: Telegram only treats
 # [a-zA-Z0-9_] after a slash as a command, so "/посадить_семечко" is never highlighted,
 # never autocompletes, and -- if the bot's privacy mode is ever turned back on -- never
@@ -308,21 +408,27 @@ CABINET_COMMAND = "/cabinet"
 # the same reason /plant has two: "/голосование" is what people type, "/vote" is what
 # Telegram can highlight and register in the menu.
 VOTE_COMMANDS = ("/vote", "/голосование")
-# Rebuilds the entry list from this contest week's #итогинедели posts -- Monday 00:00
-# through now, never the week before. Admin-only and
+# Adds to the entry list the #итогинедели posts of the previous and the current contest
+# week -- Monday 00:00 a week ago through now. Admin-only and
 # separate from opening the page: collecting downloads every photo in every nomination,
 # which is slow enough that it must be something somebody asks for, not something that
 # happens each time a voter taps a button.
-VOTE_COLLECT_WORDS = frozenset({"собрать", "обновить", "collect", "refresh"})
-# "/vote собрать прошлая" -- the same collection, one calendar week back. The voting for a
-# week happens once that week is over, so on Monday the default window ("this week", a few
-# hours old) is empty and the works people came to vote on are all in the week before.
-# Written as a modifier on собрать rather than as its own command word, the way the column
-# count rides on картинка -- see _vote_collect_weeks_ago.
-VOTE_PREVIOUS_WEEK_WORDS = frozenset({
-    "прошлая", "прошлую", "прошлой", "прошлая неделя", "прошлую неделю",
-    "за прошлую неделю", "previous", "prev", "last",
-})
+#
+# Two spellings of it, one button each. "Собрать все заявки" reads the whole window every
+# time; "Добавить новые" stops at the newest work the poll already has, which is quick but
+# only right when the poll was filled from the same window -- a poll holding just this
+# week's works makes it stop before it ever reaches last week (see
+# voting.collect_entries' stop_at_known). Neither re-downloads a work already collected.
+VOTE_COLLECT_WORDS = frozenset({"собрать", "собрать все", "collect", "collect all"})
+VOTE_ADD_NEW_WORDS = frozenset({"добавить", "добавить новые", "новые", "обновить", "refresh", "add", "new"})
+# How many calendar weeks "/vote собрать" reads, ending with the week in progress. Two,
+# because the vote is run around the turn of the week: on a Monday the works are all in
+# the week just ended, on a Sunday in the week still running, and a work posted late on
+# Sunday or early on Monday belongs to whichever vote is being put together. One window
+# over both means the moderator sees everything and admits what belongs, instead of
+# having to know which week to ask for. Everything collected arrives pending (see
+# voting.Poll.approved), so the wider window can never put a work in front of voters.
+VOTE_COLLECT_WEEKS = 2
 # Opens the moderation screen (admit toggles, live counts, closing the vote) explicitly,
 # as opposed to bare "/vote" -- which now always opens the plain ballot, even for an
 # administrator, so admitting entries never blocks an admin from casting their own vote.
@@ -395,10 +501,10 @@ ARENA_ACTIONS = {
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
     "collect": "/vote собрать",
-    # Two buttons rather than one that asks which week: on Monday the answer is always
-    # "the previous one", on Saturday always "this one", so a picker would be a tap that
-    # never tells anybody anything.
-    "collectprev": "/vote собрать прошлая",
+    "collectnew": "/vote добавить",
+    # The "за прошлую неделю" button of status messages sent before собрать read both weeks
+    # at once. Kept so tapping one of those still collects, rather than doing nothing.
+    "collectprev": "/vote собрать",
     "chat": "/vote chat",
     "image": "/vote картинка",
     # Same command with the column count on the end -- see _vote_image_columns. A separate
@@ -2836,6 +2942,481 @@ async def handle_badge_admin_command(
     )
 
 
+async def handle_via_cleaner_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/viacleaner -- the ViaCleaner settings menu (see via_cleaner.py).
+
+    DM-only, and gated on being an administrator of the home chat, exactly like every
+    other management command here. The menu itself carries the whole feature: there are no
+    sub-commands and no arguments to remember, because the one thing an administrator ever
+    does with this is switch it on and pick how long a via-message may stand.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /viacleaner:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply("Настройками ViaCleaner управляют только администраторы чата.")
+        return
+
+    try:
+        await api.send_message(
+            dm_chat_id,
+            via_cleaner.menu_text(entry),
+            reply_to_message_id=reply_to,
+            parse_mode="HTML",
+            reply_markup=via_cleaner.menu_keyboard(entry),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to open the ViaCleaner menu:\n{traceback.format_exc()}")
+        await reply("Не удалось открыть настройки. Попробуй ещё раз.")
+
+
+async def _edit_via_cleaner_screen(
+    api: TelegramBotAPI, chat_id, message_id: int, entry: str, screen: str, log=print,
+) -> None:
+    """Redraw the open menu in place -- one definition, so every button that changes
+    something ends on a screen that already reflects the change."""
+    text = via_cleaner.delay_text(entry) if screen == "delays" else via_cleaner.menu_text(entry)
+    keyboard = via_cleaner.delay_keyboard(entry) if screen == "delays" else via_cleaner.menu_keyboard(entry)
+    try:
+        await api.edit_message_text(chat_id, message_id, text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception:
+        log(f"[bot_listener] failed to redraw the ViaCleaner menu:\n{traceback.format_exc()}")
+
+
+async def handle_via_cleaner_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    callback: dict,
+    entry: str | None,
+    known_chat_ids: dict[str, int],
+    log=print,
+) -> None:
+    """The ViaCleaner menu's buttons.
+
+    The spinner is stopped FIRST, before anything that can wait: the administrator check
+    below needs the home chat's id, and resolving one goes through the Telethon session,
+    which -- when unwell -- waits rather than failing, leaving a button spinning for ever.
+    Nothing here needs a toast to explain itself; every button's effect is visible in the
+    screen it redraws.
+    """
+    callback_id = callback["id"]
+    await api.answer_callback_query(callback_id)
+
+    parsed = via_cleaner.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    action, argument = parsed
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    presser = callback.get("from") or {}
+    if entry is None or chat_id is None or message_id is None:
+        return
+
+    # Re-checked rather than trusted: the menu only ever exists in the DM of somebody who
+    # was an administrator when it was opened, so this can only differ if they have since
+    # stopped being one -- in which case the buttons must stop working, not keep working
+    # because the message is still on their screen.
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+        try:
+            await api.edit_message_text(
+                chat_id, message_id,
+                "Настройками ViaCleaner управляют только администраторы чата.",
+                parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to close the ViaCleaner menu:\n{traceback.format_exc()}")
+        return
+
+    by = _display_name(presser)
+    if action == "toggle":
+        current = via_cleaner.settings(entry)
+        updated = via_cleaner.set_enabled(entry, not current["enabled"], by=by)
+        log(
+            f"[bot_listener] ViaCleaner in '{entry}' turned "
+            + ("on" if updated["enabled"] else "off")
+            + f" by {by}"
+        )
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+        return
+    if action == "delays":
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "delays", log=log)
+        return
+    if action == "delay":
+        try:
+            seconds = int(argument)
+        except (TypeError, ValueError):
+            return
+        updated = via_cleaner.set_delay(entry, seconds, by=by)
+        log(
+            f"[bot_listener] ViaCleaner delay in '{entry}' set to "
+            f"{updated['delay_seconds']}s by {by}"
+        )
+        # Back to the root screen rather than staying here: it names the chosen delay in a
+        # sentence, which is a better confirmation than a tick beside a button, and it is
+        # the screen somebody who is finished wants to be on.
+        await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+        return
+    await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+
+
+async def handle_admin_command(
+    api: TelegramBotAPI,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    log=print,
+) -> None:
+    """/admin -- the management panel (see admin_menu.py).
+
+    DM-only and administrator-gated, like every command it contains. It is the index for
+    them, not a new permission: each button ends in the same handler the typed command
+    runs, and that handler checks the same rights again on its own.
+    """
+    dm_chat_id = message["chat"]["id"]
+    reply_to = message["message_id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, reply_to_message_id=reply_to, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to answer /admin:\n{traceback.format_exc()}")
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, actor):
+        await reply(ADMIN_PANEL_REFUSAL)
+        return
+
+    try:
+        await api.send_message(
+            dm_chat_id,
+            admin_menu.menu_text(),
+            reply_to_message_id=reply_to,
+            parse_mode="HTML",
+            reply_markup=admin_menu.menu_keyboard(),
+        )
+    except Exception:
+        log(f"[bot_listener] failed to open the admin panel:\n{traceback.format_exc()}")
+        await reply("Не удалось открыть панель. Попробуй ещё раз.")
+
+
+async def _run_admin_action(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    item: dict,
+    message: dict,
+    command_text: str,
+    entry: str | None,
+    admin_chat_id: int | None,
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """Hand one panel action to the very handler its typed command uses.
+
+    `message` is either the administrator's real reply (for an `ask`) or one built from
+    the button press (for `open` and `confirm`) -- the handlers read only `chat`,
+    `message_id` and `from`, all of which a callback carries. Going through them rather
+    than around them is the whole design: the permission check, the argument parsing and
+    the wording all stay in one place, and the panel cannot drift from the command.
+    """
+    action_id = item["id"]
+    if action_id == "send":
+        await handle_send_command(api, message, command_text, entry, admin_chat_id, log=log)
+    elif action_id == "preview":
+        await handle_preview_command(
+            api, telethon_client, message, command_text, entry, known_chat_ids, log=log,
+        )
+    elif action_id == "buttons":
+        await handle_button_builder_command(
+            api, message, entry, admin_chat_id, button_builder_flows,
+        )
+    elif action_id == "via":
+        await handle_via_cleaner_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "vote":
+        await handle_vote_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    elif action_id == "vote2":
+        await handle_arena_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    elif action_id == "badge":
+        await handle_badge_command(api, message, entry, admin_chat_id, badge_flows)
+    elif action_id == "badgeadmin":
+        await handle_badge_admin_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "weekwinner":
+        await handle_week_winner_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "deletepokras":
+        await handle_delete_pokras_command(
+            api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "plant":
+        await handle_plant_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "plantreminder":
+        await handle_plant_reminder_command(api, message, entry, admin_chat_id, log=log)
+    elif action_id == "replant":
+        await handle_replant_command(
+            api, telethon_client, message, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id == "arenanews":
+        await handle_arena_news_command(
+            api, telethon_client, message, entry or "", command_text, entry,
+            known_chat_ids, log=log,
+        )
+    else:  # pragma: no cover -- an action in the catalogue with nothing wired to it
+        log(f"[bot_listener] admin panel has no handler for {action_id!r}")
+
+
+def _admin_message_from_callback(callback: dict, command_text: str) -> dict:
+    """The button press, shaped like the command message a handler expects.
+
+    Carries `text` as well as the three obvious fields, because /vote and /vote2 read it
+    to find their sub-command: they would still open their root panel without it, but a
+    stand-in that is only accidentally right is one bad afternoon away from being wrong.
+    Replies thread onto the panel itself, which is what an administrator who pressed a
+    button on it is looking at anyway.
+    """
+    message = callback.get("message") or {}
+    return {
+        "chat": message.get("chat") or {},
+        "message_id": message.get("message_id"),
+        "from": callback.get("from") or {},
+        "text": command_text,
+    }
+
+
+async def handle_admin_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    admin_flows: dict[str, dict],
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> None:
+    """The panel's buttons.
+
+    The spinner is stopped first, before the home chat is resolved: resolving goes through
+    the Telethon session, which when unwell waits rather than failing, and a button that
+    never reaches answerCallbackQuery spins on screen for ever.
+    """
+    callback_id = callback["id"]
+    await api.answer_callback_query(callback_id)
+
+    parsed = admin_menu.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        return
+    step, action_id = parsed
+    source = callback.get("message") or {}
+    chat = source.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = source.get("message_id")
+    presser = callback.get("from") or {}
+    if chat_id is None or message_id is None:
+        return
+
+    async def redraw(text: str, keyboard: dict | None, parse_mode: str | None) -> None:
+        try:
+            await api.edit_message_text(
+                chat_id, message_id, text, reply_markup=keyboard, parse_mode=parse_mode,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to redraw the admin panel:\n{traceback.format_exc()}")
+
+    admin_chat_id = (
+        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+        if entry
+        else None
+    )
+    if entry is None or admin_chat_id is None:
+        await redraw("Основной чат не настроен.", None, None)
+        return
+    # Re-checked rather than trusted: the panel only ever exists in the DM of somebody who
+    # was an administrator when it was opened, so this differs only if they have stopped
+    # being one -- in which case the buttons must stop working, not keep working because
+    # the message is still on their screen. Every handler below checks again anyway; this
+    # one is here so a stranger never even reaches a force-reply prompt.
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
+        await redraw(ADMIN_PANEL_REFUSAL, None, None)
+        return
+
+    if step == "menu":
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+        return
+
+    item = admin_menu.action(action_id)
+    if item is None:
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+        return
+
+    if step == "run" and item["kind"] == "confirm":
+        # Everything that writes into the group, or resets something shared, asks first.
+        # One stray tap must not be able to post to 190 people or start the tree over.
+        await redraw(admin_menu.confirm_text(item), admin_menu.confirm_keyboard(item), None)
+        return
+
+    if step == "run" and item["kind"] == "ask":
+        try:
+            prompt = await api.send_message(
+                chat_id, admin_menu.prompt_text(item),
+                reply_to_message_id=message_id,
+                reply_markup={"force_reply": True, "selective": True},
+                parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to ask for {action_id!r}:\n{traceback.format_exc()}")
+            return
+        admin_flows[uuid.uuid4().hex] = {
+            "chat_id": chat_id,
+            "user_id": presser.get("id"),
+            "action_id": action_id,
+            "awaiting": "argument",
+            "prompt_message_id": (prompt or {}).get("message_id"),
+            "created_at": time.monotonic(),
+        }
+        return
+
+    log(f"[bot_listener] admin panel: {_display_name(presser)} ran {item['command']}")
+    await _run_admin_action(
+        api, telethon_client, cfg, tz, item,
+        _admin_message_from_callback(callback, item["command"]),
+        item["command"], entry, admin_chat_id, bot_username, background_tasks,
+        known_chat_ids, badge_flows, button_builder_flows, vote_chat_flows, log=log,
+    )
+    if step == "go":
+        # A confirmed action leaves the confirmation screen behind; the panel is what the
+        # administrator wants back, not the question they have already answered.
+        await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+
+
+async def handle_admin_text_input(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    admin_flows: dict[str, dict],
+    bot_username: str | None,
+    background_tasks: set,
+    known_chat_ids: dict[str, int],
+    badge_flows: dict[str, dict],
+    button_builder_flows: dict[str, dict],
+    vote_chat_flows: dict[str, dict],
+    log=print,
+) -> bool:
+    """Consumes the reply to an `ask` button's force-reply and runs the command with it.
+
+    Correlated on the prompt's own message id, like every other force-reply flow here, so
+    an administrator with several prompts open answers whichever one they replied to
+    rather than the most recent one.
+    """
+    chat_id = (message.get("chat") or {}).get("id")
+    actor = message.get("from") or {}
+    replied_message_id = (message.get("reply_to_message") or {}).get("message_id")
+    if replied_message_id is None:
+        return False
+    flow_pair = next(
+        (
+            (flow_id, flow)
+            for flow_id, flow in admin_flows.items()
+            if flow.get("chat_id") == chat_id
+            and flow.get("user_id") == actor.get("id")
+            and flow.get("prompt_message_id") == replied_message_id
+            and time.monotonic() - flow["created_at"] <= admin_menu.FLOW_TTL_SECONDS
+        ),
+        None,
+    )
+    if flow_pair is None:
+        return False
+    flow_id, flow = flow_pair
+    # Dropped whatever happens next: this prompt asked one question and now has its
+    # answer. Leaving it open would let a later reply to the same message run the command
+    # a second time -- which for /send is a second post to the chat.
+    admin_flows.pop(flow_id, None)
+
+    item = admin_menu.action(flow.get("action_id") or "")
+    if item is None:
+        return True
+    text = (message.get("text") or message.get("caption") or "").strip()
+    if not text or admin_menu.is_cancel(text):
+        try:
+            await api.send_message(
+                chat_id, "Отменено.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to confirm an admin cancel:\n{traceback.format_exc()}")
+        return True
+
+    admin_chat_id = (
+        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+        if entry
+        else None
+    )
+    log(f"[bot_listener] admin panel: {_display_name(actor)} ran {item['command']}")
+    try:
+        # No permission check here on purpose: the handler about to run has its own, and
+        # it is the one that has always decided this. A second gate would be a second
+        # answer to the same question, and the two would eventually disagree.
+        await _run_admin_action(
+            api, telethon_client, cfg, tz, item, message, f"{item['command']} {text}",
+            entry, admin_chat_id, bot_username, background_tasks, known_chat_ids,
+            badge_flows, button_builder_flows, vote_chat_flows, log=log,
+        )
+    except Exception:
+        log(f"[bot_listener] admin panel action {item['id']!r} failed:\n{traceback.format_exc()}")
+        try:
+            await api.send_message(
+                chat_id,
+                "Не получилось. Попробуй ещё раз или набери команду вручную.",
+                reply_to_message_id=message.get("message_id"), parse_mode=None,
+            )
+        except Exception:
+            pass
+    return True
+
+
 def _is_chat_allowed(allowed_chats: set[str], chat: dict) -> bool:
     # A private chat (DM) with the bot itself is always a legitimate input channel,
     # regardless of the group allowlist -- see _home_chat_ref: it's how you ask about the
@@ -3302,6 +3883,7 @@ async def maybe_send_menu(
     badge_flows: dict[str, dict],
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
+    admin_flows: dict[str, dict] | None = None,
     log=print,
 ) -> None:
     """Answer an otherwise-unhandled DM with the cabinet menu.
@@ -3329,6 +3911,8 @@ async def maybe_send_menu(
     if _has_pending_flow(
         button_builder_flows or {}, chat_id, user_id, BUTTON_BUILDER_FLOW_TTL_SECONDS
     ):
+        return
+    if _has_pending_flow(admin_flows or {}, chat_id, user_id, admin_menu.FLOW_TTL_SECONDS):
         return
 
     now = time.monotonic()
@@ -3750,8 +4334,16 @@ async def handle_tree_command(
 
 def _pets_page_url(cfg) -> str | None:
     """The pet game's Mini App (pets_web.py), or None when no public URL is configured --
-    in which case the menu simply doesn't offer it and the buttons remain the whole game."""
-    return f"{cfg.webapp_public_url}{pets_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
+    in which case the menu simply doesn't offer it and the buttons remain the whole game.
+
+    Also None when the game is closed: pets_web was never imported and nothing is serving
+    that route, so offering the button would hand somebody a link to a 404. This is why
+    the quest alert's "Проверить в вебе" button disappears while "Проверить в Telegram"
+    stays -- see _send_quest_submission_notifications.
+    """
+    if pets_web is None or not cfg.webapp_public_url:
+        return None
+    return f"{cfg.webapp_public_url}{pets_web.ROUTE_PREFIX}"
 
 
 def _vote_page_url(cfg) -> str | None:
@@ -3812,16 +4404,13 @@ def _vote_status_text(entry: str) -> str:
     return "\n".join(lines)
 
 
-def _current_vote_poll_id(tz, weeks_ago: int = 0) -> str:
+def _current_vote_poll_id(tz) -> str:
     """Keyed by ISO week, not by today's date: собрать/выбрать/очистить all need to agree
     on which poll "this week" refers to regardless of which day of the week they're run,
     and a date-keyed id would silently point at a different poll once the day rolls over
-    mid-week.
-
-    `weeks_ago` names an earlier week (1 is the previous one). Computed by shifting the
-    moment rather than by subtracting from the week number, so the last week of a year
-    lands on the right year instead of "-W00"."""
-    iso_year, iso_week, _ = (datetime.now(tz) - timedelta(weeks=weeks_ago)).isocalendar()
+    mid-week. The poll is named after the week it was collected in, even though its
+    collection window also covers the week before (VOTE_COLLECT_WEEKS)."""
+    iso_year, iso_week, _ = datetime.now(tz).isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
 
 
@@ -3971,23 +4560,6 @@ async def _archive_vote_boards(entry: str, log=print) -> int:
         except Exception:
             log(f"[bot_listener] could not archive vote board for {poll_id}:\n{traceback.format_exc()}")
     return saved
-
-
-def _vote_collect_weeks_ago(argument: str) -> int | None:
-    """Which week "/vote собрать" was asked for -- 0 for the week in progress, 1 for the
-    one before it -- or None if this isn't the собрать command at all.
-
-    The window rides on the same command word rather than getting its own (as with
-    картинка's column count) so that both menu buttons go through the one collect branch:
-    the admin/DM gate, the in-progress lock and the merge with what's already collected are
-    the same work either way, and only the window differs."""
-    normalized = " ".join((argument or "").lower().split())
-    if normalized in VOTE_COLLECT_WORDS:
-        return 0
-    word, _, rest = normalized.partition(" ")
-    if word in VOTE_COLLECT_WORDS and rest in VOTE_PREVIOUS_WEEK_WORDS:
-        return 1
-    return None
 
 
 def _vote_image_columns(argument: str) -> int | None:
@@ -4543,11 +5115,11 @@ async def handle_vote_command(
     page that changes shape depending who opens it:
 
     - "/vote собрать" (DM, admin-only) adds newly posted #итогинедели entries to the
-      list -- already-known ones are left alone, not re-fetched or re-processed. It
-      collects the week in progress; "/vote собрать прошлая" collects the week before it
-      instead, into that week's own poll, and makes that poll the one the page opens. The
-      vote for a week is run once the week is over, so on a Monday the previous week is
-      the one that has the works in it.
+      list -- already-known ones are left alone, not re-fetched or re-processed. It reads
+      the previous and the current contest week together (VOTE_COLLECT_WEEKS) into the
+      current week's poll, and makes that poll the one the page opens; everything found
+      waits in moderation until an administrator admits it. "/vote добавить" is the quick
+      variant that stops at the newest work already collected (VOTE_ADD_NEW_WORDS).
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
@@ -4603,8 +5175,8 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
+    collect_only_new = False
     image_columns = vote_image.COLUMNS
-    collect_weeks_ago = 0
     if forced_mode == "moderate":
         wants_moderate = True
     elif forced_mode == "clear":
@@ -4619,11 +5191,9 @@ async def handle_vote_command(
             if argument.lower().startswith(spelling):
                 argument = argument[len(spelling):]
                 break
-        normalized = argument.strip().lower()
-        requested_weeks_ago = _vote_collect_weeks_ago(normalized)
-        wants_collect = requested_weeks_ago is not None
-        if requested_weeks_ago is not None:
-            collect_weeks_ago = requested_weeks_ago
+        normalized = " ".join(argument.lower().split())
+        collect_only_new = normalized in VOTE_ADD_NEW_WORDS
+        wants_collect = collect_only_new or normalized in VOTE_COLLECT_WORDS
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
@@ -4670,21 +5240,24 @@ async def handle_vote_command(
             )
             return
 
-        week_label = "за прошлую неделю" if collect_weeks_ago else "за эту неделю"
-        window_label = (
-            "за прошлую неделю (с прошлого понедельника по этот)" if collect_weeks_ago
-            else "за эту неделю (с понедельника)"
-        )
+        week_label = "за прошлую и эту неделю"
         status = await reply(
-            f"Собираю заявки с #итогинедели {window_label}. "
-            "Это может занять несколько минут -- буду показывать прогресс здесь."
+            (
+                f"Добавляю новые заявки с #итогинедели {week_label}: читаю чат до последней "
+                "уже собранной работы. Если не хватает работ за прошлую неделю -- нажми "
+                "«Собрать все заявки»."
+            ) if collect_only_new else (
+                f"Собираю все заявки с #итогинедели {week_label} (с понедельника прошлой "
+                "недели). Уже собранные не скачиваю заново. Это может занять несколько "
+                "минут -- буду показывать прогресс здесь."
+            )
         )
-        poll_id = _current_vote_poll_id(tz, collect_weeks_ago)
+        poll_id = _current_vote_poll_id(tz)
         existing_poll = voting.load_poll(entry, poll_id)
 
-        # Nothing is carried over from last week. A poll holds exactly what was nominated
-        # in its own Monday-to-Sunday window, which is what makes "очистить, then собрать"
-        # actually start from empty instead of immediately refilling with last week.
+        # Nothing is copied out of another poll: this one holds exactly what the chat scan
+        # finds in its window. A work that was already in last week's poll is found again
+        # if it was posted inside the window, and arrives here pending like any other.
         known_ids = {e.entry_id for e in existing_poll.entries} if existing_poll else set()
         _VOTE_COLLECTIONS_IN_PROGRESS.add(lock_key)
         try:
@@ -4694,7 +5267,8 @@ async def handle_vote_command(
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
                 skip_entry_ids=known_ids,
-                weeks_ago=collect_weeks_ago,
+                weeks=VOTE_COLLECT_WEEKS,
+                stop_at_known=collect_only_new,
                 progress=_vote_progress_reporter(
                     api, chat_id, (status or {}).get("message_id"), week_label, log=log,
                 ),
@@ -4713,11 +5287,11 @@ async def handle_vote_command(
         # their admitted/vote state survives untouched.
         all_entries = (existing_poll.entries if existing_poll else []) + new_entries
         poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
-        # The week just collected is the week being worked on, so it becomes what the page
-        # and the status message open -- otherwise collecting the previous week would hand
-        # the moderator the empty poll of the week that has only just started (see
-        # voting.make_current). Only if it actually holds something: a week that turned out
-        # to have no nominations must not push aside a week that has them.
+        # The poll just collected is the one being worked on, so it becomes what the page
+        # and the status message open -- otherwise an older unmoderated poll still on disk
+        # (one the old "за прошлую неделю" button wrote, say) could be handed to the
+        # moderator instead (see voting.make_current). Only if it actually holds something:
+        # a collection that found no nominations must not push aside a poll that has them.
         if all_entries:
             voting.make_current(poll)
         voting.save_poll(poll)
@@ -4743,7 +5317,7 @@ async def handle_vote_command(
             "чтобы перейти к этой неделе -- заявки уже собраны и никуда не денутся."
         )
         await reply(
-            f"{summary} Неделя: {poll_id} ({week_label}). "
+            f"{summary} Неделя: {poll_id} (заявки {week_label}). "
             f"Открой модерацию и отметь, какие работы допустить.{elsewhere}",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
@@ -4866,18 +5440,17 @@ async def handle_vote_command(
                         {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
                     ],
-                    # Собрать заявки is two buttons, one per week: the collection window is
-                    # a calendar week, and which week you want depends on the day you press
-                    # it. On Monday -- when the vote for the week just finished is actually
-                    # run -- "this week" is a few hours old and has nothing in it.
+                    # Both read the previous and the current week (VOTE_COLLECT_WEEKS); they
+                    # differ in whether the scan stops at the newest work already collected
+                    # (see VOTE_ADD_NEW_WORDS).
                     [
                         {
-                            "text": "🔄 Заявки за эту неделю",
+                            "text": "🔄 Собрать все заявки",
                             "callback_data": _vote_action_callback_data("collect", chat_id, admin_user_id),
                         },
                         {
-                            "text": "🔄 За прошлую неделю",
-                            "callback_data": _vote_action_callback_data("collectprev", chat_id, admin_user_id),
+                            "text": "➕ Добавить новые",
+                            "callback_data": _vote_action_callback_data("collectnew", chat_id, admin_user_id),
                         },
                     ],
                     [
@@ -6507,6 +7080,26 @@ async def _pets_start_flow(
 #
 # Navigation stays open so a player who opens the menu mid-update reads the notice on a
 # working screen rather than meeting a wall of refusals.
+# What still works while the game is CLOSED (GAME_ENABLED=0), as opposed to paused.
+#
+# Far narrower than PAUSE_SAFE_PET_ACTIONS below, and for a different reason: a pause is a
+# few minutes during a deploy, so navigation stays open and only writes are held; a close
+# is indefinite, so nothing that reads as "come and play" may answer at all. What is left
+# is exactly quest moderation, which is not play -- somebody painted a model and is waiting
+# to hear whether it counted, and that queue must not stop because the arena did.
+#
+# `main` is NOT here on purpose. It draws the arena menu -- cage, fights, farm, shop -- and
+# a closed game must not advertise itself. A moderator does not need it: their route in is
+# the "Проверить в Telegram" button on the alert they were sent, which lands directly on
+# the review screen.
+QUEST_MODERATION_ACTIONS = frozenset({
+    "questreview", "questaccept", "questreject",
+    "questmods", "questmodadd", "questmoddel",
+    # A dead button on those same screens. Refusing it would answer a tap that asked for
+    # nothing with a notice about a game the moderator did not mention.
+    "noop",
+})
+
 PAUSE_SAFE_PET_ACTIONS = frozenset({
     "main", "info", "noop", "pet", "bag", "bagitems", "cage", "farm", "train", "fight",
     "history", "mail", "updates", "leaderboard", "slot", "shopslot", "skills", "skillpick",
@@ -6575,13 +7168,22 @@ async def handle_pets_callback(
     leaves the button spinning on the client until it times out -- a bug this codebase has
     already been bitten by once.
     """
-    # Nothing below this line exists without the game modules.
-    if await _decline_game_callback(api, callback, log=log):
+    # Nothing below this line exists without the game modules. Note the gate: modules
+    # LOADED, not game open -- a closed game still has to answer quest moderators.
+    if not game_available() and await _decline_game_callback(api, callback, log=log):
         return
     parsed = pets_ui.parse_callback(callback.get("data"))
     if parsed is None:
         return
     owner_id, action, argument = parsed
+    # The close is applied per action rather than at the door, because quest review lives
+    # in this same menu and is the one thing GAME_ENABLED=0 is meant to keep (see
+    # QUEST_MODERATION_ACTIONS). A no-op while the game is open.
+    if (
+        action not in QUEST_MODERATION_ACTIONS
+        and await _decline_game_callback(api, callback, log=log)
+    ):
+        return
     callback_id = callback.get("id")
     message = callback.get("message") or {}
     chat_id = (message.get("chat") or {}).get("id")
@@ -6709,9 +7311,12 @@ async def handle_pets_callback(
                         message_id=message_id, log=log,
                     )
                     return
+                prompt = "Ответь на это сообщение @username получателя."
+                if pets.gift_spends_paint(entry, user_id, item_code):
+                    prompt += "\n\n" + pets_ui.GIFT_SPENDS_PAINT_NOTE
                 gift_flow = await _pets_start_flow(
                     api, pets_flows, chat_id, actor.get("id"), entry, "gift_target",
-                    "Ответь на это сообщение @username получателя.", message_id, actor.get("username"),
+                    prompt, message_id, actor.get("username"),
                 )
                 # The item code is server-side only; callbacks remain compact and cannot
                 # be replayed by another menu owner.
@@ -7058,6 +7663,21 @@ async def handle_pets_callback(
                 ok, note, _receipt = pets.apply_personal_paint_rune(
                     entry, user_id, rune_id, candidates[int(raw_index)]["code"],
                 )
+            await _pets_toast_and_redraw(
+                api, chat_id, message_id, note,
+                pets_ui.personal_paint_runes_view(entry, user_id), log,
+            )
+            return
+        if action == "paintremove":
+            applied = pets.personal_paint_status(entry, user_id).get("applied", [])
+            code = next(
+                (row["code"] for row in applied if row.get("rune_id") == str(argument or "")),
+                None,
+            )
+            if code is None:
+                note = "Этот покрас уже снят."
+            else:
+                ok, note = pets.remove_personal_paint_rune(entry, user_id, code)
             await _pets_toast_and_redraw(
                 api, chat_id, message_id, note,
                 pets_ui.personal_paint_runes_view(entry, user_id), log,
@@ -8752,6 +9372,7 @@ async def _dispatch_update(
     cabinet_flows: dict[str, dict],
     menu_last_sent: dict,
     button_builder_flows: dict[str, dict] | None = None,
+    admin_flows: dict[str, dict] | None = None,
     vote_chat_flows: dict[str, dict] | None = None,
     vote_result_flows: dict[str, dict] | None = None,
     pets_flows: dict[str, dict] | None = None,
@@ -8767,6 +9388,7 @@ async def _dispatch_update(
     can't take the rest of the process down with it -- run_bot_listener's own try/except
     around this call is strictly a last-resort backstop, not the primary safety net."""
     button_builder_flows = button_builder_flows if button_builder_flows is not None else {}
+    admin_flows = admin_flows if admin_flows is not None else {}
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     pets_flows = pets_flows if pets_flows is not None else {}
@@ -8829,6 +9451,20 @@ async def _dispatch_update(
                 pets_flows, background_tasks, bot_username=bot_username,
                 known_chat_ids=known_chat_ids, log=log,
             )
+        elif callback_data.startswith(f"{admin_menu.CALLBACK_PREFIX}:"):
+            # DM-only like the panel itself, so the chat every action is about is the home
+            # chat -- the DM the button was pressed in has nothing to manage.
+            await handle_admin_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, admin_flows,
+                bot_username, background_tasks, known_chat_ids, badge_flows,
+                button_builder_flows, vote_chat_flows, log=log,
+            )
+        elif callback_data.startswith(f"{via_cleaner.CALLBACK_PREFIX}:"):
+            # The menu is DM-only, so the chat it is about is always the home chat -- the
+            # DM this button was pressed in has no chat history of its own to clean.
+            await handle_via_cleaner_callback(
+                api, telethon_client, callback, home_chat_ref, known_chat_ids, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_RESULT_CALLBACK_PREFIX}:"):
             # No chat resolution here either: the draft already carries the main chat's id
             # (resolved when the vote was closed), so pressing Отправить never waits on the
@@ -8855,6 +9491,26 @@ async def _dispatch_update(
     matched_entry = _match_allowed_chat(chat, cfg.listener_allowed_chats)
     if matched_entry is not None:
         known_chat_ids[matched_entry] = chat["id"]
+        # ViaCleaner's second pair of eyes. listener.py's Telethon session sees every
+        # via-message and is the primary observer; this one only sees them while the bot's
+        # privacy mode is off, but it keeps the chat clean during the times that session is
+        # the half that is down. via_cleaner.remember de-duplicates on (chat, message id),
+        # so both observers reporting the same message costs one store read and nothing
+        # else, and it is a no-op entirely for a chat with the cleaner switched off.
+        # Never our own posts: this bot has no inline mode, so a `via_bot` that is us could
+        # only be a Telegram-side surprise, and deleting our own menus would be a bad one.
+        via_bot = message.get("via_bot") or {}
+        if via_bot and via_bot.get("id") != bot_user_id:
+            try:
+                # Same shape listener.inline_bot_ref produces, so the two observers write
+                # the same label for the same bot: "@name", or the bare id without one.
+                username = via_bot.get("username")
+                via_cleaner.remember(
+                    matched_entry, message["message_id"],
+                    via=f"@{username}" if username else str(via_bot.get("id") or ""),
+                )
+            except Exception:
+                log(f"[bot_listener] via_cleaner could not schedule a message:\n{traceback.format_exc()}")
         # The Bot API gives us the reusable file_id that Telethon's user-session update
         # cannot. Preserve it for personal-paint quest rewards before the ordinary
         # command router ignores this non-command group post. quests.py handles either
@@ -9005,6 +9661,29 @@ async def _dispatch_update(
             api, message, home_chat_ref, admin_chat_id, button_builder_flows
         )
         return
+    if re.match(rf"^{re.escape(ADMIN_MENU_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_admin_command(api, message, home_chat_ref, admin_chat_id, log=log)
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in VIA_CLEANER_COMMANDS
+    ):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_via_cleaner_command(api, message, home_chat_ref, admin_chat_id, log=log)
+        return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
@@ -9070,6 +9749,16 @@ async def _dispatch_update(
             tz,
             log=log,
         )
+        return
+
+    # First among the force-reply consumers: an admin panel prompt is the only one that
+    # can end in somebody else's handler, and correlating on the prompt's own message id
+    # means it claims nothing that was not an answer to it.
+    if await handle_admin_text_input(
+        api, telethon_client, cfg, tz, message, home_chat_ref, admin_flows,
+        bot_username, background_tasks, known_chat_ids, badge_flows,
+        button_builder_flows, vote_chat_flows, log=log,
+    ):
         return
 
     if await handle_button_builder_text_input(
@@ -9388,7 +10077,7 @@ async def _dispatch_update(
         await maybe_send_menu(
             api, telethon_client, tz, message, home_chat_ref,
             cabinet_flows, badge_flows, menu_last_sent,
-            button_builder_flows=button_builder_flows, log=log,
+            button_builder_flows=button_builder_flows, admin_flows=admin_flows, log=log,
         )
         return
 
@@ -9419,6 +10108,21 @@ async def _dispatch_update(
         f"[bot_listener] queued request #{summary_queue.qsize()} from "
         f"'{chat.get('title', chat_key)}': {message_text!r}"
     )
+
+
+async def _supervise_service_tasks(tasks) -> None:
+    """Run long-lived sibling services and always drain them on the way out.
+
+    One crashed loop must not leave the others briefly alive against resources the caller
+    is about to tear down, such as the shared Bot API ClientSession.
+    """
+    running = [asyncio.create_task(task) for task in tasks]
+    try:
+        await asyncio.gather(*running)
+    finally:
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
 
 
 async def run_bot_listener(
@@ -9506,6 +10210,10 @@ async def run_bot_listener(
     # Short-lived /buttons conversations. Published posts and their counters are
     # persisted separately by stats.py; only the unfinished constructor lives here.
     button_builder_flows: dict[str, dict] = {}
+    # Short-lived /admin prompts -- the one question an `ask` button asked, and nothing
+    # else. Panel navigation keeps no state at all (every button carries its own action
+    # id), so a restart costs an administrator a half-typed answer and never a permission.
+    admin_flows: dict[str, dict] = {}
     # Short-lived "/vote chat" draft-text prompts. The finished announcement itself is
     # just sent, not persisted anywhere -- losing this on a restart costs the admin one
     # re-press, same as every other force-reply flow here.
@@ -9567,6 +10275,37 @@ async def run_bot_listener(
                 f"{vaulted_mirror['players']} players, returned {vaulted_mirror['runes']} "
                 "personal paint runes"
             )
+        lost_paints = await asyncio.to_thread(
+            pets.restore_lost_personal_paint_runes, cfg.listener_allowed_chats,
+        )
+        for row in lost_paints["restored"]:
+            log(
+                f"[pets] returned lost personal paint rune {row['rune_id']} "
+                f"({row['target']}) to user {row['user_id']} @{row['username'] or '?'}"
+            )
+        for row in lost_paints["gifted"]:
+            log(
+                f"[pets] kept personal paint rune {row['rune_id']} ({row['target']}) of "
+                f"user {row['user_id']} @{row['username'] or '?'} spent: it left with a gift"
+            )
+        closed_farm = await asyncio.to_thread(
+            pets.settle_closed_farm, cfg.listener_allowed_chats,
+        )
+        if closed_farm["farm"] or closed_farm["quarry"]:
+            log(
+                f"[pets] farm and quarry are closed: paid out {closed_farm['farm']} farm "
+                f"and {closed_farm['quarry']} quarry shifts in full"
+            )
+        if closed_farm["tickets"]:
+            log(
+                f"[pets] turned {closed_farm['tickets']} held farm tickets of "
+                f"{closed_farm['ticket_holders']} players into meadow tickets"
+            )
+        if lost_paints["unrecoverable"]:
+            log(
+                f"[pets] {lost_paints['unrecoverable']} lost personal paint runes have no "
+                "surviving photo and were not restored"
+            )
         scroll_reset = pets.reset_scroll_collections(cfg.listener_allowed_chats)
         if scroll_reset["players"]:
             log(
@@ -9625,7 +10364,8 @@ async def run_bot_listener(
                             summary_queue, background_tasks, home_chat_ref,
                             known_chat_ids, badge_flows,
                             cabinet_flows, menu_last_sent,
-                            button_builder_flows=button_builder_flows, vote_chat_flows=vote_chat_flows,
+                            button_builder_flows=button_builder_flows, admin_flows=admin_flows,
+                            vote_chat_flows=vote_chat_flows,
                             vote_result_flows=vote_result_flows, pets_flows=pets_flows, log=log,
                         ),
                         update.get("update_id"),
@@ -9749,6 +10489,56 @@ async def run_bot_listener(
                 except Exception:
                     log(f"[bot_listener] failed to handle a blocked file in '{entry}':\n{traceback.format_exc()}")
 
+        async def _via_cleaner_loop():
+            """Deletes via-messages whose delay has run out (see via_cleaner.py).
+
+            Not a queue consumer, and deliberately so: the hand-off between the half that
+            SEES a via-message and this half is a file, because the delay routinely
+            outlives the process and a queue would drop every pending deletion on each
+            deploy. So this loop reads the store, sleeps until the earliest thing in it is
+            due, and is woken early by via_cleaner.wake() whenever something new is
+            remembered -- which is what makes a chat set to "сразу" actually feel immediate.
+
+            Guarded like every other loop here: they share one asyncio.gather with the poll
+            loop, so an escaping exception takes the whole bot down rather than costing one
+            pass.
+            """
+            while True:
+                try:
+                    await via_cleaner.wait_for_work(via_cleaner.seconds_until_next())
+                    ready = via_cleaner.due()
+                    handled = []
+                    for item in ready:
+                        entry = item.get("entry") or ""
+                        chat_id = await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
+                        if chat_id is None:
+                            # Left in the queue rather than counted as done: the message is
+                            # still standing. It cannot pile up for ever -- via_cleaner
+                            # drops anything Telegram would refuse to delete anyway.
+                            log(f"[bot_listener] ViaCleaner cannot resolve a chat_id for '{entry}' yet")
+                            continue
+                        # Best-effort inside api.delete_message: no rights, already gone,
+                        # or too old all fail silently, and none of them is a reason to
+                        # keep retrying the same message on every pass.
+                        await api.delete_message(chat_id, item["message_id"])
+                        handled.append(item)
+                    if handled:
+                        via_cleaner.settle(handled)
+                        log(f"[bot_listener] ViaCleaner deleted {len(handled)} via-message(s)")
+                    else:
+                        # Still called with nothing handled: settle is where the queue
+                        # sheds entries that have aged out of Telegram's delete window.
+                        via_cleaner.settle([])
+                        if ready:
+                            # Everything due was unresolvable, so the store still says
+                            # "due now" and the wait above would return instantly.
+                            await asyncio.sleep(VIA_CLEANER_STUCK_BACKOFF_SECONDS)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log(f"[bot_listener] ViaCleaner sweep failed:\n{traceback.format_exc()}")
+                    await asyncio.sleep(VIA_CLEANER_STUCK_BACKOFF_SECONDS)
+
         async def _consume_quest_refusals():
             while True:
                 item = await quest_refusal_queue.get()
@@ -9855,6 +10645,21 @@ async def run_bot_listener(
                 return False
             return await _can_manage_chat(api, admin_chat_id, user, home_chat_ref)
 
+        async def _is_vote_stats_admin(user: dict) -> bool:
+            """Who may inspect the private subscriber/non-subscriber vote split.
+
+            Unlike normal v1 moderation, delegated badge managers are intentionally
+            excluded: this is limited to real chat administrators and Sultan.
+            """
+            if not home_chat_ref:
+                return False
+            admin_chat_id = await _resolve_chat_id(
+                telethon_client, home_chat_ref, known_chat_ids, log=log,
+            )
+            if admin_chat_id is None:
+                return False
+            return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
+
         async def _is_quest_moderator(user: dict) -> bool:
             """Who may accept or reject a quest submission.
 
@@ -9884,15 +10689,15 @@ async def run_bot_listener(
             return await _is_chat_admin_or_privileged(api, admin_chat_id, user)
 
         async def _is_vote_member(user: dict) -> bool:
-            """The "голосовать могут только подписчики" gate: only members of the home
-            chat may cast a ballot. Fails closed -- an unresolvable home chat blocks
-            voting entirely rather than letting a stranger through, the same tradeoff
-            _is_vote_admin makes above."""
+            """Subscription snapshot for v1's post-vote join invitation and statistics.
+
+            A failed lookup returns False, but is no longer a reason to reject a ballot.
+            """
             if not home_chat_ref:
                 return False
             admin_chat_id = await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
             if admin_chat_id is None:
-                log("[bot_listener] /vote membership check: could not resolve the home chat -- denying the vote.")
+                log("[bot_listener] /vote membership check: could not resolve the home chat.")
                 return False
             user_id = user.get("id")
             if user_id is None:
@@ -9946,10 +10751,21 @@ async def run_bot_listener(
         tasks = [
             _poll_loop(),
             _consume_summaries(),
-            _farm_returns_loop(),
-            _daily_chatter_prize_loop(),
             _button_counter_refresh_loop(api, home_chat_ref, log=log),
+            # Unconditional, unlike the queue consumers below: its work comes off disk, so
+            # it also has a restart's worth of overdue deletions to clear on the way up.
+            _via_cleaner_loop(),
         ]
+        if game_open():
+            # Both settle and announce the game's own clocks -- farm expeditions coming
+            # home, yesterday's chatter prizes. With the game closed there is nothing for
+            # them to settle and nobody who could spend what they paid out, so they are
+            # left off rather than left spinning: an hourly scan of every tracked chat is
+            # not free, and paying prizes into a shut game is worse than not paying them.
+            tasks.append(_farm_returns_loop())
+            tasks.append(_daily_chatter_prize_loop())
+        else:
+            log("[bot_listener] the game is closed: farm returns and chatter prizes are off")
         if figurine_ack_queue is not None:
             tasks.append(_consume_figurine_acks())
         if quest_submission_queue is not None:
@@ -10045,9 +10861,9 @@ async def run_bot_listener(
                         api, telethon_client, pledge, known_chat_ids, log=log,
                     )
 
-                if not game_available():
+                if pets_web is None:
                     log("[bot_listener] the game's Mini App is not being served: "
-                        + (GAME_IMPORT_ERROR or ""))
+                        + (GAME_IMPORT_ERROR or _game_down_reason(False)))
                 else:
                     pets_web.attach(
                         app, cfg, home_chat_ref or "",
@@ -10079,13 +10895,14 @@ async def run_bot_listener(
                 vote_web.run_web_server(
                     cfg, home_chat_ref or "", _is_vote_admin, cfg.webapp_port,
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
+                    is_stats_admin=_is_vote_stats_admin,
                     export=_deliver_vote_board, avatar=_fetch_vote_avatar,
                     attach=_attach_extra,
                 )
             )
         else:
             log("[bot_listener] PORT is not set -- the voting page is not being served.")
-        await asyncio.gather(*tasks)
+        await _supervise_service_tasks(tasks)
 
 
 async def main():
