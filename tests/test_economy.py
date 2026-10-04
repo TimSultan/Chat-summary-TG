@@ -199,10 +199,26 @@ class EffectTests(unittest.TestCase):
             stats.REPUTATION_PER_BADGE_RECEIVED + stats.REPUTATION_PER_CONTEST_WIN,
         )
 
+    def test_coins_won_in_the_arena_are_not_reputation(self):
+        """A duel win moves 5% of the loser's coins into the winner's `received`. That
+        field used to be read as "coins given by other members", so beating one rich
+        player was worth thousands of reputation. It is money, and only money."""
+        user = stats.UserStats(user_id="1")
+        before = economy.reputation_for("chat", "1", user)
+        moved = economy.settle_arena_reward(
+            "chat", "1", 0, "2", 10_000_000, transfer_share=0.05,
+        )
+
+        self.assertGreater(moved, 0)
+        self.assertEqual(economy.lifetime("chat", "1")["received"], moved)
+        self.assertEqual(economy.reputation_for("chat", "1", user), before)
+        # ...while it still spends like any other coin.
+        self.assertEqual(economy.balance("chat", "1", 0), moved)
+
     def test_earned_badges_add_reputation_once_a_userstats_is_passed(self):
         """The /stat paths all hold a UserStats, so this is what members actually see."""
-        user = stats.UserStats(user_id="1", figurines_painted=10, media=25)
-        # Painting tiers 1-3, plus the gallery badge.
+        user = stats.UserStats(user_id="1", active_days=65, messages=2_400)
+        # Завсегдатай 2 and Собеседник 2.
         self.assertEqual(stats.medal_levels(user), 4)
         self.assertEqual(
             economy.reputation_for("chat", "1", user),
@@ -216,7 +232,7 @@ class EffectTests(unittest.TestCase):
         )
 
     def test_stat_extras_passes_the_userstats_through_to_reputation(self):
-        user = stats.UserStats(user_id="1", figurines_painted=50, media=25)
+        user = stats.UserStats(user_id="1", active_days=90, messages=5_000)
         extras = economy.stat_extras("chat", "1", 500, user)
         self.assertEqual(extras["reputation"], stats.medal_levels(user))
         # Without it, the same member scores only the peer-granted half.
@@ -227,85 +243,86 @@ class EffectTests(unittest.TestCase):
             self.assertEqual(economy.stat_extras("chat", "1", 500), {})
 
 
-class SeasonTests(unittest.TestCase):
-    def test_seasons_are_calendar_quarters(self):
-        self.assertEqual(
-            stats.season_bounds(date(2026, 7, 25)), (date(2026, 7, 1), date(2026, 9, 30))
-        )
-        self.assertEqual(
-            stats.season_bounds(date(2026, 1, 1)), (date(2026, 1, 1), date(2026, 3, 31))
-        )
-        # The Q4 boundary is the one that would break a naive month+3 calculation.
-        self.assertEqual(
-            stats.season_bounds(date(2026, 12, 31)), (date(2026, 10, 1), date(2026, 12, 31))
-        )
-        self.assertEqual(stats.season_key(date(2026, 7, 25)), "2026-S3")
-        self.assertNotEqual(
-            stats.season_key(date(2026, 9, 30)), stats.season_key(date(2026, 10, 1))
-        )
+class PermanentLevelTests(unittest.TestCase):
+    """The chat level is scored on all-time XP and never resets.
 
-    def test_season_xp_counts_only_days_inside_the_season(self):
-        combined = {}
-        payload = lambda day: {
-            "day": day,
-            "users": {"20": {"messages": 10, "words": 500, "media": 0, "replies": 0}},
-        }
-        season_start = date(2026, 7, 1)
-        stats._merge_day(combined, payload("2026-06-20"), season_start=season_start)
-        stats._merge_day(combined, payload("2026-07-10"), season_start=season_start)
-        user = combined["20"]
+    It used to be scored on a calendar-quarter season, and the first boundary (1 October
+    2026) dropped every member back to level 1-3 overnight -- what the chat reported as
+    "levels broken". These pin that it cannot happen again.
+    """
 
-        self.assertEqual(user.words, 1_000)
-        self.assertEqual(user.season_words, 500)
-        self.assertEqual(user.active_days, 2)
-        self.assertEqual(user.season_active_days, 1)
-        # All-time is strictly larger, and the level reads the smaller number.
-        self.assertGreater(user.xp(5.0), user.season_xp(5.0))
-
-    def test_season_xp_falls_back_to_all_time_when_no_window_was_applied(self):
-        # Aggregates built without a season_start (older callers, tests) must still
-        # render a sensible level rather than reporting everybody at level 1.
-        combined = {}
-        stats._merge_day(combined, {
-            "day": "2026-07-10",
-            "users": {"20": {"messages": 10, "words": 500, "media": 0, "replies": 0}},
-        })
-        user = combined["20"]
-        self.assertEqual(user.season_xp(5.0), user.xp(5.0))
-
-    def test_a_season_of_p95_activity_reaches_the_top_level(self):
-        """The calibration target: ~103 XP/day for 90 days maxes the ladder."""
-        season_xp = 103 * 90
-        self.assertEqual(stats.chat_level(season_xp).number, stats.MAX_CHAT_LEVEL)
-        # ...and a season at the p90 rate gets most of the way, not all of it.
-        self.assertLess(stats.chat_level(68 * 90).number, stats.MAX_CHAT_LEVEL)
-        self.assertGreater(stats.chat_level(68 * 90).number, 25)
-
-    def test_a_new_season_rebaselines_the_watermark_without_a_word(self):
+    def test_a_quarter_boundary_no_longer_resets_the_watermark(self):
         user = stats.UserStats(user_id="20", username="user", display_name="User")
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
-                with patch("stats.app_now", return_value=datetime(2026, 7, 15, tzinfo=timezone.utc)):
+                with patch("stats.app_now", return_value=datetime(2026, 9, 30, tzinfo=timezone.utc)):
                     stats.record_level_observations("chat", [(user, 0)])
-                    climbed = stats.record_level_observations("chat", [(user, 9_000)])
-                    high = stats._load_level_state("chat")["users"]["20"]
-
-                # New quarter: everybody's season XP restarts at zero, so the watermark
-                # must come down with it rather than freezing them at last season's peak.
+                    stats.record_level_observations("chat", [(user, 9_000)])
+                    before = stats._load_level_state("chat")["users"]["20"]
                 with patch("stats.app_now", return_value=datetime(2026, 10, 2, tzinfo=timezone.utc)):
-                    reset = stats.record_level_observations("chat", [(user, 0)])
+                    stats.record_level_observations("chat", [(user, 9_050)])
                     after = stats._load_level_state("chat")["users"]["20"]
 
-        self.assertEqual(climbed, [])
-        self.assertEqual(reset, [])
-        self.assertEqual(high["season"], "2026-S3")
-        self.assertGreater(high["chat_level"], 1)
-        self.assertEqual(after["season"], "2026-S4")
-        self.assertEqual(after["chat_level"], 1)
+        self.assertGreater(before["chat_level"], 30)
+        self.assertGreaterEqual(after["chat_level"], before["chat_level"])
+        self.assertNotIn("season", after)
+
+    def test_a_watermark_saved_with_a_season_is_still_read(self):
+        """State written while seasons existed carries a "season" key. It must neither
+        reset anybody nor announce anything when it is next compared."""
+        user = stats.UserStats(user_id="20", username="user", display_name="User")
+        saved = {
+            "version": stats.LEVEL_STATE_VERSION,
+            "users": {"20": {
+                "chat_level": 35, "painter_figurines": 0, "season": "2026-S3",
+            }},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._level_state_path("chat"), saved)
+                announced = stats.record_level_observations("chat", [(user, 9_000)])
+                after = stats._load_level_state("chat")["users"]["20"]
+
+        self.assertEqual(announced, [])
+        # Moved forward (a new name was reached), never back to the start of a season.
+        self.assertEqual(after["chat_level"], stats.chat_level(9_000).number)
+
+    def test_the_first_forty_levels_cost_what_they_always_did(self):
+        """Same curve the seasonal ladder used, so dropping the season lowered nobody:
+        all-time XP is never below one quarter's XP."""
+        for number in range(2, 41):
+            self.assertEqual(stats.chat_level_threshold(number), int(25 * number ** 1.6))
+        # The calibration target still holds: three months at the p95 rate is level 40.
+        self.assertEqual(stats.chat_level(103 * 90).number, 40)
+
+    def test_the_ladder_has_no_top(self):
+        top = stats.chat_level(10**7)
+        self.assertGreater(top.number, 40)
+        self.assertGreater(top.next_threshold, 10**7)
+        self.assertLess(stats.chat_level_progress(10**7), 100)
+        # The last name is reached eventually; the number keeps counting past it.
+        self.assertIn("Вечный", top.label)
+
+    def test_the_solved_level_matches_walking_the_ladder(self):
+        def walked(xp):
+            number = 1
+            while stats.chat_level_threshold(number + 1) <= xp:
+                number += 1
+            return number
+
+        for xp in list(range(0, 60_000, 37)) + [
+            stats.chat_level_threshold(n) + delta for n in range(2, 150) for delta in (-1, 0, 1)
+        ]:
+            with self.subTest(xp=xp):
+                self.assertEqual(stats.chat_level(xp).number, walked(xp))
+
+    def test_negative_xp_is_level_one(self):
+        self.assertEqual(stats.chat_level(-500).number, 1)
+
 
     def test_chat_levels_are_tracked_but_never_announced(self):
-        """Deliberately silent: on the seasonal curve these come round every quarter for
-        the same handful of people, and the level is always visible in /stat."""
+        """Deliberately silent: they are frequent, they come from the same handful of
+        people, and the level is always visible in /stat."""
         user = stats.UserStats(user_id="20", username="user", display_name="User")
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
@@ -332,23 +349,74 @@ class SeasonTests(unittest.TestCase):
 class LevelTrackTests(unittest.TestCase):
     def test_chat_level_has_no_figurine_gate(self):
         # The exact case the split exists for: a prolific talker who has never painted.
-        # 11.6k XP is a full season at the very top of the chat, so it maxes the ladder.
         talker = stats.chat_level(11_648)
-        self.assertEqual(talker.number, stats.MAX_CHAT_LEVEL)
-        self.assertIn("Хранитель чата", talker.label)
+        self.assertGreaterEqual(talker.number, 40)
+        self.assertIn("Столп чата", talker.label)
 
         # ...and a prolific painter who barely talks still ranks on the craft track.
         rank, _ = stats.painter_rank(50)
         self.assertEqual(rank.name, "Легенда покраса")
 
-    def test_chat_level_curve_is_monotonic_and_capped(self):
-        thresholds = [stats.chat_level_threshold(n) for n in range(1, stats.MAX_CHAT_LEVEL + 1)]
-        self.assertEqual(thresholds, sorted(thresholds))
+    def test_chat_level_curve_is_strictly_increasing(self):
+        thresholds = [stats.chat_level_threshold(n) for n in range(1, 500)]
         self.assertEqual(thresholds[0], 0)
-        top = stats.chat_level(10**9)
-        self.assertEqual(top.number, stats.MAX_CHAT_LEVEL)
-        self.assertIsNone(top.next_threshold)
-        self.assertEqual(stats.chat_level_progress(10**9), 100)
+        self.assertTrue(all(a < b for a, b in zip(thresholds, thresholds[1:])))
+
+    def test_the_first_eight_names_keep_their_old_bands(self):
+        """The ladder was extended upward only: up to level 45 every member reads the
+        same name they read before, so adding names lowered nobody's."""
+        old_names = [name for _, _, name in stats.CHAT_LEVEL_TIERS[:8]]
+        for number in range(1, 46):
+            with self.subTest(level=number):
+                expected = old_names[min((number - 1) // 5, 7)]
+                self.assertEqual(
+                    stats.chat_level(stats.chat_level_threshold(number)).tier_name, expected
+                )
+
+    def test_names_widen_and_never_repeat(self):
+        starts = [first for first, _, _ in stats.CHAT_LEVEL_TIERS]
+        self.assertEqual(starts[0], 1)
+        self.assertEqual(starts, sorted(set(starts)))
+        gaps = [b - a for a, b in zip(starts[7:], starts[8:])]
+        self.assertEqual(gaps, sorted(gaps), "bands above 36 must only get wider")
+        names = [name for _, _, name in stats.CHAT_LEVEL_TIERS]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_veterans_still_have_names_ahead_of_them(self):
+        """The reason for the extension: at the p95 rate (~103 XP/day) the last name
+        used to arrive within three months and never change again."""
+        a_year = stats.chat_level(103 * 365)
+        self.assertLess(
+            stats._chat_tier_index(a_year.number), len(stats.CHAT_LEVEL_TIERS) - 3,
+        )
+        # ...while the busiest member in the chat gets there in about two years.
+        self.assertIn("Вечный", stats.chat_level(299 * 730).label)
+
+    def test_painter_ranks_keep_their_old_steps_and_continue_past_fifty(self):
+        old = [(0, "Серый новичок"), (3, "Ученик грунта"), (5, "Подмастерье кисти"),
+               (10, "Укротитель аэрографа"), (20, "Повелитель проливок"),
+               (35, "Мастер витрины"), (50, "Легенда покраса")]
+        self.assertEqual([(m, n) for m, _, n in stats.PAINTER_RANKS[:7]], old)
+        rank, next_rank = stats.painter_rank(50)
+        self.assertEqual(next_rank.name, "Магистр лессировок")
+        top, nothing = stats.painter_rank(10_000)
+        self.assertEqual(top.name, "Бессмертная кисть")
+        self.assertIsNone(nothing)
+
+    def test_a_painter_already_past_the_old_top_is_announced_once(self):
+        user = stats.UserStats(
+            user_id="20", username="user", display_name="User", figurines_painted=80,
+        )
+        stored = {"version": stats.LEVEL_STATE_VERSION,
+                  "users": {"20": {"chat_level": 1, "painter_figurines": 50}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats._write_json_atomic(stats._level_state_path("chat"), stored)
+                first = stats.record_level_observations("chat", [(user, 0)])
+                again = stats.record_level_observations("chat", [(user, 0)])
+
+        self.assertEqual(first, ["@user получил новое звание «✨ Магистр лессировок»! 🎉🎊🥳"])
+        self.assertEqual(again, [])
 
     def test_progress_bar_shows_position_without_revealing_the_target(self):
         xp = (stats.chat_level_threshold(5) + stats.chat_level_threshold(6)) // 2

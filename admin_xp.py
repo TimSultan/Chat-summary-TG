@@ -101,34 +101,22 @@ def _breakdown(entry: str, user_id: str) -> None:
     The question worth answering before touching anything: a grant and a genuinely active
     member look identical in /top. Printing both halves side by side says which one you
     are looking at, instead of removing a grant and finding they were top anyway.
+
+    Reads stats.xp_breakdown, the same split the admin resource panel shows, so the CLI
+    and the panel can never disagree about what was earned and what was handed out.
     """
     with _resolved_paths():
-        rows = stats.aggregate_all_time(entry)
-        baseline = stats._load_words_per_point(entry) or stats.DEFAULT_WORDS_PER_POINT
-    user = rows.get(str(user_id))
-    if user is None:
+        breakdown = stats.xp_breakdown(entry, user_id)
+    if not breakdown["found"]:
         print("  В статистике чата этого человека нет.")
         return
-    total = user.xp(baseline)
-    granted = user.bonus_xp
-    earned = total - granted
-    print(f"\n  Всего XP: {_num(total)}")
-    print(f"    заработано: {_num(earned)}")
-    print(f"    выдано:     {_num(granted)}")
-    if earned:
+    print(f"\n  Всего XP: {_num(breakdown['total'])}")
+    print(f"    заработано: {_num(breakdown['earned'])}")
+    print(f"    выдано:     {_num(breakdown['granted'])}")
+    if breakdown["earned"]:
         print("  Из заработанного:")
-        parts = (
-            ("сообщения (старый счёт)", user.legacy_message_points),
-            (f"слова ({user.words} / {baseline:g})", round(user.words / baseline)),
-            (f"медиа ×{user.media}", user.media * stats.XP_PER_MEDIA_MESSAGE),
-            (f"ответы ×{user.replies}", user.replies * stats.XP_PER_REPLY),
-            (f"активные дни ×{user.active_days}", user.active_days * stats.XP_PER_ACTIVE_DAY),
-            (f"покрасы ×{user.figurines_painted}",
-             user.figurines_painted * stats.XP_PER_FIGURINE),
-        )
-        for label, value in parts:
-            if value:
-                print(f"    {_num(value):>12}  {label}")
+        for part in breakdown["parts"]:
+            print(f"    {_num(part['xp']):>12}  {part['label']}")
 
 
 def _show(entry: str, user_id: str) -> dict:
@@ -137,12 +125,14 @@ def _show(entry: str, user_id: str) -> dict:
     if not grants:
         print("  XP-начислений нет — весь XP этого игрока заработан.")
     else:
+        # Signed: the resource panel's running adjustment can be negative, and it really
+        # is subtracted from the total, so it is shown and summed that way here too.
         total = sum(row["amount"] for row in grants.values())
         print(f"  Выданный XP: {_num(total)}")
         for key, row in sorted(grants.items(), key=lambda item: -item[1]["amount"]):
             print(f"    {_num(row['amount']):>14} XP  ·  {row['granted_at'] or '?'}"
                   f"  ·  ключ «{key}»")
-        print(f"  Это даёт монет: {_num(total // stats.XP_PER_COIN)}")
+        print(f"  Это даёт монет: {_num(max(0, total) // stats.XP_PER_COIN)}")
     _breakdown(entry, user_id)
     return grants
 
@@ -190,7 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Ключа «{args.key}» у этого игрока нет.", file=sys.stderr)
         return 1
     removing = grants[args.key]["amount"] if args.key else sum(r["amount"] for r in grants.values())
-    coins = removing // stats.XP_PER_COIN
+    # A net-negative removal (only a downward adjustment left) RAISES the total, and there
+    # is no coin un-grant to balance it, so it is never "compensated" with a negative sum.
+    coins = max(0, removing) // stats.XP_PER_COIN
 
     if not args.yes:
         print(f"\nБудет снято: {_num(removing)} XP")
@@ -205,7 +197,7 @@ def main(argv: list[str] | None = None) -> int:
     with _resolved_paths():
         removed = stats.revoke_xp_grants(entry, user_id, args.key)
         paid = 0
-        if removed and not args.no_compensate:
+        if removed > 0 and not args.no_compensate:
             paid = removed // stats.XP_PER_COIN
             # Idempotent on the exact amount: re-running the same correction cannot pay
             # twice, the same guarantee every other grant in this codebase makes.

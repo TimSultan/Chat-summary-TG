@@ -545,7 +545,8 @@ class FounderBadgeTests(unittest.TestCase):
         badge = stats.ensure_founder_badge(self.ENTRY)
         self.assertTrue(badge.custom)
         self.assertNotIn(
-            stats.FOUNDER_BADGE_ID, [badge_id for badge_id, _, _, _ in stats.AUTOMATIC_BADGES]
+            stats.FOUNDER_BADGE_ID,
+            [stats.ACTIVE_DAYS_BADGE[0], stats.MESSAGES_BADGE[0]],
         )
 
 

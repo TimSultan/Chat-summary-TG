@@ -196,6 +196,24 @@ Details worth knowing:
 `tests/test_blocked_files.py` pins which attachments match and how the sender is
 addressed (an `@username` when there is one, a `tg://user` mention link when there isn't).
 
+### ✍️ deletes a message, for the moderator
+
+When **@sultan_kembayev** reacts **✍️** to any message in a chat named in
+`LISTENER_ALLOWED_CHATS`, the bot deletes that message (`handle_moderator_reaction`). Who
+may do it is `REACTION_DELETE_USERNAMES`, kept separate from the badge-menu delegates on
+purpose — deleting anybody's message is its own power.
+
+- Only **adding** ✍️ counts. Telegram resends the whole reaction set on every change, so a
+  ✍️ that was already there, or one being taken away, deletes nothing.
+- Nobody else's ✍️, and no other emoji, ever deletes anything. An anonymous admin reacts
+  as the chat rather than as a person, so it is ignored too.
+- It runs on the bot account: the bot must be an **admin with delete rights**, because
+  Telegram only sends reaction updates (`message_reaction`, requested in `getUpdates`'
+  `allowed_updates`) to a bot that administers the chat. Telegram also refuses to let a bot
+  delete messages older than 48 hours; that failure is swallowed like every other delete.
+- Deleting a `#япокрасил` post this way does not take its figurine credit back — use
+  `/deletepokras` for that, as before.
+
 ### Turning the game off (`GAME_ENABLED`)
 
 The pet game and the chat share one process, so the game's code sits in the chat's memory
@@ -362,42 +380,79 @@ formula is unchanged; only its user-facing name changed from points to XP. `/top
 also shows the member with the largest positive XP change compared with the preceding
 seven-day window.
 
+**Chat XP belongs to the chat.** It is computed only from what members write and post
+(`stats.UserStats.xp`), and nothing in the game writes to it: coins are *derived* from XP
+(`economy.balance`), never the other way round, and a payment is made in coins
+(`economy.grant_once`, `admin_grant.py --gold`). XP handed out as money puts the recipient
+at the top of `/top` and `/stat` and cannot be told apart from XP somebody earned. One such
+grant — 10,000,000 XP to london_leads, re-applied on every start so even `admin_xp.py`
+could not make its removal stick — is converted once at start-up into the 2,000,000 coins it
+stood for (`economy.retire_xp_grant`, idempotent, never pays twice). `admin_xp.py` remains
+the tool for any other grant; the resource panel's "XP сервера" is for correcting a total,
+not for paying people.
+
+A bare `/stat` finds the requester by their **Telegram id** first, then by @username, then by
+display name (an exact match before a partial one), so a member without a username is never
+shown somebody else's card because their name happens to be part of it.
+
 `/stat [username]` shows all-time XP plus three **independent** progression tracks. They
 were split apart deliberately: a single ladder gated on XP *and* figurines at once meant
 a member who chatted constantly but painted nothing, and a member who painted constantly
 but rarely posted, were both frozen at the bottom forever. Now everybody always has at
 least one bar moving.
 
-**🧩 Уровень — chat level.** Scored on **season XP**, not all-time, with no figurine
-requirement. Forty levels on a `25 × n^1.6` curve, renamed every five levels (🌱 Новенький
-→ 💬 Болтун → 🗣️ Голос чата → 📣 Заводила → 🎙️ Старожил → 🔥 Душа чата → ⚡ Легенда общения
-→ 🌟 Хранитель чата). A progress bar shows position inside the current level **without**
-printing the target, so the old "don't reveal the next requirement" rule still holds.
+**🧩 Уровень — chat level.** Scored on **all-time XP** and **never reset**, with no figurine
+requirement. A `25 × n^1.6` curve with **no top**. A progress bar shows position inside the
+current level **without** printing the target, so the old "don't reveal the next requirement"
+rule still holds. Rank, coins and the level all read the same all-time XP number.
 
-Seasons are calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec) — fixed boundaries so
-everyone's season starts on the same day. Season XP and all-time XP are accumulated in the
-**same aggregation pass** (`UserStats.season_*`), so `/stat` pays for one walk, not two.
+Seventeen names (`CHAT_LEVEL_TIERS`). Every five levels up to 40, where newcomers need
+frequent milestones, then in widening bands:
 
-The curve is calibrated from the chat's own measured rates, caps applied:
-
-| | XP/day | after one season | max reached in |
+| from level | name | from level | name |
 |---|---|---|---|
-| top-1 | 299 | level 40 | 31 days |
-| **p95** | **103** | **level 40** | **89 days** ← the target |
-| p90 | 68 | ⚡ Легенда общения 31 | 134 days |
-| p75 | 12 | 💬 Болтун 10 | 2 years |
-| median | 2.8 | 🌱 Новенький 4 | — |
+| 1 | 🌱 Новенький | 46 | 🏛️ Столп чата |
+| 6 | 💬 Болтун | 58 | 📜 Летописец |
+| 11 | 🗣️ Голос чата | 72 | 🧙 Аксакал |
+| 16 | 📣 Заводила | 90 | 🐉 Древний дух чата |
+| 21 | 🎙️ Старожил | 112 | 🌌 Живая история |
+| 26 | 🔥 Душа чата | 140 | 👑 Патриарх ЕПХ |
+| 31 | ⚡ Легенда общения | 175 | 🗿 Монумент ЕПХ |
+| 36 | 🌟 Хранитель чата | 220 | 🌋 Титан чата |
+| | | 280 | ♾️ Вечный |
 
-Levels are scored seasonally because the two goals are otherwise incompatible: with
-all-time XP, a ladder cheap enough to climb in a season is one that members tracked for a
-year would start already past the top of, and it would never move again.
+The names used to stop at 🌟 Хранитель чата (level 36), which the top 5% of members reached
+in about two and a half months — after that the whole core of the chat read the same name
+for good. Measured on this chat's rates, the level after a given time is:
 
-Only a **tier** change (every five levels) is announced, not each level. On this curve an
-active member crosses ~40 levels a season; announcing each would put several promotion
-messages a day into the chat from the same few people. A new season re-baselines everyone
-silently — the ladder was rebuilt, nobody was demoted.
+| | 1 month | 3 months | 6 months | 1 year | 2 years | 3 years |
+|---|---|---|---|---|---|---|
+| busiest (299 XP/day) | 39 | 78 | 121 | 188 | 290 | 374 |
+| p95 (103) | 20 | 40 | 62 | 96 | 149 | 192 |
+| p90 (68) | 15 | 31 | 47 | 74 | 115 | 148 |
+| p75 (12) | 5 | 10 | 16 | 25 | 38 | 50 |
+| median (2.8) | 2 | 4 | 6 | 10 | 15 | 20 |
 
-**🎨 Звание — painter rank.** The original seven names, now gated on figurines alone:
+so the busiest member reaches ♾️ Вечный in about two years and a p95 member in about five,
+while everyone keeps passing a new name every few months. The first eight bands are exactly
+what they were, so nobody's name went down when the rest were added.
+
+The level used to be scored on a calendar-quarter **season**. The first quarter boundary
+(1 October 2026) dropped every member back to level 1–3 overnight with nothing in the chat
+explaining why — a level that silently falls reads as broken, and it was reported exactly
+that way. Seasons were removed rather than announced: the first forty levels cost what they
+always did (the p95 member, ~103 XP/day, reaches level 40 in about three months), so
+switching to all-time XP lowered nobody, and with no cap the most active members keep
+moving instead of freezing at the top; each level costs a little more than the last, so
+the climb slows down on its own.
+
+Only a **tier** change (every five levels) is tracked as a milestone, not each level, and
+chat-level promotions are not announced at all (see below).
+
+**🎨 Звание — painter rank.** Gated on figurines alone. The original seven stop at 50, which
+a steady painter reaches within a year; six more continue in wider steps so the top is a
+career rather than a season. The first seven are unchanged, so nobody's rank went down — a
+painter already past 75 is announced once, the next time their rank is observed:
 
 - 🩶 Серый новичок — 0 figurines
 - ⚪ Ученик грунта — 3
@@ -406,28 +461,37 @@ silently — the ladder was rebuilt, nobody was demoted.
 - 💧 Повелитель проливок — 20
 - 🏛️ Мастер витрины — 35
 - 👑 Легенда покраса — 50
+- ✨ Магистр лессировок — 75
+- 🪞 Чародей NMM — 100
+- 🔆 Заклинатель свечения — 150
+- 🏆 Гроссмейстер кисти — 200
+- 🐉 Живой классик — 300
+- ♾️ Бессмертная кисть — 500
 
 **Репутация — standing.** Tiers: Пока тихо → 🌿 Замеченный → 👏 Уважаемый → 🤝 Опора чата →
-🏅 Легенда сообщества. Four inputs:
+🏅 Легенда сообщества. Three inputs:
 
 | source | rate |
 | --- | --- |
 | weekly contest win | **10** each |
 | administrator-awarded custom badge | **5** each |
-| coins *received* from another member | **1** per 20 |
-| earned-badge **level** held | **1** each |
+| automatic badge **level** held | **1** each, capped at **19** |
 
-The first three are peer-granted and cannot be moved by posting — that is the anti-grind
-core, and it still is. The fourth is the one self-earned input, added so a member nobody
-has handed anything yet still has a reputation that moves.
+The first two are peer-granted and cannot be moved by posting — that is the anti-grind
+core, and it still is. The third is the one self-earned input, added so a member nobody
+has handed anything yet still has a reputation that moves. **Nothing from the game counts.**
 
-A badge is worth **one point per level**, not one point per badge: a five-level family is
-five points at the top. `🏅 Я покрасил 5` means levels 1–5 are all unlocked, so it scores
-5 — "a point per medal" and "a point per level" are the same number here, not two rules to
-combine. The medal total is capped at **17**: painting 5, messages 2, streak 3, night
-shift 3, and one each for 🖼️ Галерея, 📅 Завсегдатай, 🦄 Я не пидор and 🎪 Участник
-Недельного конкурса. That ceiling is deliberately below two contest wins — grinding the
-whole collection can never outrank being valued by the chat.
+There used to be a fourth input, a point per 20 coins *received* from another member.
+Member transfers existed for one afternoon in July 2026; from 26 August the arena wrote the
+5% it takes from a duel's loser into the same `received` field, so the point quietly became
+"coins won in fights". One win over a rich player was worth thousands of reputation, which
+is why a few arena regulars sat far above everybody else. The input is gone; the coins stay
+in the winner's balance.
+
+A badge is worth **one point per level**: `📅 Завсегдатай 3` is three points, `💬 Собеседник 5`
+five. Those levels never run out, so the medal total is capped at **19**
+(`REPUTATION_MEDAL_LEVEL_CAP`), one short of two contest wins — grinding can never outrank
+being valued by the chat.
 
 Custom badges and contest wins are **excluded** from the per-level count: they already
 score 5 and 10, and adding a point would pay twice for one medal.
@@ -502,10 +566,10 @@ Each planter's display name is stored **at press time** rather than looked up la
 roll call has to name members who have never written a word in the chat, and those are
 exactly the ones no stats file knows about.
 
-The founder badge lives in the custom-badge store rather than in `AUTOMATIC_BADGES`,
+The founder badge lives in the custom-badge store rather than among the automatic badges,
 because nothing about it can be recomputed from a member's stats — it records a single
 afternoon, and afterwards there is no way to earn it again. That also puts it in the
-`✨ Уникальные значки` block at the top of `/stat`, which is where a thing you cannot earn
+`✨ Уникальные значки` line of `/stat`, which is where a thing you cannot earn
 belongs. It is exempt from `MAX_CUSTOM_BADGES`, so a chat that had already filled its badge
 budget still plants its tree with something to show for it.
 
@@ -1399,13 +1463,15 @@ Administrator commands, none of them advertised in the menu:
 | `/badgeadmin [-] @user` | DM | delegate custom-badge rights |
 | `/badge` | DM | create, award and remove custom badges |
 | `/weekwinner`, `/deletepokras` | DM | weekly winner badge; remove a figurine credit |
+| `/работы [@user]`, `/works [@user]` | chat or DM | every `#япокрасил` work, numbered like `/stat` |
 
 ### Menu button and the fallback menu
 
 The bot publishes its command list to Telegram at startup (`setMyCommands`), so the
 client shows a tappable ☰ **Menu** next to the input field and nobody has to know a
-command exists. `/arena` is first in both scopes. DMs then get `/cabinet /stat /top /shop
-/tree /vote /pet`; groups then get `/stat /top /shop /tree /vote /pet /duel`. Wallet actions
+command exists. `/arena` is first in both scopes. DMs then get `/cabinet /stat /works /top
+/shop /tree /vote /pet`; groups then get `/stat /works /top /shop /tree /vote /pet /duel`.
+`/works` is the menu spelling of `/работы`, for the same reason as `/plant`. Wallet actions
 belong in the DM where a balance isn't public,
 and `/cabinet` is absent from the group menu on purpose — it only works in a DM, so a
 group button for it would just answer "напиши мне в личку".
@@ -1465,10 +1531,12 @@ coins — open a force-reply prompt and only debit once the reply arrives.
 - 📊 **Статистика** — the exact `/stat` card the group sees, so the cabinet never becomes
   a second, subtly different source of truth
 - 🏪 **Магазин** — one button per item, with the same ✅/🔒/⏳ marks
-- 🎨 **Мои работы** — showcase links plus up to 30 `#япокрасил` works, one per line.
+- 🎨 **Мои работы** — showcase links plus **every** `#япокрасил` work, one per line, 30 to
+  a page with ⬅️ Новее / Старее ➡️ buttons (the page rides in the button, so it survives a
+  restart like everything else here).
   ✏️ Переименовать renames one by position (`3 Дредноут`, up to 32 chars; a bare number
   clears it). 🗑 Удалить removes one of your own, behind a confirmation — it writes a
-  permanent tombstone, costs 200 XP and a figurine, and can drop a level or a badge with
+  permanent tombstone, costs 200 XP and a figurine, and can drop a level or painter rank with
   it, so it is never a single tap. Both the name and the confirm button carry the work's
   **message_id**, not its position: deleting compacts the numbering, so a position could
   point at a different work by the time the second tap arrives. The confirm handler also
@@ -1476,9 +1544,9 @@ coins — open a force-reply prompt and only debit once the reply arrives.
   somebody else's work.
 - 🏅 **Значки** — admin-granted badges in their own section **first** (split on
   `Badge.custom`, since those are the only ones somebody chose to give you), then earned
-  ones, then `📦 Открыто: N из M`. The denominator counts every tier individually (all
-  three painting medals, not just the highest shown), plus the 8 chat-level tiers, the 7
-  painting ranks, and however many custom badges the chat has defined.
+  ones, then how the two levelled badges are earned, then `📦 Открыто: N из M`: the 17
+  chat-level names, the 13 painting ranks, the two automatic badges (once each — their
+  levels never run out), and however many custom badges the chat has defined.
 - ✏️ **Титул** — the one force-reply purchase flow
 
 Each button carries its owner's user id inside its `callback_data`, so a forwarded menu is
@@ -1515,8 +1583,8 @@ follows.
 Member-to-member transfers were removed too. **That took the economy's only always-on
 sink with it**: transfers used to burn 10% of every gift, and now the sole drain is a
 400-coin title every 30 days against ~1,000 coins a month for an active member. Balances
-will grow. `received` is still read by `balance()` so any ledger written while transfers
-existed keeps computing the same number; nothing can add to it any more.
+will grow. `received` is still read by `balance()`; it is now where the arena puts the
+share it takes from a duel's loser, and it is money only — reputation no longer reads it.
 
 If delivery of a purchase fails the coins are refunded, so a debit and its effect are
 never left half-applied.
@@ -1564,8 +1632,14 @@ linked, since both describe a current state that a later post supersedes — the
 history is still stored, so that display choice can be changed later without a re-scan.
 Neither tag awards XP or a badge, and neither is covered by `/deletepokras` (that command
 remains specific to `#япокрасил` figurine credit).
-The name, progression, and activity sections are separated by blank lines. The last
-activity timestamp is intentionally omitted, and badges are rendered two per row.
+Both links ride on the figurine line, named for what they are (`🛠️ Рабочее место`,
+`💎 Моя лучшая`).
+
+`/stat` is deliberately **compact** — it is posted into a busy group, where a reply that
+fills the screen pushes the conversation away. One line per fact, related facts sharing a
+line (XP and coins; active days and streak; messages and favourite hour), each badge group
+on one line, and only the **10 newest works** (`STAT_WORKS_SHOWN`). With more than ten, a
+last line points at the rest: `📂 Все 34: /работы @user`.
 
 A new **painting rank** is announced once:
 
@@ -1573,65 +1647,54 @@ A new **painting rank** is announced once:
 @user получил новое звание «⚪ Ученик грунта»! 🎉🎊🥳
 ```
 
-Chat levels are tracked but deliberately **not** announced: on the seasonal curve they
-come round again every quarter for the same handful of people, which turns the chat into
-a promotion feed, and the level is always visible in `/stat` and the cabinet. The
-watermark is still maintained, so restoring the announcement is two lines and needs no
-migration.
+Chat levels are tracked but deliberately **not** announced: they are frequent, they come
+from the same handful of people, and the level is always visible in `/stat` and the
+cabinet. The watermark is still maintained, so restoring the announcement is two lines and
+needs no migration.
 
 The last observed level is persisted per chat, so a promotion is announced only once
 across `/stat` calls and process restarts. Existing users are silently baselined when
 this feature is first deployed; only later promotions generate announcements. Level
 checks run during `/stat` and the daily stats rollover.
 
-Automatic badges are derived from production counters and hashtag activity. Only the
-highest earned painting medal is shown:
+There are exactly **two automatic badges**, each with levels that never run out:
 
-- 🎨 Я покрасил 1 — 1 painted figurine
-- 🥉 Я покрасил 2 — 5
-- 🥈 Я покрасил 3 — 10
-- 🥇 Я покрасил 4 — 25
-- 💎 Я покрасил 5 — 50
+- 📅 **Завсегдатай N** — a level for every **30 active days** (days with at least one message)
+- 💬 **Собеседник N** — a level for every **1,000 messages**
 
-  Numbered **ascending** (1 = first work, 5 = fifty), unlike the streak and night-shift
-  families where I is still the best — with five steps, "IV" gives no hint whether it
-  beats "II".
-- 🦄 Я не пидор — post `#янепидор`
-- 🎪 Участник Недельного конкурса ×N — post `#итогинедели`; several posts by the
-  same person in one Monday–Sunday ISO week count once
-- 💯 Сотня — 100 messages
-- 📣 Голос чата — 1,000 messages
-- 🖼️ Галерея — 25 photo/video messages
-- 📅 Завсегдатай — 30 active days
-- 🔥 Не остановить 1 / 2 / 3 — a longest historical streak of 7 / 14 / 30 days
-- 🦉 Ночная смена 1 / 2 / 3 — 50 / 250 / 1,000 messages between 00:00 and 05:59
+There used to be a dozen (five painting steps, message steps, streaks, night shifts,
+gambling, a gallery, `#янепидор`, weekly-contest participation). After a few months nearly
+every regular held most of them, so the block took half of `/stat` while telling nobody
+anything — and the painting steps repeated the painter rank two lines above. Day files
+still record every counter those badges read, so bringing one back is a display change,
+not a re-scan.
 
-  All tier families now count **upward**: 1 is the easiest step, the highest number
-  the hardest.
-
-Painting medals, message-count badges, streak badges, and night-shift badges are upgrade
-families: `/stat` displays only the highest unlocked badge in each family. For example,
-`📣 Голос чата` replaces `💯 Сотня` at 1,000 messages instead of appearing beside it.
-
-Custom badges are rendered **first**, in their own `✨ Уникальные значки` block, above the
-automatic ones — they are the only badges somebody chose to give this person, and mixed
-into a dozen automatic counters that is exactly what gets lost. The split is on
+Custom badges are rendered **first**, on their own `✨ Уникальные значки` line, above the
+automatic ones — they are the only badges somebody chose to give this person. The split is on
 `Badge.custom`, so a weekly-contest win (assigned by an administrator, but *won*) stays
 with the earned ones.
 
 The last line of `/stat` is a `t.me/<bot>?start=cabinet` deep link — one tap opens the
 member's cabinet instead of dropping them into an empty DM where they would still have to
 know a command. `/start` (with or without the payload) opens the cabinet too. The link is
-omitted entirely when no bot username is available, which is exactly the case where
-`listener.py` answers `/stat` itself and there is no cabinet to link to.
+omitted entirely when no bot username is available.
 
-Badges appear near the end of `/stat`, immediately before the complete tracked work
-history. Every work is a compact clickable entry (newest first) with no display cap, showing
-`номер. Название` once it has been named in the cabinet and a bare number until then. The
-number always stays visible even for a named work: `/deletepokras` takes the number shown
-here as its argument, so replacing it with a name would leave an administrator nothing to
-point at. No new message schema or history fetch is needed for
-automatic badges.
+Badges appear near the end of `/stat`, immediately before the newest works. Every work is a
+compact clickable entry (newest first), showing `номер. Название` once it has been named in
+the cabinet and a bare number until then. The number always stays visible even for a named
+work: `/deletepokras` takes it as its argument, so replacing it with a name would leave an
+administrator nothing to point at.
+
+**`/работы [@user]`** (or `/works`, the spelling the menu can hold) lists **every** tracked
+work in the same compact form and numbering, split across as many messages as Telegram's
+4,096-character limit needs, and self-deletes like `/stat`. Nothing is ever trimmed from the
+history — `/stat` just shows less of it. In a DM the links still point into the group (a
+private chat has no `t.me/c/` address; building them from the DM used to leave `/stat` in a
+DM with no works at all).
+
+A post recorded live without a message id cannot be linked, so it takes **no number
+anywhere** (`stats.numbered_figurine_posts`) — `/stat`, `/работы`, the cabinet and
+`/deletepokras` all skip it the same way, so one number always names one work.
 
 Custom badges are created and awarded with `/badge` in a private chat with the bot.
 
@@ -1740,8 +1803,8 @@ stale work link and figurine credit from the bot's private chat:
 /deletepokras @username 1
 ```
 
-The final argument is the clickable work number currently shown in `/stat`; number 1 is
-the newest work. Removing it also removes one figurine and its 200 XP, then the remaining
+The final argument is the clickable work number shown in `/stat` or `/работы`; number 1
+is the newest work. Removing it also removes one figurine and its 200 XP, then the remaining
 work numbers are compacted. A persistent tombstone prevents a stale transcript cache
 from restoring the deleted submission. `/deletepokras` is silently ignored in groups.
 

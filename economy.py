@@ -44,9 +44,10 @@ AUDIT_WINDOW_HOURS = (24, 72, 168)
 FLOW_WINDOW_DAYS = (7, 30, 90)
 FIGURINE_COIN_REWARD = 500
 
-# Member-to-member transfers were removed. `received` is still read by balance() and
-# reputation_for() so that any ledger written while they existed keeps computing exactly
-# the same numbers; nothing can add to it any more.
+# Member-to-member transfers were removed (they existed for one afternoon in July 2026).
+# `received` is still part of balance(), and since the arena started taking a share of a
+# duel loser's coins it is where the winner's share lands (settle_arena_reward). It is
+# money and nothing else: reputation stopped reading it once it meant "won in a fight".
 
 # A 30-day rented title, priced so it stays a recurring decision rather than a one-off
 # purchase. See the price note on SHOP_ITEMS.
@@ -257,6 +258,31 @@ def grant_once(entry: str, user_id, amount: int, reason: str) -> bool:
     _append_log(data, user_id, int(amount), f"grant:{reason}")
     _save(entry, data)
     return True
+
+
+def retire_xp_grant(entry: str, user_id, key: str) -> int:
+    """Turn one XP grant that was really a payment into the coins it stood for.
+
+    XP is the chat's own score -- what /top, /stat and the chat level read -- and coins
+    are derived from it, so money handed out as XP used to put the recipient at the top
+    of the chat's leaderboard. This takes the XP out and pays the same value as `bonus`
+    coins, so the wallet is unchanged and the leaderboard is honest again.
+
+    Coins are paid first and keyed on the grant itself, the same key admin_xp.py has
+    always used, so a crash between the two steps, a second run, or a grant that was
+    already compensated once by hand can never pay twice. Only the part of the grant
+    still in effect is paid for (see stats.xp_grant_in_effect): one an administrator
+    already cancelled with a negative adjustment took its coins away with it.
+
+    Returns the coins paid; 0 once the grant is gone.
+    """
+    granted, live = stats.xp_grant_in_effect(entry, user_id, key)
+    if not granted:
+        return 0
+    coins = live // stats.XP_PER_COIN
+    paid = grant_once(entry, user_id, coins, f"xp_grant_revert:{user_id}:{granted}") if coins else False
+    stats.retire_xp_grant(entry, user_id, key)
+    return coins if paid else 0
 
 
 def grant(entry: str, user_id, amount: int, reason: str) -> None:
@@ -715,19 +741,18 @@ def streak_freeze_lookup(entry: str):
 def reputation_for(entry: str, user_id, user=None) -> int:
     """This member's reputation (see stats.reputation_score).
 
-    Lives here rather than in stats because the coins-received half is ledger data, and
-    stats must not import this module (the dependency runs the other way).
+    It reads nothing from this ledger any more -- the coins-received component had come
+    to count arena winnings (see the reputation note in stats.py) -- but stays here so
+    every caller keeps one entry point.
 
     `user` is the UserStats the earned-badge levels are read off. It is optional because
     the ledger knows a user_id but has no way to load stats for it; callers that already
     hold a UserStats (every /stat path) pass it, and one that does not scores the
     peer-granted half alone rather than failing."""
-    record = _load(entry)["users"].get(str(user_id)) or {}
     return stats.reputation_score(
         stats.weekly_wins_for_user(entry, user_id),
         len(stats.custom_badges_for_user(entry, user_id)),
-        record.get("received", 0),
-        stats.medal_levels(user, casino_winnings_for_user(entry, user_id)) if user is not None else 0,
+        stats.medal_levels(user) if user is not None else 0,
     )
 
 
@@ -1252,7 +1277,6 @@ def stat_extras(entry: str, user_id, xp: int, user=None) -> dict:
             "coins": balance(entry, user_id, xp),
             "reputation": reputation_for(entry, user_id, user),
             "custom_title": active_title(entry, user_id),
-            "casino_winnings": casino_winnings_for_user(entry, user_id),
         }
     except (OSError, ValueError):
         return {}

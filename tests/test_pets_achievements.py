@@ -136,6 +136,22 @@ class LiveAchievementTests(unittest.TestCase):
         self.assertTrue(pets.buy_cage(CHAT, USER, RICH_XP)[0])
         self.assertTrue(pets.tame(CHAT, USER, RICH_XP, "Пеструшка", "f", "Хозяин")[0])
 
+    def test_a_showcase_post_counts_instead_of_breaking_the_profile(self):
+        """UserStats.best_work_posts is a list of [ts, message_id] refs. It was passed to
+        int(), which raised for anybody who had ever posted #моялучшая -- the very
+        members the two showcase achievements exist for."""
+        import stats
+
+        row = stats.UserStats(
+            user_id=str(USER), messages=40, active_days=3,
+            best_work_posts=[["2026-07-02T12:00:00", 12], ["2026-07-01T12:00:00", 11]],
+        )
+        with patch("stats.aggregate_all_time", return_value={str(USER): row}):
+            chat = pets._achievement_chat_stats(CHAT, USER)
+
+        self.assertEqual(chat["best_work_posts"], 2)
+        self.assertEqual(chat["messages"], 40)
+
     def _ticket_payers(self):
         return [row for row in pets.ACHIEVEMENTS.catalogue() if row.farm_tickets]
 

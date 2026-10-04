@@ -22,10 +22,9 @@ class GamificationTests(unittest.TestCase):
                 self.assertFalse(stats.grant_xp_once(
                     "chat", "42", 10_000_000, "admin-grant",
                 ))
-                user = stats.aggregate_all_time("chat", season_start=date(2026, 8, 1))["42"]
+                user = stats.aggregate_all_time("chat")["42"]
 
         self.assertEqual(user.xp(5.0), 10_000_000)
-        self.assertEqual(user.season_xp(5.0), 10_000_000)
         self.assertEqual(stats.coins_for_xp(user.xp(5.0)), 2_000_000)
         self.assertEqual(user.username, "london_leads")
 
@@ -45,112 +44,69 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(stats.coins_for_xp(stats.XP_PER_COIN * 101), 101)
         self.assertEqual(stats.coins_for_xp(stats.XP_PER_COIN - 1), 0)
 
-        self.assertEqual(stats.level_for_progress(2_500, 2)[0].label, "🩶 Серый новичок")
-        self.assertEqual(stats.level_for_progress(2_499, 3)[0].label, "🩶 Серый новичок")
-        self.assertEqual(stats.level_for_progress(2_500, 3)[0].label, "⚪ Ученик грунта")
-        self.assertEqual(stats.level_for_progress(5_000, 5)[0].label, "🖌️ Подмастерье кисти")
-        self.assertEqual(stats.level_for_progress(10_000, 10)[0].label, "💨 Укротитель аэрографа")
-        self.assertEqual(stats.level_for_progress(20_000, 20)[0].label, "💧 Повелитель проливок")
-        self.assertEqual(stats.level_for_progress(35_000, 35)[0].label, "🏛️ Мастер витрины")
-        final_level, next_level = stats.level_for_progress(50_000, 50)
-        self.assertEqual(final_level.label, "👑 Легенда покраса")
-        self.assertIsNone(next_level)
+    def test_painter_rank_moves_on_figurines_alone(self):
+        for figurines, label in (
+            (0, "🩶 Серый новичок"),
+            (2, "🩶 Серый новичок"),
+            (3, "⚪ Ученик грунта"),
+            (5, "🖌️ Подмастерье кисти"),
+            (10, "💨 Укротитель аэрографа"),
+            (20, "💧 Повелитель проливок"),
+            (35, "🏛️ Мастер витрины"),
+        ):
+            with self.subTest(figurines=figurines):
+                self.assertEqual(stats.painter_rank(figurines)[0].label, label)
+        legend, next_rank = stats.painter_rank(50)
+        self.assertEqual(legend.label, "👑 Легенда покраса")
+        self.assertEqual(next_rank.label, "✨ Магистр лессировок")
+        final_rank, no_more = stats.painter_rank(500)
+        self.assertEqual(final_rank.label, "♾️ Бессмертная кисть")
+        self.assertIsNone(no_more)
 
-    def test_automatic_badges_use_existing_counters(self):
+    def test_only_two_automatic_badges_exist(self):
+        """Everything else the old dozen read is still recorded, just no longer shown."""
         first_day = date(2026, 1, 1)
-        active_dates = {(first_day + timedelta(days=offset)).isoformat() for offset in range(7)}
         user = stats.UserStats(
             user_id="1",
-            figurines_painted=5,
+            figurines_painted=50,
             messages=1_000,
             media=25,
             replies=100,
             active_days=30,
-            active_day_dates=active_dates,
-            hours={str(hour): 10 for hour in range(6)},
+            active_day_dates={(first_day + timedelta(days=n)).isoformat() for n in range(30)},
+            hours={str(hour): 300 for hour in range(6)},
+            not_gay_hashtag_uses=1,
+            weekly_contest_weeks={"2026-W30"},
         )
 
         self.assertEqual(
-            {badge.badge_id for badge in stats.earned_badges(user)},
-            {
-                "painted_2",  # 5 figurines is now the second step, not the first
-                "chat_voice",
-                "gallery",
-                "regular",
-                "streak_1",
-                "night_shift_1",
-            },
+            [(badge.badge_id, badge.label) for badge in stats.earned_badges(user)],
+            [("active_days", "📅 Завсегдатай 1"), ("messages", "💬 Собеседник 1")],
         )
 
-    def test_only_highest_painting_medal_is_shown(self):
-        # Five steps, numbered ascending: 1 work -> "1", fifty -> "5". Exactly one shows.
-        expected = {
-            0: [],
-            1: [("🎨", "Я покрасил 1")],
-            4: [("🎨", "Я покрасил 1")],
-            5: [("🥉", "Я покрасил 2")],
-            10: [("🥈", "Я покрасил 3")],
-            24: [("🥈", "Я покрасил 3")],
-            25: [("🥇", "Я покрасил 4")],
-            50: [("💎", "Я покрасил 5")],
-            999: [("💎", "Я покрасил 5")],
-        }
-        for figurines, labels in expected.items():
-            with self.subTest(figurines=figurines):
-                badges = stats.earned_badges(
-                    stats.UserStats(user_id="1", figurines_painted=figurines)
-                )
-                self.assertEqual([(b.emoji, b.name) for b in badges], labels)
-
-    def test_higher_message_badge_replaces_lower_tier(self):
-        none = stats.earned_badges(stats.UserStats(user_id="1", messages=99))
-        hundred = stats.earned_badges(stats.UserStats(user_id="1", messages=100))
-        still_hundred = stats.earned_badges(stats.UserStats(user_id="1", messages=999))
-        voice = stats.earned_badges(stats.UserStats(user_id="1", messages=1_000))
-
-        self.assertEqual(none, [])
-        self.assertEqual(
-            [(badge.badge_id, badge.name) for badge in hundred],
-            [("hundred_messages", "Сотня")],
-        )
-        self.assertEqual(
-            [(badge.badge_id, badge.name) for badge in still_hundred],
-            [("hundred_messages", "Сотня")],
-        )
-        self.assertEqual(
-            [(badge.badge_id, badge.name) for badge in voice],
-            [("chat_voice", "Голос чата")],
-        )
-
-    def test_streak_and_night_badges_upgrade_without_stacking(self):
-        def user_for(streak_days, night_messages):
-            first_day = date(2026, 1, 1)
-            return stats.UserStats(
-                user_id="1",
-                active_day_dates={
-                    (first_day + timedelta(days=offset)).isoformat()
-                    for offset in range(streak_days)
-                },
-                hours={"0": night_messages},
-            )
-
-        expected = (
-            (7, 50, "streak_1", "Не остановить 1", "night_shift_1", "Ночная смена 1"),
-            (14, 250, "streak_2", "Не остановить 2", "night_shift_2", "Ночная смена 2"),
-            (30, 1_000, "streak_3", "Не остановить 3", "night_shift_3", "Ночная смена 3"),
-        )
-        for streak, night, streak_id, streak_name, night_id, night_name in expected:
-            with self.subTest(streak=streak, night=night):
-                badges = stats.earned_badges(user_for(streak, night))
+    def test_active_days_badge_levels_every_thirty_days(self):
+        for days, expected in ((0, None), (29, None), (30, 1), (59, 1), (60, 2), (365, 12)):
+            with self.subTest(days=days):
+                badges = stats.earned_badges(stats.UserStats(user_id="1", active_days=days))
                 self.assertEqual(
-                    [(badge.badge_id, badge.name) for badge in badges],
-                    [(streak_id, streak_name), (night_id, night_name)],
+                    [badge.name for badge in badges],
+                    [] if expected is None else [f"Завсегдатай {expected}"],
                 )
 
-        almost = stats.earned_badges(user_for(6, 49))
-        self.assertEqual(almost, [])
+    def test_messages_badge_levels_every_thousand_messages(self):
+        for messages, expected in ((999, None), (1_000, 1), (1_999, 1), (12_345, 12)):
+            with self.subTest(messages=messages):
+                badges = stats.earned_badges(stats.UserStats(user_id="1", messages=messages))
+                self.assertEqual(
+                    [badge.name for badge in badges],
+                    [] if expected is None else [f"Собеседник {expected}"],
+                )
+        twelve = stats.earned_badges(stats.UserStats(user_id="1", messages=12_345))[0]
+        self.assertIn("12.000+ сообщений", twelve.description)
 
-    def test_hashtag_badges_and_weekly_participation_are_derived_from_messages(self):
+    def test_hashtag_counters_are_still_derived_from_messages(self):
+        """No badge reads these any more, but day files keep recording them, so bringing
+        one back is a display change rather than a re-scan of the chat."""
         def message(moment, text, message_id):
             return SimpleNamespace(
                 sender_id=20,
@@ -179,9 +135,6 @@ class GamificationTests(unittest.TestCase):
 
         self.assertEqual(user.not_gay_hashtag_uses, 1)
         self.assertEqual(user.weekly_contest_weeks, {"2026-W30", "2026-W31"})
-        labels = [badge.label for badge in stats.earned_badges(user)]
-        self.assertIn("🦄 Я не пидор", labels)
-        self.assertIn("🎪 Участник Недельного конкурса ×2", labels)
 
     def test_showcase_hashtags_are_tracked_as_linkable_posts(self):
         def message(moment, text, message_id):
@@ -282,10 +235,13 @@ class GamificationTests(unittest.TestCase):
             workplace_link="https://t.me/example/8",
         )
 
-        self.assertIn('🛠️ Рабочее место: <a href="https://t.me/example/8">ссылка</a>', text)
-        self.assertIn('💎 Моя лучшая: <a href="https://t.me/example/7">ссылка</a>', text)
-        self.assertLess(text.index("🛠️ Рабочее место"), text.index("💎 Моя лучшая"))
-        self.assertLess(text.index("💎 Моя лучшая"), text.index("Фигурок:"))
+        # Both ride on the figurine line as links named for what they are.
+        self.assertIn(
+            "🖼️ Фигурок: 3 (#япокрасил)"
+            ' · <a href="https://t.me/example/8">🛠️ Рабочее место</a>'
+            ' · <a href="https://t.me/example/7">💎 Моя лучшая</a>',
+            text,
+        )
 
         without = stats.format_stat(user, rank=1, total=1, xp=100, streak=0)
         self.assertNotIn("Рабочее место", without)
@@ -335,19 +291,19 @@ class GamificationTests(unittest.TestCase):
             custom_badges=[custom],
         )
 
-        # XP and coins share one line now. The coin figure is derived from the rate, not
+        # XP and coins share one line. The coin figure is derived from the rate, not
         # written out, so re-tuning XP_PER_COIN does not have to be re-typed here.
-        self.assertIn(f"⭐️ XP: 1.234 🪙 Монеты: {stats.coins_for_xp(1_234)}", text)
-        # Chat level moves on XP alone; the painting rank is its own separate track.
+        self.assertIn(f"⭐️ XP: 1.234 · 🪙 Монеты: {stats.coins_for_xp(1_234)}", text)
+        # Chat level moves on all-time XP alone; the painting rank is its own track.
         self.assertIn("🧩 Уровень: 🗣️ Голос чата 11", text)
         self.assertIn("🎨 Звание: 🩶 Серый новичок", text)
         self.assertNotIn("До уровня", text)
-        # A hand-made badge goes in its own block, above the works list.
-        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🎨 Все работы"))
+        # A hand-made badge has its own line, above the works.
+        self.assertLess(text.index("✨ Уникальные значки:"), text.index("🎨 Работы"))
         self.assertIn("🏹 Лучник", text)
         self.assertIn('<a href="https://t.me/example/1">1</a>', text)
 
-    def test_stat_groups_sections_and_formats_badges_in_two_columns(self):
+    def test_stat_is_compact_and_badges_share_one_line(self):
         custom = [
             stats.Badge(f"custom-{number}", emoji, name, custom=True)
             for number, (emoji, name) in enumerate(
@@ -355,14 +311,15 @@ class GamificationTests(unittest.TestCase):
                     ("🏹", "Лучник"),
                     ("🎯", "Меткий глаз"),
                     ("🛡️", "Защитник"),
-                    ("🧙", "Волшебник"),
-                    ("🐉", "Дракон"),
                 ],
                 start=1,
             )
         ]
         text = stats.format_stat(
-            stats.UserStats(user_id="1", display_name="Tester"),
+            stats.UserStats(
+                user_id="1", display_name="Tester", messages=2_000, active_days=31,
+                hours={"21": 5},
+            ),
             rank=1,
             total=1,
             xp=0,
@@ -373,15 +330,13 @@ class GamificationTests(unittest.TestCase):
         # The name is the header; there is no separate "Имя:" line.
         self.assertIn("📊 Статистика Tester:\n\n⭐️ XP:", text)
         self.assertNotIn("Имя:", text)
-        self.assertIn("Пока тихо)\n\nФигурок:", text)
-        self.assertNotIn("Последняя активность:", text)
-        self.assertIn(
-            "✨ Уникальные значки:\n"
-            "🏹 Лучник  │  🎯 Меткий глаз\n"
-            "🛡️ Защитник  │  🧙 Волшебник\n"
-            "🐉 Дракон",
-            text,
-        )
+        self.assertIn("Пока тихо)\n\n🖼️ Фигурок:", text)
+        self.assertIn("💬 Сообщений: 2.000 (64.5 в день) · 🕘 21:00–22:00", text)
+        self.assertNotIn("Любимое время", text)
+        self.assertIn("✨ Уникальные значки: 🏹 Лучник · 🎯 Меткий глаз · 🛡️ Защитник\n", text)
+        self.assertIn("🏅 Значки: 📅 Завсегдатай 1 · 💬 Собеседник 2", text)
+        # One line per fact: a stat card for a member with everything is still short.
+        self.assertLessEqual(len(text.splitlines()), 16)
 
     def test_stat_shows_work_names_but_keeps_the_numbers(self):
         user = stats.UserStats(user_id="1", display_name="T", figurines_painted=3)
@@ -463,11 +418,10 @@ class GamificationTests(unittest.TestCase):
         )
         self.assertIn("t.me/Trash_Modelist?start=cabinet", linked)
         # Truly last, below even the works list.
-        self.assertGreater(linked.index("Открыть личный кабинет"), linked.index("🎨 Все работы"))
+        self.assertGreater(linked.index("Открыть личный кабинет"), linked.index("🎨 Работы"))
         self.assertTrue(linked.rstrip().endswith("</a>"))
 
-        # listener.py's own /stat only runs when no bot is configured, and then there is
-        # no cabinet to link to at all.
+        # Without a bot to link to there is no cabinet line at all.
         self.assertNotIn("Открыть личный кабинет", stats.format_stat(
             user, rank=1, total=1, xp=0, streak=0
         ))
@@ -574,14 +528,14 @@ class GamificationTests(unittest.TestCase):
         )
         text = stats.format_stat(user, rank=1, total=1, xp=12_480, streak=11)
 
-        self.assertIn("Фигурок: 12 (#япокрасил)", text)
-        self.assertIn("Активных дней: 96 (🔥 Серия: 11 дней)", text)
+        self.assertIn("🖼️ Фигурок: 12 (#япокрасил)", text)
+        self.assertIn("📅 Активных дней: 96 · 🔥 Серия: 11 дней", text)
         self.assertIn("💬 Сообщений: 1.842 (19.2 в день)", text)
         self.assertNotIn("Среднее сообщений в день:", text)
         self.assertNotIn("+200 XP за фигурку", text)
 
         without_streak = stats.format_stat(user, rank=1, total=1, xp=12_480, streak=0)
-        self.assertIn("Активных дней: 96\n", without_streak)
+        self.assertIn("📅 Активных дней: 96\n", without_streak)
         self.assertNotIn("Серия:", without_streak)
 
     def test_level_announcements_are_persistent_and_emit_once(self):
@@ -877,88 +831,325 @@ class GamificationTests(unittest.TestCase):
         self.assertEqual(saved["users"]["20"]["weekly_contest_weeks"], ["2026-W30"])
 
 
+def _painter_with_works(count, **kwargs):
+    """A member with `count` works, message ids 1000+, newest first."""
+    posts = [
+        [f"2026-07-{1 + (n % 28):02d}T12:00:{n % 60:02d}", 1000 + n]
+        for n in range(count, 0, -1)
+    ]
+    defaults = dict(
+        user_id="20", username="painter", display_name="Painter",
+        figurines_painted=count, recent_figurine_posts=posts,
+    )
+    defaults.update(kwargs)
+    return stats.UserStats(**defaults)
+
+
+class WorksListTests(unittest.TestCase):
+    """/stat shows the newest STAT_WORKS_SHOWN works; /работы lists every one."""
+
+    def test_stat_links_only_the_newest_ten_and_points_to_the_rest(self):
+        user = _painter_with_works(25)
+        links = stats.figurine_message_links("example", -1001, user)
+        text = stats.format_stat(user, rank=1, total=1, xp=0, streak=0, figurine_links=links)
+
+        self.assertIn("🎨 Последние работы: ", text)
+        for number, message_id in zip(range(1, 11), range(1025, 1015, -1)):
+            self.assertIn(f'<a href="https://t.me/example/{message_id}">{number}</a>', text)
+        self.assertNotIn(">11</a>", text)
+        self.assertIn("📂 Все 25: /работы @painter", text)
+
+    def test_ten_or_fewer_works_need_no_pointer(self):
+        user = _painter_with_works(10)
+        links = stats.figurine_message_links("example", -1001, user)
+        text = stats.format_stat(user, rank=1, total=1, xp=0, streak=0, figurine_links=links)
+
+        self.assertIn("🎨 Работы: ", text)
+        self.assertIn(">10</a>", text)
+        self.assertNotIn("/работы", text)
+
+    def test_the_pointer_names_somebody_without_a_username_by_display_name(self):
+        user = _painter_with_works(11, username=None, display_name="Саша <К>")
+        links = stats.figurine_message_links("example", -1001, user)
+        text = stats.format_stat(user, rank=1, total=1, xp=0, streak=0, figurine_links=links)
+        self.assertIn("/работы Саша &lt;К&gt;", text)
+
+    def test_works_lists_every_work_with_names_numbered_like_stat(self):
+        user = _painter_with_works(25)
+        links = stats.figurine_message_links("example", -1001, user)
+        names = [None] * 25
+        names[11] = "Дредноут"
+
+        messages = stats.format_works(user, links, names)
+
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(messages[0].startswith("🎨 Работы Painter — 25 (#япокрасил)\n\n"))
+        for number in range(1, 26):
+            self.assertIn(f">{number}" if number != 12 else ">12. Дредноут</a>", messages[0])
+        self.assertIn('<a href="https://t.me/example/1001">25</a>', messages[0])
+
+    def test_a_long_history_is_split_under_telegrams_limit(self):
+        user = _painter_with_works(400)
+        links = stats.figurine_message_links("example", -1001, user)
+        names = ["Космодесантник Ультрамаринов " + str(n) for n in range(400)]
+
+        messages = stats.format_works(user, links, names)
+
+        self.assertGreater(len(messages), 1)
+        visible = [
+            len(__import__("re").sub(r"<[^>]+>", "", message)) for message in messages
+        ]
+        self.assertTrue(all(length <= 4096 for length in visible), visible)
+        # The header once, and every work exactly once across the parts.
+        self.assertEqual(sum(message.count("🎨 Работы") for message in messages), 1)
+        self.assertEqual(sum(message.count("<a href=") for message in messages), 400)
+
+    def test_works_escapes_names_and_handles_an_empty_history(self):
+        user = _painter_with_works(1, display_name="<b>")
+        links = stats.figurine_message_links("example", -1001, user)
+        text = stats.format_works(user, links, ["<i>x</i>"])[0]
+        self.assertNotIn("<b>", text.split("\n")[0])
+        self.assertIn("&lt;i&gt;x&lt;/i&gt;", text)
+
+        empty = stats.format_works(stats.UserStats(user_id="1", display_name="T"), [])
+        self.assertEqual(len(empty), 1)
+        self.assertIn("Пока ни одной", empty[0])
+
+    def test_works_command_spellings(self):
+        self.assertEqual(stats.parse_works_command("/работы"), "")
+        self.assertEqual(stats.parse_works_command("/РАБОТЫ @painter"), "@painter")
+        self.assertEqual(stats.parse_works_command("/works Саша Иванов"), "Саша Иванов")
+        self.assertIsNone(stats.parse_works_command("/worksheet"))
+        self.assertIsNone(stats.parse_works_command("мои /работы"))
+        self.assertIsNone(stats.parse_works_command("/stat"))
+        # Telegram's own "/works@bot" form is stripped before this is asked.
+        self.assertEqual(
+            stats.parse_works_command(stats.strip_command_bot_mention("/works@Trash_Modelist", "Trash_Modelist")),
+            "",
+        )
+
+    def test_a_post_without_a_message_id_takes_no_number_anywhere(self):
+        """A live-recorded post with no id cannot be linked. Every numbered screen skips
+        it the same way, or /stat's "2" and the cabinet's "2" become different works."""
+        user = stats.UserStats(
+            user_id="1",
+            recent_figurine_posts=[["t4", 104], ["t3", None], ["t2", 102], ["t1", 101]],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                stats.set_work_name("chat", "1", 102, "Дредноут")
+                names = stats.work_name_list("chat", user)
+
+        links = stats.figurine_message_links("example", -1001, user)
+        self.assertEqual(links[1], "https://t.me/example/102")
+        self.assertEqual(names, [None, "Дредноут", None])
+        import cabinet
+        self.assertEqual(cabinet.message_id_for_position(user, 2), 102)
+
+
+class WorksCommandDispatchTests(unittest.TestCase):
+    """/работы reaches its handler from a real update, in the group and in a DM."""
+
+    class _Api:
+        def __init__(self):
+            self.sent = []
+            self.next_id = 500
+
+        async def send_message(self, chat_id, text, **kwargs):
+            self.next_id += 1
+            self.sent.append((chat_id, text, kwargs))
+            return {"message_id": self.next_id}
+
+        async def delete_message(self, chat_id, message_id):
+            pass
+
+        async def set_message_reaction(self, *args, **kwargs):
+            pass
+
+    def _dispatch(self, chat, text, resolved_user, known_chat_ids=None):
+        import asyncio
+
+        api = self._Api()
+        resolve = AsyncMock(return_value=(resolved_user, 1, 1, 0, 0))
+        cfg = SimpleNamespace(
+            listener_allowed_chats=["examplechat"], stats_enabled=True, stats_top_limit=10,
+        )
+
+        async def go():
+            background = set()
+            with patch("stats.resolve_stat_target", resolve), \
+                    patch("stats.work_name_list", return_value=[]):
+                await bot_listener._dispatch_update(
+                    {"message": {
+                        "message_id": 7, "chat": chat, "text": text,
+                        "from": {"id": 20, "username": "painter", "first_name": "Painter"},
+                    }},
+                    api, None, cfg, timezone.utc, "Trash_Modelist", 1, set(),
+                    asyncio.Queue(), background, "examplechat",
+                    known_chat_ids if known_chat_ids is not None else {}, {}, {}, {},
+                    log=lambda *_: None,
+                )
+                for task in list(background):
+                    task.cancel()
+
+        asyncio.run(go())
+        return api, resolve
+
+    def test_in_the_group_it_lists_every_work_with_links_into_the_group(self):
+        group = {"id": -1001, "type": "supergroup", "username": "examplechat"}
+        api, resolve = self._dispatch(group, "/работы", _painter_with_works(12))
+
+        self.assertEqual(len(api.sent), 1)
+        chat_id, text, kwargs = api.sent[0]
+        self.assertEqual(chat_id, -1001)
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        self.assertIn("🎨 Работы Painter — 12", text)
+        self.assertIn('<a href="https://t.me/examplechat/1001">12</a>', text)
+        # Asked about themselves, so the lookup goes by their Telegram id.
+        self.assertEqual(resolve.await_args.kwargs.get("requester_id"), 20)
+        self.assertEqual(resolve.await_args.args[3], "")
+
+    def test_a_bare_stat_is_compact_and_looks_its_requester_up_by_id(self):
+        group = {"id": -1001, "type": "supergroup", "username": "examplechat"}
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("stats._stats_dir", return_value=Path(temporary)):
+                api, resolve = self._dispatch(
+                    group, "/stat", _painter_with_works(14, messages=1_200, active_days=33),
+                )
+
+        _, text, kwargs = api.sent[0]
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        self.assertEqual(resolve.await_args.kwargs.get("requester_id"), 20)
+        self.assertIn("🏅 Значки: 📅 Завсегдатай 1 · 💬 Собеседник 1", text)
+        self.assertIn("🎨 Последние работы: ", text)
+        self.assertIn("📂 Все 14: /работы @painter", text)
+        self.assertNotIn(">11</a>", text)
+
+    def test_works_at_bot_with_a_name_asks_about_that_member(self):
+        group = {"id": -1001, "type": "supergroup", "username": "examplechat"}
+        _, resolve = self._dispatch(
+            group, "/works@Trash_Modelist @someone", _painter_with_works(1)
+        )
+        self.assertEqual(resolve.await_args.args[3], "@someone")
+
+    def test_in_a_dm_the_links_still_point_at_the_group(self):
+        """The DM has no t.me/c/ address of its own; links built from it came out empty,
+        so /stat in a DM used to show no works at all."""
+        dm = {"id": 20, "type": "private"}
+        with patch("bot_listener._cabinet_chat_ref", new=AsyncMock(return_value=(-1001234, None))):
+            api, _ = self._dispatch(dm, "/работы", _painter_with_works(2))
+
+        _, text, _ = api.sent[0]
+        self.assertIn('<a href="https://t.me/c/1234/1002">1</a>', text)
+
+
+class StatTargetTests(unittest.TestCase):
+    """Whose stats a bare /stat shows."""
+
+    def test_an_exact_display_name_beats_a_longer_one_that_contains_it(self):
+        users = {
+            "1": stats.UserStats(user_id="1", display_name="Саша Иванов"),
+            "2": stats.UserStats(user_id="2", display_name="Саша"),
+        }
+        self.assertEqual(stats._find_user(users, "Саша").user_id, "2")
+        self.assertEqual(stats._find_user(users, "иванов").user_id, "1")
+
+    def test_the_requesters_own_id_wins_over_any_name(self):
+        users = {
+            "1": stats.UserStats(user_id="1", display_name="Саша Иванов", messages=50),
+            "2": stats.UserStats(user_id="2", display_name="Саша", messages=5),
+        }
+
+        async def go(requester_id):
+            with patch("stats.aggregate_all_time_live", new=AsyncMock(return_value=users)), \
+                    patch("stats.words_per_point", new=AsyncMock(return_value=5.0)):
+                return await stats.resolve_stat_target(
+                    None, "chat", "chat", "", None, "Саша Иванов", timezone.utc,
+                    log=lambda *_: None, requester_id=requester_id,
+                )
+
+        import asyncio
+        user, rank, total, xp, streak = asyncio.run(go(2))
+        self.assertEqual(user.user_id, "2")
+        self.assertEqual(total, 2)
+        # Without an id the name decides, as before.
+        user, *_ = asyncio.run(go(None))
+        self.assertEqual(user.user_id, "1")
+
+    def test_rank_ties_break_the_same_way_in_top_and_stat(self):
+        users = {
+            "9": stats.UserStats(user_id="9", display_name="Девять", messages=10),
+            "3": stats.UserStats(user_id="3", display_name="Три", messages=10),
+        }
+
+        async def go():
+            with patch("stats.aggregate_all_time_live", new=AsyncMock(return_value=users)), \
+                    patch("stats.words_per_point", new=AsyncMock(return_value=5.0)):
+                stat = await stats.resolve_stat_target(
+                    None, "chat", "chat", "Девять", None, "", timezone.utc,
+                    log=lambda *_: None,
+                )
+                top = await stats.format_top(None, "chat", "chat", "all", timezone.utc, 10,
+                                             log=lambda *_: None)
+            return stat, top
+
+        import asyncio
+        (_, rank, *_), top = asyncio.run(go())
+        self.assertEqual(rank, 2)
+        self.assertLess(top.index("Три"), top.index("Девять"))
+
+
 class MedalReputationTests(unittest.TestCase):
     """A point of reputation per earned-badge level (stats.medal_levels)."""
 
     def test_a_member_with_no_badges_scores_nothing(self):
         self.assertEqual(stats.medal_levels(stats.UserStats(user_id="1")), 0)
 
-    def test_a_tiered_badge_is_worth_its_level_not_one_point(self):
-        """The whole point of the rule: "Я покрасил 5" is five medals deep, so 5 rep."""
-        for figurines, expected in ((1, 1), (5, 2), (10, 3), (25, 4), (50, 5)):
-            with self.subTest(figurines=figurines):
-                user = stats.UserStats(user_id="1", figurines_painted=figurines)
+    def test_each_badge_level_is_worth_a_point(self):
+        for days, messages, expected in (
+            (29, 999, 0), (30, 0, 1), (0, 1_000, 1), (90, 2_999, 5), (61, 4_000, 6),
+        ):
+            with self.subTest(days=days, messages=messages):
+                user = stats.UserStats(user_id="1", active_days=days, messages=messages)
                 self.assertEqual(stats.medal_levels(user), expected)
 
-    def test_a_tier_short_of_the_threshold_does_not_count(self):
-        self.assertEqual(stats.medal_levels(stats.UserStats(user_id="1", figurines_painted=49)), 4)
-
-    def test_every_family_and_flat_badge_adds_up_to_the_ceiling(self):
-        """21 = painting 5 + messages 2 + streak 3 + night 3 + gambling 4 + four flat."""
-        user = stats.UserStats(
-            user_id="1",
-            figurines_painted=50,
-            messages=1_000,
-            media=25,
-            active_days=30,
-            active_day_dates={
-                (date(2026, 6, 1) + timedelta(days=offset)).isoformat() for offset in range(30)
-            },
-            hours={str(hour): 200 for hour in range(6)},
-            not_gay_hashtag_uses=1,
-            weekly_contest_weeks={"2026-W30"},
-        )
-        self.assertEqual(stats.medal_levels(user, casino_winnings=1_000), 21)
-
-    def test_gambling_badge_levels_are_based_on_net_casino_profit(self):
-        user = stats.UserStats(user_id="1")
-        for winnings, badge_id, levels in (
-            (99, None, 0),
-            (100, "gambler_1", 1),
-            (250, "gambler_2", 2),
-            (500, "gambler_3", 3),
-            (1_000, "gambler_4", 4),
-        ):
-            with self.subTest(winnings=winnings):
-                earned = {badge.badge_id for badge in stats.earned_badges(user, winnings)}
-                gambler_badges = {badge_id for badge_id in earned if badge_id.startswith("gambler_")}
-                self.assertEqual(gambler_badges, {badge_id} if badge_id else set())
-                self.assertEqual(stats.medal_levels(user, winnings), levels)
+    def test_the_points_stop_one_short_of_two_contest_wins(self):
+        """The badges never run out, so grinding them is capped below being valued."""
+        veteran = stats.UserStats(user_id="1", active_days=3_000, messages=500_000)
+        self.assertEqual(stats.medal_levels(veteran), stats.REPUTATION_MEDAL_LEVEL_CAP)
+        self.assertLess(stats.REPUTATION_MEDAL_LEVEL_CAP, 2 * stats.REPUTATION_PER_CONTEST_WIN)
 
     def test_the_count_matches_the_badges_stat_actually_shows(self):
-        """medal_levels must never award a point for a medal the member cannot see: the
-        earned list collapses each family to its top tier, so the level count is always
-        at least the badge count, and both move together."""
-        user = stats.UserStats(
-            user_id="1", figurines_painted=10, messages=100, media=25, active_days=30,
-        )
-        earned = {badge.badge_id for badge in stats.earned_badges(user)}
-        self.assertEqual(earned, {"painted_3", "hundred_messages", "gallery", "regular"})
-        # painting 3 + messages 1 + gallery + regular
-        self.assertEqual(stats.medal_levels(user), 6)
+        """medal_levels must never award a point for a medal the member cannot see."""
+        user = stats.UserStats(user_id="1", active_days=65, messages=3_100)
+        labels = [badge.label for badge in stats.earned_badges(user)]
+        self.assertEqual(labels, ["📅 Завсегдатай 2", "💬 Собеседник 3"])
+        self.assertEqual(stats.medal_levels(user), 2 + 3)
 
-    def test_peer_granted_medals_are_left_to_their_own_rates(self):
-        """A custom badge scores REPUTATION_PER_BADGE_RECEIVED and a weekly win
-        REPUTATION_PER_CONTEST_WIN. Counting them here too would pay twice for one medal."""
-        user = stats.UserStats(user_id="1", weekly_contest_weeks={"2026-W30"})
-        # Participation is an earned badge and counts; winning is scored elsewhere.
-        self.assertEqual(stats.medal_levels(user), 1)
+    def test_retired_badges_no_longer_score(self):
+        """Painting, streaks, night shifts, the gallery and the two hashtags were dropped
+        from /stat, so they no longer move reputation either."""
+        user = stats.UserStats(
+            user_id="1", figurines_painted=50, media=25,
+            hours={str(hour): 200 for hour in range(6)},
+            not_gay_hashtag_uses=1, weekly_contest_weeks={"2026-W30"},
+        )
+        self.assertEqual(stats.medal_levels(user), 0)
 
     def test_reputation_score_adds_medals_to_the_peer_granted_half(self):
         self.assertEqual(
-            stats.reputation_score(1, 1, 40, 7),
+            stats.reputation_score(1, 1, 7),
             stats.REPUTATION_PER_CONTEST_WIN
             + stats.REPUTATION_PER_BADGE_RECEIVED
-            + 2
             + 7 * stats.REPUTATION_PER_MEDAL_LEVEL,
         )
 
     def test_medals_default_to_zero_for_a_caller_without_userstats(self):
         """economy.reputation_for is reachable from the ledger, which has no UserStats."""
-        self.assertEqual(stats.reputation_score(1, 0, 0), stats.REPUTATION_PER_CONTEST_WIN)
+        self.assertEqual(stats.reputation_score(1, 0), stats.REPUTATION_PER_CONTEST_WIN)
 
     def test_a_negative_medal_count_cannot_subtract_reputation(self):
-        self.assertEqual(stats.reputation_score(0, 0, 0, -5), 0)
+        self.assertEqual(stats.reputation_score(0, 0, -5), 0)
 
 
 class FakeBotAPI:
@@ -1097,7 +1288,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
                 ):
                     consumed = await bot_listener.handle_badge_text_input(
                         api,
@@ -1165,7 +1356,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         prompt = api.sent[-1][0]
         with patch("stats.resolve_stat_target", new=AsyncMock(side_effect=[
-            (target, 1, 1, 0, 0, 0) for target in targets
+            (target, 1, 1, 0, 0) for target in targets
         ])):
             await bot_listener.handle_badge_text_input(
                 api, None,
@@ -1295,7 +1486,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -1348,7 +1539,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
                 ):
                     await bot_listener.handle_week_winner_command(
                         api,
@@ -1392,7 +1583,7 @@ class BadgeFlowTests(unittest.IsolatedAsyncioTestCase):
             with patch("stats._stats_dir", return_value=Path(temporary)):
                 with patch(
                     "stats.resolve_stat_target",
-                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0, 0)),
+                    new=AsyncMock(return_value=(tracked_target, 1, 1, 0, 0)),
                 ):
                     await bot_listener.handle_delete_pokras_command(
                         api,

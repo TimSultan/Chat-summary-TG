@@ -23,7 +23,9 @@ import stats
 WPP = 20.0
 
 
-class RevokeXpGrantTests(unittest.TestCase):
+class _GrantStoreCase(unittest.TestCase):
+    """A temporary stats directory with two tamed players, "1" (Кломбик) and "2"."""
+
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
         self.root = Path(self._temporary.name)
@@ -52,6 +54,8 @@ class RevokeXpGrantTests(unittest.TestCase):
     def _coins(self, user_id="1"):
         return economy.balance("chat", user_id, self._xp(user_id))
 
+
+class RevokeXpGrantTests(_GrantStoreCase):
     def test_a_grant_inflates_xp_and_revoking_it_hands_the_money_back_as_coins(self):
         stats.grant_xp_once("chat", "1", 10_000_000, "money")
         inflated_xp, funded = self._xp(), self._coins()
@@ -106,6 +110,90 @@ class RevokeXpGrantTests(unittest.TestCase):
         self.assertEqual(admin_xp.main(["revoke", "Кломбик", "--yes"]), 0)
         self.assertEqual(stats.revoke_xp_grants("chat", "1"), 0)
         self.assertEqual(stats.revoke_xp_grants("chat", "1", "no-such-key"), 0)
+
+    def test_revoking_everything_nets_a_negative_adjustment_instead_of_paying_for_it(self):
+        """The resource panel undoes XP with a NEGATIVE running adjustment. Clearing it
+        together with the grant it undid removes nothing, so nothing is paid -- it used to
+        be read as 0 and the grant's full value was handed out a second time."""
+        stats.grant_xp_once("chat", "1", 1_000_000, "money")
+        stats.adjust_bonus_xp("chat", "1", -1_000_000, by="panel")
+        xp_before, coins_before = self._xp(), self._coins()
+
+        admin_xp.main(["revoke", "Кломбик", "--yes"])
+
+        self.assertEqual(self._xp(), xp_before)
+        self.assertEqual(self._coins(), coins_before)
+
+
+class RetireXpGrantTests(_GrantStoreCase):
+    """economy.retire_xp_grant: the startup conversion of a payment made as XP."""
+
+    def test_the_grant_becomes_coins_and_leaves_the_leaderboard(self):
+        stats.grant_xp_once("chat", "1", 10_000_000, "paid-as-xp")
+        funded = self._coins()
+
+        paid = economy.retire_xp_grant("chat", "1", "paid-as-xp")
+
+        self.assertEqual(paid, 10_000_000 // stats.XP_PER_COIN)
+        self.assertEqual(self._xp(), 0)
+        self.assertEqual(self._coins(), funded)
+        self.assertEqual(stats.xp_grants_for("chat", "1"), {})
+
+    def test_running_it_on_every_start_pays_once(self):
+        stats.grant_xp_once("chat", "1", 10_000_000, "paid-as-xp")
+        economy.retire_xp_grant("chat", "1", "paid-as-xp")
+        once = self._coins()
+        self.assertEqual(economy.retire_xp_grant("chat", "1", "paid-as-xp"), 0)
+        self.assertEqual(self._coins(), once)
+
+    def test_a_grant_already_compensated_by_hand_is_not_paid_again(self):
+        """admin_xp.py revoke, then a restart re-granted it: the money is already out."""
+        stats.grant_xp_once("chat", "1", 10_000_000, "paid-as-xp")
+        admin_xp.main(["revoke", "Кломбик", "--yes"])
+        stats.grant_xp_once("chat", "1", 10_000_000, "paid-as-xp")
+        compensated = economy.balance("chat", "1", 0)
+
+        self.assertEqual(economy.retire_xp_grant("chat", "1", "paid-as-xp"), 0)
+        self.assertEqual(self._xp(), 0)
+        self.assertEqual(self._coins(), compensated)
+
+    def test_a_grant_the_panel_already_cancelled_pays_nothing_and_changes_nothing(self):
+        stats.grant_xp_once("chat", "1", 10_000_000, "paid-as-xp")
+        stats.grant_xp_once("chat", "1", 300, "earned-prize")
+        stats.adjust_bonus_xp("chat", "1", -10_000_000, by="panel")
+        xp_before, coins_before = self._xp(), self._coins()
+
+        self.assertEqual(economy.retire_xp_grant("chat", "1", "paid-as-xp"), 0)
+
+        self.assertEqual(self._xp(), xp_before)
+        self.assertEqual(self._coins(), coins_before)
+        # Both halves of the cancelled pair are gone; the unrelated grant stays.
+        self.assertEqual(list(stats.xp_grants_for("chat", "1")), ["earned-prize"])
+
+    def test_a_partly_cancelled_grant_pays_only_what_was_still_in_effect(self):
+        stats.grant_xp_once("chat", "1", 1_000_000, "paid-as-xp")
+        stats.adjust_bonus_xp("chat", "1", -400_000, by="panel")
+        coins_before = self._coins()
+
+        paid = economy.retire_xp_grant("chat", "1", "paid-as-xp")
+
+        self.assertEqual(paid, 600_000 // stats.XP_PER_COIN)
+        self.assertEqual(self._xp(), 0)
+        self.assertEqual(self._coins(), coins_before)
+
+    def test_nothing_to_retire_is_not_an_error(self):
+        self.assertEqual(economy.retire_xp_grant("chat", "1", "no-such-grant"), 0)
+
+
+class StartupGrantTests(unittest.TestCase):
+    def test_the_bot_no_longer_pays_anybody_in_xp_when_it_starts(self):
+        """The 10M grant used to be re-applied on every start, so even admin_xp.py could
+        not make its removal stick. The start-up now converts it to coins instead."""
+        source = (Path(__file__).resolve().parents[1] / "bot_listener.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("grant_xp_once(", source)
+        self.assertIn("economy.retire_xp_grant(", source)
 
 
 if __name__ == "__main__":

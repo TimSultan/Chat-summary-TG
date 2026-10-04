@@ -146,12 +146,12 @@ class _Resolver:
         self.found = found
 
     async def __call__(self, client, chat_ref, entry, arg, username, display_name, tz,
-                       log=print, frozen_days_for=None):
+                       log=print, frozen_days_for=None, requester_id=None):
         self.api.calls.append("resolve_stat_target")
         if not self.found:
-            return None, None, 0, None, None, None
+            return None, None, 0, None, None
         user = SimpleNamespace(user_id=self.user_id, display_name=self.name)
-        return user, 1, 1, RICH_XP, 0, RICH_XP
+        return user, 1, 1, RICH_XP, 0
 
 
 def _cfg():
@@ -1077,8 +1077,8 @@ class PetsCommandTests(unittest.TestCase):
         receiver = SimpleNamespace(user_id=43, display_name="Receiver")
 
         async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
-            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
-                receiver, 1, 1, RICH_XP, 0, RICH_XP
+            return (giver, 1, 1, RICH_XP, 0) if not arg else (
+                receiver, 1, 1, RICH_XP, 0
             )
 
         with patch.object(stats, "resolve_stat_target", resolve):
@@ -1118,8 +1118,8 @@ class PetsCommandTests(unittest.TestCase):
         giver = SimpleNamespace(user_id=PLAYER["id"], display_name="Player")
 
         async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
-            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
-                petless, 1, 1, RICH_XP, 0, RICH_XP
+            return (giver, 1, 1, RICH_XP, 0) if not arg else (
+                petless, 1, 1, RICH_XP, 0
             )
 
         with patch.object(stats, "resolve_stat_target", resolve):
@@ -1147,8 +1147,8 @@ class PetsCommandTests(unittest.TestCase):
         receiver = SimpleNamespace(user_id=43, display_name="Receiver")
 
         async def resolve(client, chat_ref, entry, arg, *args, **kwargs):
-            return (giver, 1, 1, RICH_XP, 0, RICH_XP) if not arg else (
-                receiver, 1, 1, RICH_XP, 0, RICH_XP
+            return (giver, 1, 1, RICH_XP, 0) if not arg else (
+                receiver, 1, 1, RICH_XP, 0
             )
 
         with patch.object(stats, "resolve_stat_target", resolve):
@@ -1657,8 +1657,8 @@ class PetsCommandTests(unittest.TestCase):
         deletions = []
 
         async def resolve(*args, **kwargs):
-            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (
-                target, 1, 1, RICH_XP, 0, RICH_XP
+            return (challenger, 1, 1, RICH_XP, 0) if args[3] == "" else (
+                target, 1, 1, RICH_XP, 0
             )
 
         with patch.object(stats, "resolve_stat_target", resolve), \
@@ -1697,8 +1697,8 @@ class PetsCommandTests(unittest.TestCase):
         deletions = []
 
         async def resolve(*args, **kwargs):
-            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (
-                target, 1, 1, RICH_XP, 0, RICH_XP
+            return (challenger, 1, 1, RICH_XP, 0) if args[3] == "" else (
+                target, 1, 1, RICH_XP, 0
             )
 
         with patch.object(bot_listener.time, "monotonic", return_value=1), \
@@ -1759,7 +1759,7 @@ class PetsCommandTests(unittest.TestCase):
         deletions = []
 
         async def resolve(*args, **kwargs):
-            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+            return (challenger, 1, 1, RICH_XP, 0) if args[3] == "" else (target, 1, 1, RICH_XP, 0)
 
         with patch.object(stats, "resolve_stat_target", resolve), patch.object(
             bot_listener, "schedule_bot_delete",
@@ -1792,7 +1792,7 @@ class PetsCommandTests(unittest.TestCase):
         deletions = []
 
         async def resolve(*args, **kwargs):
-            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+            return (challenger, 1, 1, RICH_XP, 0) if args[3] == "" else (target, 1, 1, RICH_XP, 0)
 
         with patch.object(stats, "resolve_stat_target", resolve), patch.object(
             bot_listener, "schedule_bot_delete",
@@ -1859,7 +1859,7 @@ class PetsCommandTests(unittest.TestCase):
         target = SimpleNamespace(user_id=43, display_name="Bob")
 
         async def resolve(*args, **kwargs):
-            return (challenger, 1, 1, RICH_XP, 0, RICH_XP) if args[3] == "" else (target, 1, 1, RICH_XP, 0, RICH_XP)
+            return (challenger, 1, 1, RICH_XP, 0) if args[3] == "" else (target, 1, 1, RICH_XP, 0)
 
         with patch.object(stats, "resolve_stat_target", resolve):
             _run(bot_listener.handle_duel_command(

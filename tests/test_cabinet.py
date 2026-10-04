@@ -94,7 +94,7 @@ class ViewTests(unittest.TestCase):
         views = [
             cabinet.shop_view("chat", user, 5_000),
             cabinet.works_view("chat", user, [], None, None),
-            cabinet.badges_view("chat", user, []),
+            cabinet.badges_view("chat", user, 5_000, []),
             cabinet.title_view("chat", user, 5_000),
             cabinet.result_view(user.user_id, "готово"),
         ]
@@ -119,11 +119,35 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(len(keyboard["inline_keyboard"]), 1)
 
         many = [f"https://t.me/c/1/{n}" for n in range(cabinet.WORKS_SHOWN + 5)]
-        capped, keyboard = cabinet.works_view(
+        first, keyboard = cabinet.works_view(
             "chat", _user(figurines_painted=35), many, None, None
         )
-        self.assertIn("и ещё 5", capped)
-        self.assertIn("✏️ Переименовать", capped + str(keyboard))
+        self.assertIn("Страница 1 из 2", first)
+        self.assertIn(f"{cabinet.WORKS_SHOWN}. ", first)
+        self.assertNotIn(f"{cabinet.WORKS_SHOWN + 1}. ", first)
+        self.assertIn("✏️ Переименовать", first + str(keyboard))
+        pages = [
+            cabinet.parse_callback(button["callback_data"])
+            for row in keyboard["inline_keyboard"] for button in row
+            if cabinet.parse_callback(button["callback_data"])[1] == "works"
+        ]
+        self.assertEqual(pages, [("20", "works", "2")])
+
+        # Every work stays reachable: the last page carries the oldest five, still
+        # numbered by their position in the whole list.
+        last, keyboard = cabinet.works_view(
+            "chat", _user(figurines_painted=35), many, None, None, page="2"
+        )
+        self.assertIn("Страница 2 из 2", last)
+        self.assertIn(f"{cabinet.WORKS_SHOWN + 5}. ", last)
+        self.assertNotIn("\n1. ", last)
+        self.assertEqual(last.count('<a href='), 5)
+
+        # A stale or hand-made page number lands on a real page instead of failing.
+        clamped, _ = cabinet.works_view(
+            "chat", _user(figurines_painted=35), many, None, None, page="99"
+        )
+        self.assertIn("Страница 2 из 2", clamped)
 
     def test_rename_request_parsing(self):
         self.assertEqual(cabinet.parse_rename_request("3 Дредноут"), (3, "Дредноут"))
@@ -219,7 +243,7 @@ class BadgeSectionTests(unittest.TestCase):
         user = _user(messages=1_000, media=25)
         given = stats.Badge("custom", "🏹", "Лучник", custom=True)
 
-        text, _ = cabinet.badges_view("chat", user, [given])
+        text, _ = cabinet.badges_view("chat", user, 0, [given])
 
         self.assertIn("Уникальные значки", text)
         self.assertIn("Заработанные", text)
@@ -227,56 +251,56 @@ class BadgeSectionTests(unittest.TestCase):
         self.assertLess(text.index("🏹 Лучник"), text.index("Заработанные"))
 
     def test_the_admin_section_is_omitted_when_there_are_none(self):
-        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), 0, [])
         self.assertNotIn("Уникальные значки", text)
 
     def test_a_weekly_win_is_earned_not_admin_granted(self):
         # It is assigned by an administrator, but it is won -- Badge.custom is the
         # discriminator, and the contest badge does not set it.
         won = stats.Badge("weekly_contest_winner", "🏆", "Победитель ×1")
-        text, _ = cabinet.badges_view("chat", _user(), [won])
+        text, _ = cabinet.badges_view("chat", _user(), 0, [won])
         self.assertNotIn("Уникальные значки", text)
         self.assertIn("🏆 Победитель ×1", text)
 
     def test_collection_counter_counts_tiers_levels_and_ranks(self):
-        # A genuinely blank member -- _user() has 500 messages, which already earns one.
+        # A genuinely blank member -- _user() has 500 messages.
         empty = stats.UserStats(user_id="20")
-        unlocked, total = stats.badge_collection_progress(empty)
+        unlocked, total = stats.badge_collection_progress(empty, 0)
         # A brand-new member already holds the base painting rank and the first chat tier.
         self.assertEqual(unlocked, 2)
-        self.assertEqual(
-            total,
-            len(stats.PAINTING_BADGE_TIERS) + len(stats.MESSAGE_BADGE_TIERS)
-            + len(stats.STREAK_BADGE_TIERS) + len(stats.NIGHT_BADGE_TIERS)
-            + len(stats.GAMBLER_BADGE_TIERS)
-            + 4 + len(stats.CHAT_LEVEL_TIERS) + len(stats.XP_LEVELS),
-        )
+        self.assertEqual(total, len(stats.CHAT_LEVEL_TIERS) + len(stats.PAINTER_RANKS) + 2)
 
-        # Every painting tier below the current one counts, not just the shown one.
-        painter = stats.UserStats(user_id="20", figurines_painted=50)
-        more_unlocked, same_total = stats.badge_collection_progress(painter)
-        self.assertEqual(same_total, total)
-        self.assertEqual(
-            more_unlocked - unlocked,
-            len(stats.PAINTING_BADGE_TIERS)          # every step, not just the top one
-            + (len(stats.XP_LEVELS) - 1)             # every painting rank above the base
-            + (len(stats.CHAT_LEVEL_TIERS) - 1),     # 50 figurines is also 10k XP
+        # Every rank below the current one counts, and each automatic badge counts once
+        # however high its level -- the levels never run out, the total must not.
+        veteran = stats.UserStats(
+            user_id="20", figurines_painted=500, active_days=300, messages=40_000,
         )
+        more_unlocked, same_total = stats.badge_collection_progress(veteran, 10**6)
+        self.assertEqual(same_total, total)
+        self.assertEqual(more_unlocked, total)
 
     def test_defined_custom_badges_widen_the_denominator(self):
         user = stats.UserStats(user_id="20")
-        _, base_total = stats.badge_collection_progress(user)
+        _, base_total = stats.badge_collection_progress(user, 0)
         given = stats.Badge("custom", "🏹", "Лучник", custom=True)
 
         unlocked, total = stats.badge_collection_progress(
-            user, custom_badges=[given], chat_custom_badge_total=4
+            user, 0, custom_badges=[given], chat_custom_badge_total=4
         )
 
         self.assertEqual(total, base_total + 4)
         self.assertEqual(unlocked, 2 + 1)
 
+    def test_the_badges_screen_explains_how_the_two_levels_are_earned(self):
+        text, _ = cabinet.badges_view(
+            "chat", _user(messages=2_500, active_days=61), 0, []
+        )
+        self.assertIn("📅 Завсегдатай 2", text)
+        self.assertIn("💬 Собеседник 2", text)
+        self.assertIn("каждые 30 активных дней", text)
+
     def test_the_counter_is_rendered_at_the_bottom(self):
-        text, _ = cabinet.badges_view("chat", _user(messages=1_000), [])
+        text, _ = cabinet.badges_view("chat", _user(messages=1_000), 0, [])
         self.assertIn("📦 Открыто:", text)
         self.assertGreater(text.index("📦 Открыто:"), text.index("🏅 <b>Значки</b>"))
 
@@ -333,7 +357,7 @@ class WorkDeleteTests(unittest.TestCase):
 
     def _confirm(self, message_id, user):
         async def fake_context(telethon_client, entry, tz, from_user, log=print):
-            return user, 5_000, 3, 190, 4, 5_000
+            return user, 5_000, 3, 190, 4
 
         async def fake_render(*args, **kwargs):
             return ("works", {"inline_keyboard": []})
@@ -387,7 +411,7 @@ class WorkDeleteTests(unittest.TestCase):
 
     def test_the_cached_context_is_dropped_so_the_list_refreshes(self):
         user = self._painter()
-        bot_listener._CABINET_CONTEXT_CACHE[("chat", 20)] = (10**9, (user, 1, 1, 1, 1, 1))
+        bot_listener._CABINET_CONTEXT_CACHE[("chat", 20)] = (10**9, (user, 1, 1, 1, 1))
 
         self._confirm(105, user)
 
@@ -509,9 +533,9 @@ class BadgeRemovalTests(unittest.TestCase):
             self.assertNotIn(self.badge.badge_id, assigned)
 
         unlocked, _ = stats.badge_collection_progress(
-            _user(), custom_badges=stats.custom_badges_for_user("chat", "20")
+            _user(), 0, custom_badges=stats.custom_badges_for_user("chat", "20")
         )
-        blank, _ = stats.badge_collection_progress(_user())
+        blank, _ = stats.badge_collection_progress(_user(), 0)
         self.assertEqual(unlocked, blank)
 
     def test_deleting_twice_is_reported_not_crashed(self):
@@ -781,7 +805,7 @@ class MenuFallbackTests(unittest.TestCase):
 
     def test_a_tracked_member_gets_their_own_cabinet(self):
         async def fake_context(telethon_client, entry, tz, from_user, log=print):
-            return _user(), 5_000, 3, 190, 4, 5_000
+            return _user(), 5_000, 3, 190, 4
 
         with tempfile.TemporaryDirectory() as temporary:
             with patch("stats._stats_dir", return_value=Path(temporary)):
@@ -867,7 +891,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def fake_context(telethon_client, entry, tz, from_user, log=print):
             contexts.append(entry)
-            return _user(), 5_000, 3, 190, 4, 5_000
+            return _user(), 5_000, 3, 190, 4
 
         with patch("bot_listener._resolve_chat_id", fake_chat_id), \
              patch("bot_listener.resolve_chat", fake_resolve), \
@@ -914,7 +938,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def counting_resolve(*args, **kwargs):
             calls.append(1)
-            return _user(), 3, 190, 5_000, 4, 5_000
+            return _user(), 3, 190, 5_000, 4
 
         with patch("stats.resolve_stat_target", counting_resolve):
             for _ in range(5):
@@ -931,7 +955,7 @@ class RenderCostTests(unittest.TestCase):
 
         async def counting_resolve(*args, **kwargs):
             calls.append(1)
-            return _user(), 3, 190, 5_000, 4, 5_000
+            return _user(), 3, 190, 5_000, 4
 
         with patch("stats.resolve_stat_target", counting_resolve):
             for user_id in (20, 21):
@@ -983,7 +1007,8 @@ class MenuRegistrationTests(unittest.TestCase):
     def test_group_menu_has_public_commands_and_dm_menu_still_has_cabinet(self):
         self.assertEqual(
             {
-                "stat", "top", "shop", "tree", "vote", "arena", "pet", "duel", "testfight",
+                "stat", "works", "top", "shop", "tree", "vote", "arena", "pet", "duel",
+                "testfight",
             },
             {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
         )
