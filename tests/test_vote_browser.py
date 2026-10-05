@@ -207,6 +207,38 @@ class BrowserPageScriptTests(unittest.TestCase):
         finally:
             os.unlink(path)
 
+    def test_every_voting_page_closes_its_picture_on_esc_and_on_the_space_around_it(self):
+        """The ✕ is not the only way out: Esc steps back a layer, a click on the black
+        around a picture closes it at any zoom, and so does a click on the reel's empty
+        space. Checked with real key and mouse events in a browser when it was written;
+        pinned here so none of the three pages quietly loses it."""
+        import nominations_web
+
+        pages = {
+            "browser": vote_web.BROWSER_HTML,
+            "v1 mini app": vote_web.PAGE_HTML,
+            "v3 nominations": nominations_web.PAGE_HTML,
+        }
+        for name, page in pages.items():
+            with self.subTest(page=name):
+                self.assertIn('event.key === "Escape"' if name == "browser" else 'event.key !== "Escape"', page)
+                self.assertIn('$("lensImg").getBoundingClientRect()', page)
+                self.assertIn('$("reel").addEventListener("click"', page)
+
+    def test_the_mini_app_page_is_valid_javascript_too(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to parse the page")
+        scripts = re.findall(r"<script>(.*?)</script>", vote_web.PAGE_HTML, re.S)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write("\n".join(scripts))
+            path = handle.name
+        try:
+            result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.unlink(path)
+
     def test_the_page_tells_people_how_the_vote_reaches_the_bot(self):
         page = vote_web.BROWSER_HTML
         self.assertIn("Открыть Telegram и проголосовать", page)

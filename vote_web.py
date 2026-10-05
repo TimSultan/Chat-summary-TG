@@ -1774,6 +1774,12 @@ lensStageEl.addEventListener("pointermove", (event) => {
   }
 });
 
+function lensTapOutsideImage(x, y) {
+  // The transformed box, so "outside" follows the picture as it is zoomed and panned.
+  const box = $("lensImg").getBoundingClientRect();
+  return x < box.left || x > box.right || y < box.top || y > box.bottom;
+}
+
 function lensPointerDone(event) {
   const pointer = lensPointers.get(event.pointerId);
   lensPointers.delete(event.pointerId);
@@ -1782,6 +1788,14 @@ function lensPointerDone(event) {
   const moved = Math.hypot(pointer.x - pointer.startX, pointer.y - pointer.startY);
   if (moved > 10 || Date.now() - pointer.at > 600) return;   // a drag, not a tap
 
+  // A tap on the black around the picture closes it at any zoom: that space shows
+  // nothing, so a tap there can only mean "done looking".
+  if (lensTapOutsideImage(pointer.x, pointer.y)) {
+    clearTimeout(lensTapTimer);
+    lensTapTimer = null;
+    closeLens();
+    return;
+  }
   if (lensTapTimer) {           // the second tap of a double
     clearTimeout(lensTapTimer);
     lensTapTimer = null;
@@ -1818,6 +1832,21 @@ function goBack() {
 }
 if (tg && tg.BackButton) tg.BackButton.onClick(goBack);
 $("reelClose").addEventListener("click", closeReel);
+
+// Esc does what the back arrow does, one layer at a time: on a computer it is the key
+// people reach for, and with only the ✕ every close was a hunt for the corner.
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!$("lens").hidden || !$("reel").hidden) { event.preventDefault(); goBack(); }
+  else if (!$("subscribePrompt").hidden) $("subscribePrompt").hidden = true;
+  else if (!$("voteStats").hidden) $("voteStats").hidden = true;
+});
+
+// A click on the reel's empty space -- around the works, not on one -- closes it too.
+$("reel").addEventListener("click", (event) => {
+  const target = event.target;
+  if (target === $("reel") || target === $("feed") || target.classList.contains("rcard")) closeReel();
+});
 
 // A tap on a picture closes the reel as well: while reading down the feed the picture is
 // the whole screen, and the ✕ in the corner is the awkward way back to the grid. Only
@@ -3249,8 +3278,18 @@ function openReel(id) {
   if (target) target.scrollIntoView({ block: "start" });
 }
 $("reelClose").addEventListener("click", closeTop);
+// A click on the empty space around the works (the dark sides on a computer, the gaps
+// between works) closes the close-up as well.
+$("reel").addEventListener("click", (event) => {
+  const target = event.target;
+  if (target === $("reel") || target === $("feed") || target.classList.contains("rcard")) closeTop();
+});
+// Esc steps back one layer, exactly like the phone's back button.
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && layers.length) { event.preventDefault(); closeTop(); }
+});
 
-let lens = { scale: 1, fit: 1, x: 0, y: 0 };
+let lens ={ scale: 1, fit: 1, x: 0, y: 0 };
 const pointers = new Map();
 let pinch = null;
 let tapTimer = null;
@@ -3311,6 +3350,13 @@ function pointerDone(event) {
   if (pointers.size < 2) pinch = null;
   if (!p || event.type !== "pointerup") return;
   if (Math.hypot(p.x - p.sx, p.y - p.sy) > 10 || Date.now() - p.at > 600) return;
+  // The black around the picture closes it at any zoom -- there is nothing there to tap.
+  const box = $("lensImg").getBoundingClientRect();
+  if (p.x < box.left || p.x > box.right || p.y < box.top || p.y > box.bottom) {
+    clearTimeout(tapTimer); tapTimer = null;
+    closeTop();
+    return;
+  }
   if (tapTimer) {
     clearTimeout(tapTimer); tapTimer = null;
     if (lens.scale > lens.fit * 1.05) lensFit(); else lensZoomTo(lens.fit * 3, p.x, p.y);

@@ -1408,6 +1408,14 @@ function lensPointerDone(event) {
   if (!pointer || event.type !== "pointerup") return;
   const moved = Math.hypot(pointer.x - pointer.startX, pointer.y - pointer.startY);
   if (moved > 10 || Date.now() - pointer.at > 600) return;
+  // The black around the picture closes it at any zoom -- there is nothing there to tap.
+  const box = $("lensImg").getBoundingClientRect();
+  if (pointer.x < box.left || pointer.x > box.right || pointer.y < box.top || pointer.y > box.bottom) {
+    clearTimeout(lensTapTimer);
+    lensTapTimer = null;
+    closeLens();
+    return;
+  }
   if (lensTapTimer) {
     clearTimeout(lensTapTimer);
     lensTapTimer = null;
@@ -1430,14 +1438,23 @@ window.addEventListener("resize", () => { if (!$("lens").hidden) lensFit(); });
 $("lensClose").addEventListener("click", closeLens);
 
 // Telegram's back arrow steps back one layer: the popup, then the lens, then the reel.
-if (tg && tg.BackButton) {
-  tg.BackButton.onClick(() => {
-    if (!$("thanks").hidden) closeThanks();
-    else if (!$("lens").hidden) closeLens();
-    else closeReel();
-  });
+// Esc does the same on a computer.
+function stepBack() {
+  if (!$("thanks").hidden) closeThanks();
+  else if (!$("lens").hidden) closeLens();
+  else closeReel();
 }
+if (tg && tg.BackButton) tg.BackButton.onClick(stepBack);
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  if (!$("thanks").hidden || !$("lens").hidden || !$("reel").hidden) { event.preventDefault(); stepBack(); }
+});
 $("reelClose").addEventListener("click", closeReel);
+// A click on the reel's empty space -- around the works, not on one -- closes it too.
+$("reel").addEventListener("click", (event) => {
+  const target = event.target;
+  if (target === $("reel") || target === $("feed") || target.classList.contains("rcard")) closeReel();
+});
 
 // A tap on a picture in the reel closes it back to the grid; a scroll that comes to rest
 // on one must not (measured from pointerdown, as v1 does).
