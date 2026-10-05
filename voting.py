@@ -770,6 +770,49 @@ def record_vote(
     return poll
 
 
+# ------------------------------------------------------------- voting by a link to the bot
+#
+# The browser page (vote_web.BROWSER_HTML) is for people whose Telegram will not open the
+# Mini App. A web page cannot tell who is looking at it, so it does not vote: it builds a
+# t.me/<bot>?start=<payload> link carrying the chosen works, and the ballot is cast by the
+# Telegram account that sends that /start to the bot -- the same identity the Mini App's
+# signed initData gives, so one person still has one ballot.
+#
+# The payload is "vote-" and each entry id (a message id) in base 36, dash-separated:
+# start parameters allow only [A-Za-z0-9_-], are capped at 64 characters, and bot_listener
+# lowercases them -- base 36 is lowercase and about two thirds the length of decimal.
+BALLOT_LINK_PREFIX = "vote-"
+BALLOT_LINK_MAX = 64
+
+
+def encode_ballot_link(entry_ids: list[str]) -> str:
+    """The start payload for these choices. Mirrored by ballotPayload() in the page's
+    script -- the two are pinned against each other by a test."""
+    return BALLOT_LINK_PREFIX + "-".join(_base36(int(entry_id)) for entry_id in entry_ids)
+
+
+def _base36(number: int) -> str:
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    text = ""
+    while True:
+        number, remainder = divmod(number, 36)
+        text = digits[remainder] + text
+        if not number:
+            return text
+
+
+def decode_ballot_link(payload: str) -> list[str] | None:
+    """Entry ids from a start payload, in order and without repeats; None if it is not a
+    ballot link or any part of it is not a base-36 number."""
+    payload = (payload or "").strip().lower()
+    if not payload.startswith(BALLOT_LINK_PREFIX):
+        return None
+    parts = payload[len(BALLOT_LINK_PREFIX):].split("-")
+    if not parts or not all(re.fullmatch(r"[0-9a-z]{1,12}", part) for part in parts):
+        return None
+    return list(dict.fromkeys(str(int(part, 36)) for part in parts))
+
+
 def weekly_vote_records(entry: str) -> list[dict]:
     """Private voter-id sets for the weekly vote-report renderer, oldest first.
 

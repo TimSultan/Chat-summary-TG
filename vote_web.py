@@ -76,6 +76,20 @@ _AVATAR_KEY = web.AppKey("avatar", Callable[[int], Awaitable[bytes | None]])
 _AVATAR_CACHE_KEY = web.AppKey("avatar_cache", dict)
 _ROUTE_PREFIX_KEY = web.AppKey("route_prefix", str)
 _LOG_KEY = web.AppKey("log", Callable[..., None])
+# The bot's @username, for the browser page's "send your vote to the bot" link. Known only
+# once bot_listener has asked Telegram (getMe), so it arrives as a create_app argument.
+_BOT_USERNAME_KEY = web.AppKey("bot_username", str)
+_PUBLIC_CACHE_KEY = web.AppKey("public_cache", dict)
+
+# The browser page: the ballot for people whose Telegram will not open the Mini App. See
+# BROWSER_HTML and voting.encode_ballot_link for how a vote cast there reaches the poll.
+BROWSER_PATH = "/web"
+# The page's data is unauthenticated, so it is served from a short cache rather than
+# re-parsing every poll file per request. Ten seconds is invisible to a voter and bounds
+# what a refresh-happy crowd (or anybody hammering the URL) can cost.
+PUBLIC_CACHE_SECONDS = 10.0
+# Where v1 invites a voter who is not subscribed. Same link the Mini App's prompt uses.
+SUBSCRIBE_URL = "https://t.me/papkahudojnicov"
 
 
 def _json_error(message: str, status: int = 400) -> web.Response:
@@ -646,6 +660,53 @@ async def handle_page(request: web.Request) -> web.Response:
     )
 
 
+def _public_payload(entry_name: str, base: str, bot_username: str) -> dict:
+    """What the browser page draws: the ADMITTED works of the poll the Mini App opens, the
+    rules a ballot has to keep, and the bot to send it to -- nothing more.
+
+    No ballots, no counts per work, no standings: the page has no idea who is looking at
+    it, so it can never have "earned" the results the way a voter does in the Mini App
+    (see handle_poll). How many people have voted carries no such bias and goes out, as it
+    does there. The works themselves were posted publicly in the chat, and their photos
+    and avatars are already served without a check."""
+    poll = voting.latest_poll(entry_name)
+    if poll is None:
+        return {"poll_id": None, "open": False, "entries": [], "bot": bot_username}
+    winner = poll.winner()
+    return {
+        "poll_id": poll.poll_id,
+        "open": poll.open,
+        "max_choices": poll.max_choices,
+        "allow_revote": poll.allow_revote,
+        "voter_count": len(poll.votes),
+        "entries": [_entry_payload(e, poll, base) for e in poll.approved_entries()],
+        "winner": _entry_payload(winner, poll, base) if winner and not poll.open else None,
+        "bot": bot_username,
+    }
+
+
+async def handle_public_poll(request: web.Request) -> web.Response:
+    """The browser page's data. Unauthenticated -- the page is for people who cannot
+    open the Mini App, so there is no initData to check -- which is exactly why it
+    carries only what the chat already saw (see _public_payload) and is cached."""
+    cache = request.app[_PUBLIC_CACHE_KEY]
+    now = asyncio.get_running_loop().time()
+    if cache.get("payload") is None or now - cache.get("at", 0.0) > PUBLIC_CACHE_SECONDS:
+        cache["payload"] = await asyncio.to_thread(
+            _public_payload, request.app[_ENTRY_KEY], request.app[_ROUTE_PREFIX_KEY],
+            request.app[_BOT_USERNAME_KEY],
+        )
+        cache["at"] = now
+    return web.json_response(cache["payload"], headers={"Cache-Control": "no-store"})
+
+
+async def handle_browser_page(request: web.Request) -> web.Response:
+    return web.Response(
+        text=BROWSER_HTML.replace("__PREFIX__", request.app[_ROUTE_PREFIX_KEY]),
+        content_type="text/html",
+    )
+
+
 async def handle_board_page(request: web.Request) -> web.Response:
     """The cropping page. Served to anyone who asks, like the ballot itself -- the page is
     only markup; every request it then makes is authenticated and admin-gated (handle_poll
@@ -664,6 +725,7 @@ async def handle_health(request: web.Request) -> web.Response:
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
     is_member=None, is_stats_admin=None, export=None, avatar=None, attach=None,
+    bot_username: str | None = None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
     returning a bool; `announce` is an async callable taking (user, poll, standings) --
@@ -694,6 +756,9 @@ def create_app(
     same server -- today the arena (arena_web.attach), the second voting system. It runs
     last, so it can only add to what this module has already registered, and this module
     knows nothing about what it adds.
+
+    `bot_username` is where the browser page (BROWSER_HTML) sends a vote: without it the
+    page still lists the works and tells people to message the bot, it just cannot link.
     """
     async def _default_announce(user, poll, standings):
         return None
@@ -719,6 +784,8 @@ def create_app(
     app[_AVATAR_CACHE_KEY] = {}
     app[_ROUTE_PREFIX_KEY] = route_prefix.rstrip("/")
     app[_LOG_KEY] = log
+    app[_BOT_USERNAME_KEY] = (bot_username or "").lstrip("@")
+    app[_PUBLIC_CACHE_KEY] = {}
 
     prefix = app[_ROUTE_PREFIX_KEY]
     app.add_routes([
@@ -730,6 +797,9 @@ def create_app(
         # /vote/board can never be mistaken for /vote/api/anything.
         web.get(f"{prefix}/board", handle_board_page),
         web.get(f"{prefix}/board/", handle_board_page),
+        web.get(prefix + BROWSER_PATH, handle_browser_page),
+        web.get(prefix + BROWSER_PATH + "/", handle_browser_page),
+        web.get(f"{prefix}/api/public", handle_public_poll),
         web.get(f"{prefix}/api/poll", handle_poll),
         web.post(f"{prefix}/api/ballot", handle_ballot),
         web.get(f"{prefix}/api/stats", handle_vote_stats),
@@ -749,13 +819,13 @@ def create_app(
 
 async def run_web_server(
     cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
-    is_stats_admin=None, export=None, avatar=None, attach=None,
+    is_stats_admin=None, export=None, avatar=None, attach=None, bot_username=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
     app = create_app(
         cfg, entry, is_admin, announce=announce, log=log, is_member=is_member,
         is_stats_admin=is_stats_admin, export=export,
-        avatar=avatar, attach=attach,
+        avatar=avatar, attach=attach, bot_username=bot_username,
     )
     runner = web.AppRunner(app)
     await runner.setup()
@@ -2711,6 +2781,597 @@ window.addEventListener("beforeunload", (event) => {
     $("msg").hidden = false;
     $("msg").textContent = String(e.message || e);
   }
+})();
+</script>
+</body>
+</html>
+"""
+
+# The browser ballot. For voters whose Telegram will not open the Mini App: the same
+# grid and the same full-screen look at a work, in an ordinary phone browser, with no
+# Telegram script at all. It cannot vote by itself -- it has nobody to vote AS -- so its
+# last step is a link to the bot carrying the choices (voting.encode_ballot_link), and the
+# ballot is cast by the account that sends it (bot_listener.handle_vote_link_ballot).
+BROWSER_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#17212b">
+<title>Голосование — итоги недели</title>
+<style>
+  /* The Mini App's palette, so somebody who has seen one recognises the other. */
+  :root {
+    color-scheme: dark;
+    --bg: #17212b;
+    --card: #232e3c;
+    --line: rgba(255,255,255,.08);
+    --fg: #f5f5f5;
+    --muted: #8a9aa9;
+    --accent: #3390ec;
+    --accent-soft: rgba(51,144,236,.16);
+    --accent-fg: #fff;
+    --good: #4fbf77;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  [hidden] { display: none !important; }
+  html, body { overflow-x: hidden; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         padding-bottom: 110px; }
+  button, a { font: inherit; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+
+  /* ----------------------------------------------------------------- header */
+  .hero { padding: 22px 16px 6px; }
+  .eyebrow { color: var(--muted); font-size: 12px; letter-spacing: .06em; text-transform: uppercase; }
+  .hero h1 { margin: 6px 0 6px; font-size: 24px; line-height: 1.2; }
+  .lead { margin: 0; color: var(--muted); font-size: 14px; }
+  .steps { margin: 14px 16px 0; padding: 14px; border-radius: var(--radius); background: var(--card);
+           display: grid; gap: 10px; }
+  .step { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
+  .step b { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft);
+            color: var(--accent); display: inline-flex; align-items: center; justify-content: center;
+            font-size: 12px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 16px 0; }
+  .fact { padding: 4px 10px; border-radius: 999px; background: var(--card); color: var(--muted); font-size: 12px; }
+  .notice { margin: 14px 16px 0; padding: 14px; border-radius: var(--radius); background: var(--card);
+            color: var(--muted); text-align: center; }
+  .notice b { display: block; color: var(--fg); font-size: 16px; margin-bottom: 4px; }
+  .winner { display: flex; gap: 12px; align-items: center; text-align: left; }
+  .winner img { width: 56px; height: 56px; border-radius: 10px; object-fit: cover; }
+
+  /* ------------------------------------------------------------------ grid */
+  .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 16px; }
+  @media (min-width: 600px) { .grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (min-width: 900px) { .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+  .gcard { position: relative; background: var(--card); border-radius: var(--radius); overflow: hidden;
+           box-shadow: 0 0 0 1px var(--line); transition: box-shadow .2s; }
+  .gcard.on { box-shadow: 0 0 0 2px var(--accent), 0 6px 18px rgba(51,144,236,.25); }
+  .thumb { position: relative; display: block; width: 100%; aspect-ratio: 1; overflow: hidden;
+           background: rgba(255,255,255,.05); cursor: zoom-in; }
+  .thumb > img.photo { width: 100%; height: 100%; object-fit: cover; display: block; }
+  /* The administrator's framing from the cropping page, the same square the Mini App and
+     the exported board show (see vote_web PAGE_HTML's applyFrame). */
+  .thumb > img.photo.framed { position: absolute; max-width: none; max-height: none; object-fit: fill; }
+  .more { position: absolute; right: 8px; top: 8px; padding: 2px 8px; border-radius: 999px;
+          background: rgba(0,0,0,.55); color: #fff; font-size: 11px; font-weight: 600; }
+  .mark { position: absolute; right: 8px; bottom: 8px; width: 30px; height: 30px; border-radius: 50%;
+          background: var(--accent); color: #fff; display: flex; align-items: center; justify-content: center;
+          font-weight: 800; transform: scale(0); transition: transform .25s cubic-bezier(.3,1.6,.6,1);
+          box-shadow: 0 2px 8px rgba(0,0,0,.4); }
+  .gcard.on .mark { transform: scale(1); }
+  .meta { display: flex; align-items: center; gap: 7px; padding: 8px 10px 0; min-width: 0; }
+  .name { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ava { position: relative; flex: none; width: 24px; height: 24px; border-radius: 50%; overflow: hidden;
+         background: var(--accent-soft); color: var(--accent); font-size: 11px; font-weight: 700;
+         display: inline-flex; align-items: center; justify-content: center; }
+  .ava img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .ava.big { width: 42px; height: 42px; font-size: 16px; }
+  .pick { display: block; width: calc(100% - 16px); margin: 8px; padding: 9px 4px; border-radius: 10px;
+          border: 1px solid var(--accent); background: transparent; color: var(--accent);
+          font-size: 14px; font-weight: 600; cursor: pointer; }
+  .gcard.on .pick { background: var(--accent); color: var(--accent-fg); }
+  .pick[disabled], .pickBtn[disabled] { opacity: .45; cursor: default; }
+  .foot { margin: 8px 16px 0; color: var(--muted); font-size: 12px; text-align: center; }
+
+  /* ------------------------------------------------------------------- bar */
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; background: var(--bg);
+         border-top: 1px solid var(--line); padding: 10px 16px calc(10px + env(safe-area-inset-bottom)); }
+  .bar .inner { max-width: 960px; margin: 0 auto; display: flex; gap: 12px; align-items: center; }
+  .count { flex: none; color: var(--muted); font-size: 13px; line-height: 1.25; }
+  .count b { display: block; color: var(--fg); font-size: 18px; }
+  .go { flex: 1; display: block; border: 0; border-radius: 12px; padding: 14px; cursor: pointer;
+        background: var(--accent); color: var(--accent-fg); font-size: 15px; font-weight: 700;
+        text-align: center; text-decoration: none; }
+  .go[disabled] { opacity: .4; cursor: default; }
+  .go.ghost { background: transparent; color: var(--fg); border: 1px solid rgba(255,255,255,.18); font-weight: 600; }
+
+  /* -------------------------------------------------- the work, close up */
+  .reel { position: fixed; inset: 0; z-index: 10; background: var(--bg); overflow-y: auto;
+          -webkit-overflow-scrolling: touch; }
+  body.locked { overflow: hidden; }
+  .close { position: fixed; top: 10px; right: 10px; z-index: 12; width: 40px; height: 40px; border: 0;
+           border-radius: 50%; background: rgba(0,0,0,.6); color: #fff; font-size: 18px; cursor: pointer; }
+  .feed { max-width: 720px; margin: 0 auto; padding: 12px 16px calc(var(--barH, 90px) + 16px); }
+  .rcard { padding: 16px 0; border-bottom: 1px solid var(--line); }
+  .rcard:last-child { border-bottom: 0; }
+  .rhead { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding-right: 48px; }
+  .rhead .tag { color: var(--muted); font-size: 12px; }
+  .rhead .name { font-size: 15px; }
+  .cap { white-space: pre-wrap; margin: 0 0 10px; font-size: 14px; }
+  .photos { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+  .photos img { width: 100%; border-radius: 12px; display: block; cursor: zoom-in; }
+  .shot { position: relative; }
+  .pickBtn { display: block; width: 100%; padding: 12px; border-radius: 12px; cursor: pointer;
+             border: 1px solid var(--accent); background: transparent; color: var(--accent);
+             font-size: 15px; font-weight: 700; }
+  .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); }
+  .lens { position: fixed; inset: 0; z-index: 30; background: #000; touch-action: none; overscroll-behavior: contain; }
+  .lensStage { position: absolute; inset: 0; overflow: hidden; touch-action: none; }
+  .lensStage img { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; display: block;
+                   user-select: none; -webkit-user-drag: none; -webkit-user-select: none; }
+  .lensHint { position: fixed; left: 0; right: 0; bottom: calc(14px + env(safe-area-inset-bottom));
+              text-align: center; color: #fff; opacity: .75; font-size: 12px; pointer-events: none; }
+
+  /* ------------------------------------------------------- send the vote */
+  .modal { position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-end; justify-content: center;
+           background: rgba(5,10,15,.7); animation: fade .2s ease; }
+  @media (min-width: 600px) { .modal { align-items: center; } }
+  .sheet { width: min(100%, 460px); max-height: 92vh; overflow-y: auto; padding: 22px 18px
+           calc(18px + env(safe-area-inset-bottom)); border-radius: 22px 22px 0 0; background: var(--card);
+           animation: rise .3s cubic-bezier(.2,1.1,.4,1); }
+  @media (min-width: 600px) { .sheet { border-radius: 22px; } }
+  .sheet h2 { margin: 0 0 4px; font-size: 20px; }
+  .sheet .muted { margin: 0; color: var(--muted); font-size: 13px; }
+  .chosen { display: grid; gap: 8px; margin: 14px 0 16px; }
+  .chosen .row { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .chosen img { width: 40px; height: 40px; border-radius: 8px; object-fit: cover; flex: none; }
+  .chosen .row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sheet .go { width: 100%; }   /* a <button> does not stretch the way the <a> beside it does */
+  .sheet .go + .go, .sheet .go + .hint { margin-top: 10px; }
+  .hint { color: var(--muted); font-size: 13px; }
+  .or { display: flex; align-items: center; gap: 10px; margin: 18px 0 10px; color: var(--muted); font-size: 12px; }
+  .or::before, .or::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+  .copyBox { display: flex; gap: 8px; margin-top: 8px; }
+  .copyBox code { flex: 1; min-width: 0; padding: 10px 12px; border-radius: 10px; background: var(--bg);
+                  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                  overflow-wrap: anywhere; user-select: all; -webkit-user-select: all; }
+  .copyBox button { flex: none; border: 0; border-radius: 10px; padding: 0 14px; cursor: pointer;
+                    background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  .toast { position: fixed; left: 50%; bottom: calc(90px + env(safe-area-inset-bottom)); z-index: 60;
+           transform: translate(-50%, 20px); opacity: 0; pointer-events: none; padding: 9px 16px;
+           border-radius: 999px; background: #0e161e; font-size: 13px; white-space: nowrap;
+           box-shadow: 0 6px 20px rgba(0,0,0,.4); transition: opacity .25s, transform .25s; }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+  @keyframes rise { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="hero">
+    <div class="eyebrow">Голосование · итоги недели</div>
+    <h1>Выберите лучшие работы</h1>
+    <p class="lead">Версия для браузера — для тех, у кого голосование не открывается в Telegram.</p>
+  </header>
+  <div class="steps" id="steps">
+    <div class="step"><b>1</b><span>Нажмите «Выбрать» под понравившимися работами. Нажмите на фото, чтобы рассмотреть.</span></div>
+    <div class="step"><b>2</b><span>Нажмите «Отправить голос» внизу.</span></div>
+    <div class="step"><b>3</b><span>Откроется Telegram, чат с ботом — нажмите «Запустить». Голос засчитается от вашего аккаунта.</span></div>
+  </div>
+  <div class="facts" id="facts"></div>
+  <div class="notice" id="notice" hidden></div>
+  <div class="grid" id="grid"></div>
+  <p class="foot">Один аккаунт Telegram — один голос. Отправленный ещё раз голос заменяет прежний.</p>
+</div>
+
+<div class="bar" id="bar" hidden>
+  <div class="inner">
+    <div class="count" id="count"></div>
+    <button class="go" id="send" disabled>Отправить голос</button>
+  </div>
+</div>
+
+<div class="reel" id="reel" hidden>
+  <button class="close" id="reelClose" aria-label="Закрыть">✕</button>
+  <div class="feed" id="feed"></div>
+</div>
+
+<div class="lens" id="lens" hidden>
+  <div class="lensStage" id="lensStage"><img id="lensImg" alt=""></div>
+  <button class="close" id="lensClose" aria-label="Закрыть">✕</button>
+  <div class="lensHint">Двумя пальцами или двойным касанием — приблизить</div>
+</div>
+
+<div class="modal" id="sendModal" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sendTitle">
+    <h2 id="sendTitle">Отправьте голос боту</h2>
+    <p class="muted" id="sendCount"></p>
+    <div class="chosen" id="chosen"></div>
+    <a class="go" id="sendLink" href="#" rel="noopener">Открыть Telegram и проголосовать</a>
+    <p class="hint" id="sendHint"></p>
+    <div class="or" id="copyTitle">Не открывается?</div>
+    <p class="hint" id="copyHint"></p>
+    <div class="copyBox"><code id="copyText"></code><button id="copyButton">Копировать</button></div>
+    <a class="go ghost" id="botLink" href="#" rel="noopener" style="margin-top:10px">Открыть чат с ботом</a>
+    <button class="go ghost" id="sendBack" style="margin-top:10px">Изменить выбор</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const PREFIX = "__PREFIX__";
+const $ = (id) => document.getElementById(id);
+let poll = null;
+let picked = new Set();
+let toastTimer = null;
+
+// The same start payload voting.encode_ballot_link builds -- a test runs both and
+// compares them. Telegram allows [A-Za-z0-9_-] and 64 characters in one.
+function ballotPayload(ids) {
+  return "vote-" + ids.map((id) => Number(id).toString(36)).join("-");
+}
+const LINK_LIMIT = 64;
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+function displayName(e) { return e.author || (e.username ? "@" + e.username : "Автор"); }
+function avatarHtml(e, extra) {
+  const initial = Array.from(String(e.author || e.username || "?").trim())[0] || "?";
+  return '<span class="ava' + (extra ? " " + extra : "") + '">' + esc(initial.toUpperCase()) +
+    (e.avatar ? '<img loading="lazy" src="' + esc(e.avatar) + '" alt="" onerror="this.remove()">' : "") + "</span>";
+}
+function toast(text) {
+  const box = $("toast");
+  box.textContent = text;
+  box.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => box.classList.remove("show"), 2200);
+}
+function plural(n, one, few, many) {
+  const t = n % 100, u = n % 10;
+  if (t >= 11 && t <= 14) return many;
+  return u === 1 ? one : (u >= 2 && u <= 4 ? few : many);
+}
+
+// Picks survive a reload of the page, per poll. Browser storage can be missing or refuse
+// (private windows), and the page must work the same without it.
+function storageKey() { return "vote-web-picks:" + (poll && poll.poll_id); }
+function savePicks() { try { localStorage.setItem(storageKey(), JSON.stringify([...picked])); } catch (e) {} }
+function loadPicks() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(storageKey()) || "[]");
+    const known = new Set(poll.entries.map((e) => e.id));
+    return new Set(raw.filter((id) => known.has(id)));
+  } catch (e) { return new Set(); }
+}
+
+// ------------------------------------------------------------------ layers and back
+// The phone's own back button closes whatever is on top -- photo, list, then the send
+// sheet -- instead of leaving the page. Each layer opened pushes one history entry.
+const layers = [];
+function openLayer(name) {
+  layers.push(name);
+  history.pushState({ layer: name }, "");
+  document.body.classList.add("locked");
+}
+function hideLayer(name) {
+  if (name === "lens") { $("lens").hidden = true; $("lensImg").removeAttribute("src"); }
+  if (name === "reel") $("reel").hidden = true;
+  if (name === "send") $("sendModal").hidden = true;
+  if (!layers.length) document.body.classList.remove("locked");
+}
+function closeTop() { if (layers.length) history.back(); }
+window.addEventListener("popstate", () => {
+  const name = layers.pop();
+  if (name) hideLayer(name);
+});
+
+// -------------------------------------------------------------------- rendering
+function applyFrame(img) {
+  const crop = img.crop;
+  const frame = img.closest(".thumb");
+  if (!crop || !frame || !img.naturalWidth || !Number(crop.size)) return;
+  const scale = frame.clientWidth / Number(crop.size);
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  img.classList.add("framed");
+  img.style.width = (img.naturalWidth * scale) + "px";
+  img.style.height = (img.naturalHeight * scale) + "px";
+  img.style.left = (-Number(crop.x) * scale) + "px";
+  img.style.top = (-Number(crop.y) * scale) + "px";
+}
+window.addEventListener("resize", () => document.querySelectorAll("img.photo.framed").forEach(applyFrame));
+
+function canPick() { return poll && poll.open; }
+function pickLabel(id, short) {
+  if (picked.has(id)) return short ? "✓ Выбрано" : "✓ Выбрано — убрать";
+  return short ? "Выбрать" : "Выбрать эту работу";
+}
+
+function renderFacts() {
+  const facts = [];
+  const cap = poll.max_choices;
+  facts.push(cap === 1 ? "Можно выбрать одну работу" : cap ? "Можно выбрать до " + cap + " " + plural(cap, "работы", "работ", "работ")
+                       : "Можно выбрать сколько угодно работ");
+  if (poll.allow_revote === false) facts.push("Изменить голос после отправки будет нельзя");
+  facts.push("Работ: " + poll.entries.length);
+  if (poll.voter_count) facts.push("Уже проголосовали: " + poll.voter_count);
+  $("facts").innerHTML = facts.map((f) => '<span class="fact">' + esc(f) + "</span>").join("");
+}
+
+function renderGrid() {
+  const grid = $("grid");
+  grid.innerHTML = "";
+  const disabled = canPick() ? "" : " disabled";
+  for (const e of poll.entries) {
+    const card = document.createElement("div");
+    card.className = "gcard" + (picked.has(e.id) ? " on" : "");
+    card.dataset.entry = e.id;
+    card.innerHTML =
+      '<div class="thumb" data-open="' + esc(e.id) + '" role="button" aria-label="Рассмотреть работу">' +
+        (e.photos[0] ? '<img class="photo" loading="lazy" src="' + esc(e.photos[0]) + '" alt="">' : "") +
+        (e.photos.length > 1 ? '<span class="more">+' + (e.photos.length - 1) + "</span>" : "") +
+        '<span class="mark">✓</span></div>' +
+      '<div class="meta">' + avatarHtml(e) + '<span class="name">' + esc(displayName(e)) + "</span></div>" +
+      '<button class="pick" data-pick="' + esc(e.id) + '"' + disabled + ">" + pickLabel(e.id, true) + "</button>";
+    grid.appendChild(card);
+    const img = card.querySelector("img.photo");
+    if (img && e.crop) {
+      img.crop = e.crop;
+      if (img.complete) applyFrame(img); else img.addEventListener("load", () => applyFrame(img), { once: true });
+    }
+  }
+}
+
+function renderReel() {
+  const feed = $("feed");
+  feed.innerHTML = "";
+  const disabled = canPick() ? "" : " disabled";
+  for (const e of poll.entries) {
+    const card = document.createElement("div");
+    card.className = "rcard" + (picked.has(e.id) ? " on" : "");
+    card.dataset.entry = e.id;
+    card.innerHTML =
+      '<div class="rhead">' + avatarHtml(e, "big") + '<div><div class="name">' + esc(displayName(e)) + "</div>" +
+        (e.username ? '<div class="tag">@' + esc(e.username) + "</div>" : "") + "</div></div>" +
+      (e.text ? '<div class="cap">' + esc(e.text) + "</div>" : "") +
+      '<div class="photos">' + e.photos.map((p) =>
+        '<div class="shot"><img loading="lazy" src="' + esc(p) + '" alt="" data-zoom="' + esc(p) + '"></div>').join("") + "</div>" +
+      '<button class="pickBtn" data-pick="' + esc(e.id) + '"' + disabled + ">" + pickLabel(e.id) + "</button>";
+    feed.appendChild(card);
+  }
+}
+
+function syncPicks() {
+  for (const button of document.querySelectorAll("[data-pick]")) {
+    const id = button.dataset.pick;
+    button.textContent = pickLabel(id, button.classList.contains("pick"));
+    const card = button.closest("[data-entry]");
+    if (card) card.classList.toggle("on", picked.has(id));
+  }
+  renderBar();
+}
+
+function renderBar() {
+  const bar = $("bar");
+  bar.hidden = !poll || !poll.entries.length || !poll.open;
+  const n = picked.size;
+  const cap = poll && poll.max_choices;
+  $("count").innerHTML = "Выбрано<b>" + n + (cap ? " из " + cap : "") + "</b>";
+  $("send").disabled = n === 0;
+  $("send").textContent = n ? "Отправить голос" : "Выберите работы";
+}
+
+function showNotice(title, text, extraHtml) {
+  const box = $("notice");
+  box.hidden = false;
+  box.innerHTML = "<b>" + esc(title) + "</b>" + esc(text || "") + (extraHtml || "");
+}
+
+// --------------------------------------------------------------------- choosing
+function togglePick(id) {
+  if (!canPick()) return;
+  const cap = poll.max_choices;
+  if (picked.has(id)) picked.delete(id);
+  else if (cap === 1) picked = new Set([id]);      // one work: a tap moves the choice
+  else if (cap && picked.size >= cap) { toast("Можно выбрать не более " + cap); return; }
+  else picked.add(id);
+  if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
+  savePicks();
+  syncPicks();
+}
+
+// ------------------------------------------------------------------ sending it
+function chosenInOrder() { return poll.entries.filter((e) => picked.has(e.id)); }
+
+function openSend() {
+  const chosen = chosenInOrder();
+  if (!chosen.length) return;
+  const payload = ballotPayload(chosen.map((e) => e.id));
+  const bot = poll.bot;
+  const linkable = bot && payload.length <= LINK_LIMIT;
+  $("sendCount").textContent = "Ваш выбор: " + chosen.length + " " + plural(chosen.length, "работа", "работы", "работ");
+  $("chosen").innerHTML = chosen.map((e) =>
+    '<div class="row">' + (e.photos[0] ? '<img src="' + esc(e.photos[0]) + '" alt="">' : "") +
+    "<span>" + esc(displayName(e)) + "</span></div>").join("");
+  const link = $("sendLink");
+  link.hidden = !linkable;
+  link.href = linkable ? "https://t.me/" + encodeURIComponent(bot) + "?start=" + payload : "#";
+  $("sendHint").hidden = !linkable;
+  $("sendHint").textContent = "Откроется чат с ботом @" + bot + ". Нажмите «Запустить» (или «Start») — бот ответит, что голос учтён.";
+  $("copyTitle").textContent = linkable ? "Не открывается?" : "Как отправить";
+  $("copyHint").textContent = (linkable ? "" : (bot ? "Работ выбрано больше, чем помещается в ссылку. " : "")) +
+    "Скопируйте это сообщение и отправьте его боту" + (bot ? " @" + bot : " голосования") + ":";
+  $("copyText").textContent = "/start " + payload;
+  $("botLink").hidden = !bot;
+  $("botLink").href = bot ? "https://t.me/" + encodeURIComponent(bot) : "#";
+  $("sendModal").hidden = false;
+  openLayer("send");
+}
+
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return true; } catch (e) {}
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (e) {}
+  area.remove();
+  return ok;
+}
+
+$("send").addEventListener("click", openSend);
+$("sendBack").addEventListener("click", closeTop);
+$("sendModal").addEventListener("click", (event) => { if (event.target === $("sendModal")) closeTop(); });
+$("copyButton").addEventListener("click", async () => {
+  toast(await copyText($("copyText").textContent) ? "Скопировано — отправьте боту" : "Выделите текст и скопируйте вручную");
+});
+
+// ---------------------------------------------------------- close-up and zoom
+function openReel(id) {
+  const reel = $("reel");
+  reel.hidden = false;
+  openLayer("reel");
+  reel.scrollTop = 0;
+  const target = [...$("feed").children].find((card) => card.dataset.entry === id);
+  if (target) target.scrollIntoView({ block: "start" });
+}
+$("reelClose").addEventListener("click", closeTop);
+
+let lens = { scale: 1, fit: 1, x: 0, y: 0 };
+const pointers = new Map();
+let pinch = null;
+let tapTimer = null;
+function lensApply() {
+  const stage = $("lensStage"), img = $("lensImg");
+  const w = img.naturalWidth * lens.scale, h = img.naturalHeight * lens.scale;
+  const vw = stage.clientWidth, vh = stage.clientHeight;
+  lens.x = w <= vw ? (vw - w) / 2 : Math.min(0, Math.max(vw - w, lens.x));
+  lens.y = h <= vh ? (vh - h) / 2 : Math.min(0, Math.max(vh - h, lens.y));
+  img.style.transform = "translate(" + lens.x + "px," + lens.y + "px) scale(" + lens.scale + ")";
+}
+function lensFit() {
+  const stage = $("lensStage"), img = $("lensImg");
+  if (!img.naturalWidth) return;
+  lens.fit = Math.min(stage.clientWidth / img.naturalWidth, stage.clientHeight / img.naturalHeight);
+  lens.scale = lens.fit;
+  lensApply();
+}
+function lensZoomTo(scale, px, py) {
+  const next = Math.max(lens.fit, Math.min(lens.fit * 8, scale));
+  lens.x = px - (px - lens.x) * (next / lens.scale);
+  lens.y = py - (py - lens.y) * (next / lens.scale);
+  lens.scale = next;
+  lensApply();
+}
+function openLens(src) {
+  const img = $("lensImg");
+  $("lens").hidden = false;
+  img.style.transform = "";
+  img.src = src;
+  if (img.complete && img.naturalWidth) lensFit(); else img.addEventListener("load", lensFit, { once: true });
+  openLayer("lens");
+}
+const stage = $("lensStage");
+stage.addEventListener("pointerdown", (event) => {
+  stage.setPointerCapture(event.pointerId);
+  pointers.set(event.pointerId, { x: event.clientX, y: event.clientY, sx: event.clientX, sy: event.clientY, at: Date.now() });
+  if (pointers.size === 2) {
+    const [a, b] = [...pointers.values()];
+    pinch = { distance: Math.hypot(a.x - b.x, a.y - b.y) || 1, scale: lens.scale };
+  }
+});
+stage.addEventListener("pointermove", (event) => {
+  const p = pointers.get(event.pointerId);
+  if (!p) return;
+  const px = p.x, py = p.y;
+  p.x = event.clientX; p.y = event.clientY;
+  if (pointers.size >= 2 && pinch) {
+    const [a, b] = [...pointers.values()];
+    lensZoomTo(pinch.scale * ((Math.hypot(a.x - b.x, a.y - b.y) || 1) / pinch.distance), (a.x + b.x) / 2, (a.y + b.y) / 2);
+    return;
+  }
+  if (lens.scale > lens.fit * 1.001) { lens.x += p.x - px; lens.y += p.y - py; lensApply(); }
+});
+function pointerDone(event) {
+  const p = pointers.get(event.pointerId);
+  pointers.delete(event.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (!p || event.type !== "pointerup") return;
+  if (Math.hypot(p.x - p.sx, p.y - p.sy) > 10 || Date.now() - p.at > 600) return;
+  if (tapTimer) {
+    clearTimeout(tapTimer); tapTimer = null;
+    if (lens.scale > lens.fit * 1.05) lensFit(); else lensZoomTo(lens.fit * 3, p.x, p.y);
+    return;
+  }
+  tapTimer = setTimeout(() => { tapTimer = null; if (lens.scale <= lens.fit * 1.05) closeTop(); }, 260);
+}
+stage.addEventListener("pointerup", pointerDone);
+stage.addEventListener("pointercancel", pointerDone);
+stage.addEventListener("wheel", (event) => {
+  event.preventDefault();
+  lensZoomTo(lens.scale * (event.deltaY < 0 ? 1.15 : 1 / 1.15), event.clientX, event.clientY);
+}, { passive: false });
+window.addEventListener("resize", () => { if (!$("lens").hidden) lensFit(); });
+$("lensClose").addEventListener("click", closeTop);
+
+document.addEventListener("click", (event) => {
+  const zoom = event.target.closest("[data-zoom]");
+  if (zoom) { openLens(zoom.dataset.zoom); return; }
+  const open = event.target.closest("[data-open]");
+  if (open) { openReel(open.dataset.open); return; }
+  const pick = event.target.closest("[data-pick]");
+  if (pick && !pick.disabled) togglePick(pick.dataset.pick);
+});
+
+if (window.ResizeObserver) {
+  new ResizeObserver((entries) => {
+    const h = $("bar").hidden ? 0 : entries[0].contentRect.height + 20;
+    document.documentElement.style.setProperty("--barH", h + "px");
+    document.body.style.paddingBottom = (h + 20) + "px";
+  }).observe($("bar"));
+}
+
+(async function load() {
+  try {
+    const response = await fetch(PREFIX + "/api/public", { cache: "no-store" });
+    if (!response.ok) throw new Error("Сервер ответил " + response.status);
+    poll = await response.json();
+  } catch (e) {
+    $("steps").hidden = true;
+    showNotice("Не получилось загрузить работы", "Обновите страницу через минуту.");
+    return;
+  }
+  if (!poll.poll_id || !poll.entries.length) {
+    $("steps").hidden = true;
+    showNotice("Голосование ещё не началось", "Работы появятся здесь, как только их допустят к голосованию.");
+    return;
+  }
+  picked = poll.open ? loadPicks() : new Set();
+  if (!poll.open) {
+    $("steps").hidden = true;
+    const w = poll.winner;
+    showNotice("Голосование закрыто", "Спасибо всем, кто голосовал.",
+      w ? '<div class="winner" style="margin-top:12px">' +
+          (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
+          '<div><div class="hint">Победитель</div><b>' + esc(displayName(w)) + "</b></div></div>" : "");
+  }
+  renderFacts();
+  renderGrid();
+  renderReel();
+  renderBar();
 })();
 </script>
 </body>

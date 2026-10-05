@@ -4442,6 +4442,110 @@ def _vote_page_url(cfg) -> str | None:
     return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}" if cfg.webapp_public_url else None
 
 
+# The way round a Telegram that will not open the Mini App: a plain web page in the phone's
+# browser (vote_web.BROWSER_HTML) whose last step is a link back to this bot carrying the
+# choices. Put beside every v1 vote button, worded the way the owner asked for it.
+VOTE_BROWSER_BUTTON_TEXT = "Если Бот не работает"
+
+
+def _vote_browser_url(cfg) -> str | None:
+    if not cfg.webapp_public_url:
+        return None
+    return f"{cfg.webapp_public_url}{vote_web.ROUTE_PREFIX}{vote_web.BROWSER_PATH}"
+
+
+def _vote_browser_row(cfg) -> list[list[dict]]:
+    """The fallback button as a keyboard row of its own, or no row when there is no page
+    to send anybody to -- concatenated onto a keyboard either way."""
+    url = _vote_browser_url(cfg)
+    return [[{"text": VOTE_BROWSER_BUTTON_TEXT, "url": url}]] if url else []
+
+
+async def handle_vote_link_ballot(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str | None,
+    payload: str,
+    log=print,
+) -> None:
+    """A ballot cast from the browser page: "/start vote-<ids>" arriving in the DM, from
+    the page's link or pasted by hand. The sender's Telegram account is the voter -- the
+    identity the Mini App gets from signed initData, here from the message itself -- so it
+    is the same one ballot per person, and it REPLACES that person's ballot however they
+    cast the last one.
+
+    Every rule handle_ballot keeps is kept here, under the same voting.poll_lock: the poll
+    must be open, a locked ballot (allow_revote off) stays locked, and going over
+    max_choices is refused rather than trimmed. A choice that is no longer admitted (the
+    page was opened before moderation changed) is dropped and said so; a link with nothing
+    valid left in it records nothing, so it can never wipe a ballot already cast.
+    """
+    chat_id = message["chat"]["id"]
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            await api.send_message(chat_id, text, reply_to_message_id=message.get("message_id"),
+                                   parse_mode=None, reply_markup=reply_markup)
+        except Exception as e:
+            log(f"[bot_listener] failed to answer a link ballot: {e}")
+
+    choices = voting.decode_ballot_link(payload)
+    if not choices or not entry or user.get("id") is None:
+        await reply("Не понял ссылку голосования. Откройте страницу заново и выберите работы ещё раз.")
+        return
+
+    # A snapshot for the statistics and the invitation, exactly as the Mini App takes one --
+    # never a gate (see handle_ballot). A failed lookup counts as "not subscribed".
+    subscribed = False
+    try:
+        home_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        if home_chat_id is not None:
+            subscribed = await _is_chat_member(api, home_chat_id, user["id"])
+    except Exception as e:
+        log(f"[bot_listener] link ballot: membership check failed: {e}")
+
+    voter_id = str(user["id"])
+    async with voting.poll_lock:
+        poll = voting.latest_poll(entry)
+        if poll is None:
+            await reply("Голосование ещё не создано.")
+            return
+        if not poll.open:
+            await reply("Голосование уже закрыто -- голос не записан.")
+            return
+        admitted = set(poll.approved)
+        valid = [c for c in choices if c in admitted]
+        if not valid:
+            await reply("Этих работ больше нет в голосовании -- откройте страницу заново и выберите ещё раз.")
+            return
+        if not poll.allow_revote and poll.votes.get(voter_id):
+            await reply("Вы уже проголосовали, а менять голос в этом голосовании нельзя.")
+            return
+        if poll.max_choices and len(valid) > poll.max_choices:
+            await reply(f"Можно выбрать не более {poll.max_choices} -- голос не записан. Выберите заново.")
+            return
+        voting.record_vote(poll, user["id"], valid, subscriber=subscribed)
+        voting.save_poll(poll)
+        by_id = {e.entry_id: e for e in poll.entries}
+        chosen = [by_id[c] for c in valid]
+        allow_revote = poll.allow_revote
+    log(f"[bot_listener] link ballot from {user.get('username') or voter_id}: {len(valid)} choice(s)")
+
+    lines = ["Спасибо! Ваш голос учтён:"]
+    lines += [f"{index}. {voting.who(work)}" for index, work in enumerate(chosen, start=1)]
+    if len(valid) < len(choices):
+        lines += ["", f"Работ, которых уже нет в голосовании, пропущено: {len(choices) - len(valid)}."]
+    if allow_revote:
+        lines += ["", "Передумаете -- выберите заново на странице и отправьте ещё раз: новый голос заменит этот."]
+    markup = None
+    if not subscribed:
+        lines += ["", "Подпишитесь на канал, чтобы подтвердить голос: с нами уже 500 художников по миниатюрам."]
+        markup = {"inline_keyboard": [[{"text": "Подписаться", "url": vote_web.SUBSCRIBE_URL}]]}
+    await reply("\n".join(lines), reply_markup=markup)
+
+
 def _vote_group_button_url(cfg, bot_username: str | None) -> str | None:
     """What the vote button links to in a message that lands in a GROUP. A web_app button
     is private-chat only -- Telegram rejects one posted to a group outright -- so a group
@@ -6158,9 +6262,12 @@ async def handle_vote_command(
                         {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
                         {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
                     ],
-                    # Both read the previous and the current week (VOTE_COLLECT_WEEKS); they
-                    # differ in whether the scan stops at the newest work already collected
-                    # (see VOTE_ADD_NEW_WORDS).
+                    # Here too, so an administrator can see exactly what a voter is sent
+                    # and pass the page on to anybody whose Telegram will not open it.
+                    *_vote_browser_row(cfg),
+                    # "Собрать все заявки" asks for the days first (the date picker);
+                    # "Добавить новые" reads the fixed two-week window and stops at the
+                    # newest work already collected (see VOTE_ADD_NEW_WORDS).
                     [
                         {
                             "text": "🔄 Собрать все заявки",
@@ -6203,9 +6310,20 @@ async def handle_vote_command(
                 ]},
             )
         else:
+            # The page's address is in the text as well as behind the button: when the
+            # Mini App will not open, Telegram's own in-app browser is often the next thing
+            # that fails, and a link that can be long-pressed and copied into a real
+            # browser is the way out of both.
+            browser_url = _vote_browser_url(cfg)
             await reply(
-                "Голосование за итоги недели:",
-                reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}]]},
+                "Голосование за итоги недели:" + (
+                    f"\n\nЕсли кнопка не открывается -- проголосуйте в браузере: {browser_url}"
+                    if browser_url else ""
+                ),
+                reply_markup={"inline_keyboard": [
+                    [{"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}}],
+                    *_vote_browser_row(cfg),
+                ]},
             )
         return
 
@@ -6223,7 +6341,10 @@ async def handle_vote_command(
     await reply(
         "Голосование за итоги недели:" if cfg.vote_miniapp_short_name
         else "Голосование за итоги недели -- открывается в личке с ботом:",
-        reply_markup={"inline_keyboard": [[{"text": VOTE_OPEN_BUTTON_TEXT, "url": group_url}]]},
+        reply_markup={"inline_keyboard": [
+            [{"text": VOTE_OPEN_BUTTON_TEXT, "url": group_url}],
+            *_vote_browser_row(cfg),
+        ]},
     )
     # background_tasks is now unused in this function, but stays a required parameter --
     # callers (handle_vote_action_callback, _dispatch_update) pass it positionally.
@@ -6412,7 +6533,11 @@ async def handle_vote_chat_destination_callback(
     if button is None:
         await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
         return
-    keyboard = {"inline_keyboard": [[button]]}
+    # v1's announcement also carries the browser page, for whoever's Telegram will not
+    # open the vote; the arena has no such page, so its post keeps its one button.
+    keyboard = {"inline_keyboard": [[button]] + (
+        _vote_browser_row(cfg) if (flow.get("system") or "vote") == "vote" else []
+    )}
 
     targets: list[tuple[str, object]] = []
     if destination in ("main", "both"):
@@ -10408,6 +10533,14 @@ async def _dispatch_update(
                 background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
             return
+        # A ballot from the browser page ("vote-<ids>"; the exact payloads below never
+        # carry a dash, so nothing else can be mistaken for one).
+        if start_payload.startswith(voting.BALLOT_LINK_PREFIX):
+            await handle_vote_link_ballot(
+                api, telethon_client, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), start_payload, log=log,
+            )
+            return
         if start_payload == "vote3":
             await handle_nominations_command(
                 api, telethon_client, cfg, tz, message,
@@ -11836,7 +11969,7 @@ async def run_bot_listener(
                     announce=_announce_vote_winner, log=log, is_member=_is_vote_member,
                     is_stats_admin=_is_vote_stats_admin,
                     export=_deliver_vote_board, avatar=_fetch_vote_avatar,
-                    attach=_attach_extra,
+                    attach=_attach_extra, bot_username=bot_username,
                 )
             )
         else:
