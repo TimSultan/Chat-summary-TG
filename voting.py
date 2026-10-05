@@ -154,9 +154,15 @@ async def collect_entries(
     stop_at_known: bool = True,
     progress=None,
     log=print,
+    since: datetime | None = None,
+    until: datetime | None = None,
 ) -> list[Entry]:
     """Reads the last `weeks` CONTEST WEEKS of `chat_ref` and returns one Entry per NEWLY
     found nominated post, downloading every attached photo into `media_dir`.
+
+    `since`/`until` (timezone-aware, `until` exclusive) replace the week window with dates
+    an administrator picked: the scan then starts at `until` rather than at the newest
+    message, and stops at `since`. See bot_listener's date picker for "/vote собрать".
 
     `weeks` counts calendar weeks ending with the one in progress: 1 is Monday 00:00 local
     through now, 2 reaches back to the Monday before that. /vote collects two -- the vote
@@ -198,11 +204,20 @@ async def collect_entries(
     entity = chat_ref if not isinstance(chat_ref, str) else await resolve_chat(client, chat_ref)
 
     now_local = datetime.now(tz)
-    # Shift "now" back whole weeks and take THAT week's Monday, rather than subtracting
-    # days from the current Monday -- the two agree, and this one keeps working when the
-    # shift crosses a DST change or a year boundary.
-    start_local = contest_week_start(now_local - timedelta(weeks=max(1, weeks) - 1))
+    if since is not None:
+        start_local = since
+    else:
+        # Shift "now" back whole weeks and take THAT week's Monday, rather than subtracting
+        # days from the current Monday -- the two agree, and this one keeps working when
+        # the shift crosses a DST change or a year boundary.
+        start_local = contest_week_start(now_local - timedelta(weeks=max(1, weeks) - 1))
     start_utc = start_local.astimezone(timezone.utc)
+    until_utc = until.astimezone(timezone.utc) if until is not None else None
+    # Telegram lists newest first, so a range that ends in the past starts the listing at
+    # its end (offset_date) instead of reading everything posted since only to discard it.
+    listing = {"reverse": False}
+    if until_utc is not None:
+        listing["offset_date"] = until_utc
 
     async def report(stage: str, done: int, total: int) -> None:
         """Tell the caller how far along this is, without letting that stop the scan.
@@ -221,7 +236,7 @@ async def collect_entries(
     stopped_at_known = False
     scanned = 0
     await report("scan", 0, 0)
-    async for message in client.iter_messages(entity, reverse=False):
+    async for message in client.iter_messages(entity, **listing):
         scanned += 1
         # Counted on every message read, not on every message kept: two weeks of a busy
         # chat is thousands of messages, most of them not nominations, and progress that
@@ -231,6 +246,8 @@ async def collect_entries(
             await report("scan", scanned, 0)
         if message.date < start_utc:
             break
+        if until_utc is not None and message.date >= until_utc:
+            continue  # offset_date already skips these; this holds even where it doesn't
         if message.action is not None:
             continue  # service message (join/leave/pin)
         messages.append(message)
@@ -249,7 +266,7 @@ async def collect_entries(
             break
 
     groups = group_into_entries(messages, hashtag)
-    window = f"since {start_local.date()}"
+    window = f"since {start_local.date()}" + (f" until {until.date()}" if until is not None else "")
     log(
         f"[voting] {len(messages)} message(s) of {scanned} read "
         f"{'back to the first already-collected work' if stopped_at_known else window}"
@@ -707,6 +724,20 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
     # not silently un-crop the dozen that were already framed.
     poll.crops = {k: dict(v) for k, v in existing.crops.items() if k in known}
     return poll
+
+
+def posted_within(entry: Entry, since: datetime, until: datetime) -> bool:
+    """Whether `entry` was posted in [since, until) -- the dates a collect was given.
+
+    A work whose posting time cannot be read is counted as inside: a collect that narrows
+    the window removes what it can SHOW lies outside it, and never a work on a guess."""
+    try:
+        posted = datetime.fromisoformat(entry.posted_at)
+    except (TypeError, ValueError):
+        return True
+    if posted.tzinfo is None:
+        return True
+    return since <= posted < until
 
 
 # Works are not carried over from another poll. A poll contains exactly what the chat

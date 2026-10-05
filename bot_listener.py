@@ -36,8 +36,8 @@ for rollback/comparison -- see intent_v2.py's module docstring.
 page served by this same process, alongside the long-poll loop, whenever WEBAPP_PUBLIC_URL
 and PORT are set (see run_bot_listener). Bare "/vote" is the plain ballot for everyone,
 including an admin (also a status/control panel for one); "/vote выбрать" (DM, admin-only)
-is the separate moderation screen; "/vote собрать" (DM, admin-only) (re-)scans the
-previous and the current week's #итогинедели posts into the poll;
+is the separate moderation screen; "/vote собрать" (DM, admin-only) asks for the days in
+a calendar and (re-)scans that span's #итогинедели posts into the poll;
 "/vote очистить" (DM, admin-only, tap-to-confirm)
 deletes it outright; "/vote chat" (DM, admin-only) drafts an announcement and posts it to
 the chats the admin picks; "/vote картинка" (DM, admin-only) renders the standings as one
@@ -61,7 +61,8 @@ import tempfile
 import time
 import traceback
 import uuid
-from datetime import datetime, timedelta, timezone
+import calendar
+from datetime import date, datetime, time as day_time, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
@@ -447,7 +448,8 @@ VOTE_COMMANDS = ("/vote", "/голосование")
 # voting.collect_entries' stop_at_known). Neither re-downloads a work already collected.
 VOTE_COLLECT_WORDS = frozenset({"собрать", "собрать все", "collect", "collect all"})
 VOTE_ADD_NEW_WORDS = frozenset({"добавить", "добавить новые", "новые", "обновить", "refresh", "add", "new"})
-# How many calendar weeks "/vote собрать" reads, ending with the week in progress. Two,
+# How many calendar weeks "/vote добавить" reads, ending with the week in progress (and
+# what "/vote собрать" read before it asked for dates -- its "Прошлая и эта" period). Two,
 # because the vote is run around the turn of the week: on a Monday the works are all in
 # the week just ended, on a Sunday in the week still running, and a work posted late on
 # Sunday or early on Monday belongs to whichever vote is being put together. One window
@@ -455,6 +457,16 @@ VOTE_ADD_NEW_WORDS = frozenset({"добавить", "добавить новые
 # having to know which week to ask for. Everything collected arrives pending (see
 # voting.Poll.approved), so the wider window can never put a work in front of voters.
 VOTE_COLLECT_WEEKS = 2
+# "Собрать все заявки" asks WHICH DAYS first: a calendar in the DM (from, then till, or a
+# ready-made period), then a confirmation naming the dates and whatever already-collected
+# work falls outside them -- and the poll then holds exactly the works posted in those
+# days. Every button carries the dates picked so far, so the picker holds no server state
+# and survives a restart. "/vote собрать 28.09 05.10" typed out skips the calendar.
+VOTE_DATE_CALLBACK_PREFIX = "votedate"
+# The longest span the picker will collect. A collect downloads every nomination's photos,
+# and one mis-tapped month a year back would be minutes of scanning and hundreds of
+# downloads; a contest is a week or two.
+VOTE_COLLECT_MAX_DAYS = 31
 # Opens the moderation screen (admit toggles, live counts, closing the vote) explicitly,
 # as opposed to bare "/vote" -- which now always opens the plain ballot, even for an
 # administrator, so admitting entries never blocks an admin from casting their own vote.
@@ -4565,6 +4577,297 @@ async def handle_vote_clear_callback(
         log(f"[bot_listener] failed to confirm the vote clear: {e}")
 
 
+# ------------------------------------------------- "/vote собрать": the date picker
+
+_RU_MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август",
+              "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
+_RU_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+_VOTE_DATE_TOKEN = re.compile(
+    r"(?P<iy>\d{4})-(?P<im>\d{1,2})-(?P<id>\d{1,2})"
+    r"|(?P<d>\d{1,2})\.(?P<m>\d{1,2})(?:\.(?P<y>\d{2,4}))?"
+)
+
+
+def _ru_days(count: int) -> str:
+    tail_two, tail_one = count % 100, count % 10
+    if 11 <= tail_two <= 14 or tail_one == 0 or tail_one >= 5:
+        return f"{count} дней"
+    return f"{count} день" if tail_one == 1 else f"{count} дня"
+
+
+def _vote_day(day: date, today: date | None = None) -> str:
+    """28.09 -- with the year only when it is not this one."""
+    if today is not None and day.year != today.year:
+        return day.strftime("%d.%m.%Y")
+    return day.strftime("%d.%m")
+
+
+def _vote_range_label(since: date, till: date, today: date | None = None) -> str:
+    return f"с {_vote_day(since, today)} по {_vote_day(till, today)}"
+
+
+def _vote_range_bounds(since: date, till: date, tz) -> tuple[datetime, datetime]:
+    """[since 00:00, the day after `till` 00:00) in the chat's timezone: `till` is
+    inclusive the way a person means "по 5 октября"."""
+    zone = tz or datetime.now().astimezone().tzinfo
+    start = datetime.combine(since, day_time(), tzinfo=zone)
+    end = datetime.combine(till + timedelta(days=1), day_time(), tzinfo=zone)
+    return start, end
+
+
+def _vote_range_problem(since: date, till: date, today: date) -> str | None:
+    """Why this range cannot be collected, or None if it can."""
+    if since > till:
+        return "Дата начала позже даты конца."
+    if till > today:
+        return "Этот день ещё не наступил."
+    if (till - since).days + 1 > VOTE_COLLECT_MAX_DAYS:
+        return f"Слишком длинный период: можно не больше {_ru_days(VOTE_COLLECT_MAX_DAYS)}."
+    return None
+
+
+def _parse_vote_collect_range(text: str, today: date) -> tuple[date, date] | str:
+    """The dates typed after "/vote собрать": one or two of 28.09, 28.09.2026 or
+    2026-09-28, in any separator. One date means "from then until today". Returns the
+    range, or a sentence saying what is wrong with it.
+
+    A day typed without a year is the most recent one that is not in the future, so
+    "28.12" typed in January means the December just gone."""
+    tokens = list(_VOTE_DATE_TOKEN.finditer(text or ""))
+    if not tokens or len(tokens) > 2:
+        return "Не понял даты."
+    days = []
+    try:
+        for token in tokens:
+            if token.group("iy"):
+                days.append(date(int(token.group("iy")), int(token.group("im")), int(token.group("id"))))
+                continue
+            year = token.group("y")
+            if year:
+                days.append(date(int(year) + (2000 if len(year) == 2 else 0), int(token.group("m")), int(token.group("d"))))
+                continue
+            day = date(today.year, int(token.group("m")), int(token.group("d")))
+            days.append(day if day <= today else day.replace(year=today.year - 1))
+    except ValueError:
+        return "Такой даты нет."
+    since, till = days[0], (days[1] if len(days) > 1 else today)
+    return _vote_range_problem(since, till, today) or (since, till)
+
+
+def _vote_date_callback_data(action: str, user_id, first: str = "-", second: str = "-") -> str:
+    return f"{VOTE_DATE_CALLBACK_PREFIX}:{action}:{first}:{second}:{user_id}"
+
+
+def _parse_vote_date_callback(data: str) -> tuple[str, str, str, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 5 or parts[0] != VOTE_DATE_CALLBACK_PREFIX:
+        return None
+    try:
+        return parts[1], parts[2], parts[3], int(parts[4])
+    except ValueError:
+        return None
+
+
+def _vote_calendar_rows(month: date, user_id, lowest: date, highest: date,
+                        pick, navigate, marked: date | None = None) -> list[list[dict]]:
+    """One month as inline buttons: ‹ Месяц ›, the weekday names, then the days.
+
+    A day outside [lowest, highest] is a "·" that does nothing rather than a gap, so the
+    grid keeps its shape and nobody wonders why a date is missing. `pick(day)` and
+    `navigate(month)` build the callback data for a chosen day and for another month.
+    """
+    noop = _vote_date_callback_data("noop", user_id)
+    first = month.replace(day=1)
+    previous = (first - timedelta(days=1)).replace(day=1)
+    following = (first + timedelta(days=32)).replace(day=1)
+    rows = [[
+        {"text": "‹", "callback_data": navigate(previous)} if previous >= lowest.replace(day=1)
+        else {"text": " ", "callback_data": noop},
+        {"text": f"{_RU_MONTHS[first.month - 1]} {first.year}", "callback_data": noop},
+        {"text": "›", "callback_data": navigate(following)} if following <= highest
+        else {"text": " ", "callback_data": noop},
+    ]]
+    rows.append([{"text": name, "callback_data": noop} for name in _RU_WEEKDAYS])
+    for week in calendar.monthcalendar(first.year, first.month):
+        row = []
+        for number in week:
+            if not number:
+                row.append({"text": " ", "callback_data": noop})
+                continue
+            day = first.replace(day=number)
+            if not lowest <= day <= highest:
+                row.append({"text": "·", "callback_data": noop})
+            else:
+                row.append({"text": f"[{number}]" if day == marked else str(number),
+                            "callback_data": pick(day)})
+        rows.append(row)
+    return rows
+
+
+def _vote_date_picker(today: date, user_id, month: date | None = None,
+                      since: date | None = None, problem: str | None = None) -> tuple[str, dict]:
+    """The picker's screen: step 1 (no `since` yet) asks for the first day and offers
+    ready-made periods; step 2 asks for the last day, from `since` onward."""
+    cancel = [{"text": "✖️ Отмена", "callback_data": _vote_date_callback_data("x", user_id)}]
+    intro = (f"{problem}\n\n" if problem else "") + "Собрать заявки с #итогинедели заново.\n\n"
+    if since is None:
+        earliest = today - timedelta(days=365)
+        # Opens on the month of a week ago: the first day is usually last week's Monday,
+        # and early in a month that is in the month before -- one page back otherwise.
+        rows = _vote_calendar_rows(
+            month or (today - timedelta(days=7)), user_id, earliest, today,
+            pick=lambda day: _vote_date_callback_data("f", user_id, day.strftime("%Y%m%d")),
+            navigate=lambda m: _vote_date_callback_data("fm", user_id, m.strftime("%Y%m")),
+        )
+        monday = today - timedelta(days=today.weekday())
+
+        def preset(label: str, start: date) -> dict:
+            return {"text": label, "callback_data": _vote_date_callback_data(
+                "t", user_id, start.strftime("%Y%m%d"), today.strftime("%Y%m%d"))}
+
+        rows.append([preset("Эта неделя", monday), preset("Прошлая и эта", monday - timedelta(days=7))])
+        rows.append([preset("7 дней", today - timedelta(days=6)), preset("14 дней", today - timedelta(days=13))])
+        rows.append(cancel)
+        return (intro + "Шаг 1 из 2: с какого дня? Или выбери готовый период внизу.",
+                {"inline_keyboard": rows})
+
+    latest = min(today, since + timedelta(days=VOTE_COLLECT_MAX_DAYS - 1))
+    stamp = since.strftime("%Y%m%d")
+    rows = _vote_calendar_rows(
+        month or latest, user_id, since, latest,
+        pick=lambda day: _vote_date_callback_data("t", user_id, stamp, day.strftime("%Y%m%d")),
+        navigate=lambda m: _vote_date_callback_data("tm", user_id, stamp, m.strftime("%Y%m")),
+        marked=since,
+    )
+    if latest == today:
+        rows.append([{"text": f"По сегодня ({_vote_day(today)})", "callback_data": _vote_date_callback_data(
+            "t", user_id, stamp, today.strftime("%Y%m%d"))}])
+    rows.append([{"text": "‹ Другая дата начала", "callback_data": _vote_date_callback_data("back", user_id)}] + cancel)
+    return (intro + f"С {_vote_day(since, today)}.\nШаг 2 из 2: по какой день включительно?",
+            {"inline_keyboard": rows})
+
+
+def _vote_collect_confirmation(entry: str, tz, since: date, till: date, today: date,
+                               user_id) -> tuple[str, dict]:
+    """The last screen before the collect: the dates in words, and -- because the poll
+    will hold exactly those days' works -- how many already-collected works fall outside
+    them and will leave the vote, admitted ones and voted-for ones counted separately.
+    Reads the poll the collect writes to, and changes nothing."""
+    poll = voting.load_poll(entry, _current_vote_poll_id(tz))
+    start, end = _vote_range_bounds(since, till, tz)
+    outside = [e for e in poll.entries if not voting.posted_within(e, start, end)] if poll else []
+    lines = [
+        f"Собрать заявки {_vote_range_label(since, till, today)} ({_ru_days((till - since).days + 1)})?",
+        "",
+        "В голосование попадут работы с #итогинедели, опубликованные в эти дни. Уже "
+        "собранные работы из этих дней останутся со своими допусками и голосами и заново "
+        "не скачиваются.",
+    ]
+    if outside:
+        admitted = set(poll.approved)
+        voted_for = {choice for choices in poll.votes.values() for choice in choices}
+        admitted_outside = sum(1 for e in outside if e.entry_id in admitted)
+        voted_outside = sum(1 for e in outside if e.entry_id in voted_for)
+        details = []
+        if admitted_outside:
+            details.append(f"допущено {admitted_outside}")
+        if voted_outside:
+            details.append(f"с голосами {voted_outside}")
+        lines += ["", f"Внимание: уже собранных работ вне этих дат — {len(outside)}"
+                      + (f" ({', '.join(details)})" if details else "")
+                      + ". Они уйдут из голосования."]
+    span = (since.strftime("%Y%m%d"), till.strftime("%Y%m%d"))
+    return "\n".join(lines), {"inline_keyboard": [
+        [{"text": "✅ Собрать", "callback_data": _vote_date_callback_data("go", user_id, *span)}],
+        [{"text": "✏️ Другие даты", "callback_data": _vote_date_callback_data("back", user_id)},
+         {"text": "✖️ Отмена", "callback_data": _vote_date_callback_data("x", user_id)}],
+    ]}
+
+
+async def handle_vote_date_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    vote_chat_flows: dict[str, dict] | None = None,
+    log=print,
+) -> None:
+    """Every tap on the "/vote собрать" date picker. Navigation edits the picker message
+    in place; "Собрать" replays "/vote собрать <from> <till>" through handle_vote_command,
+    so the admin/DM gate and the collect itself live in one place -- the same trick the
+    status panel's buttons use. Bound to the administrator who asked, like those."""
+    parsed = _parse_vote_date_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, first, second, target_user_id = parsed
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    # Answered before anything that reads a file or talks to Telegram again.
+    await api.answer_callback_query(callback["id"])
+    if action == "noop":
+        return
+
+    trigger = callback.get("message") or {}
+    chat = trigger.get("chat") or {}
+    today = datetime.now(tz).date()
+
+    async def show(text: str, markup: dict | None) -> None:
+        try:
+            await api.edit_message_text(chat.get("id"), trigger.get("message_id"), text,
+                                        reply_markup=markup or {"inline_keyboard": []})
+        except Exception as e:
+            log(f"[bot_listener] could not redraw the vote date picker: {e}")
+
+    def day(stamp: str) -> date:
+        return datetime.strptime(stamp, "%Y%m%d").date()
+
+    try:
+        if action == "x":
+            await show("Сбор заявок отменён -- ничего не изменилось.", None)
+        elif action in ("back", "fm"):
+            month = datetime.strptime(first, "%Y%m").date() if action == "fm" else None
+            await show(*_vote_date_picker(today, target_user_id, month=month))
+        elif action == "f":
+            await show(*_vote_date_picker(today, target_user_id, since=day(first)))
+        elif action == "tm":
+            await show(*_vote_date_picker(today, target_user_id, since=day(first),
+                                          month=datetime.strptime(second, "%Y%m").date()))
+        elif action in ("t", "go"):
+            since, till = day(first), day(second)
+            problem = _vote_range_problem(since, till, today)
+            if problem:
+                await show(*_vote_date_picker(today, target_user_id, problem=problem))
+            elif action == "t":
+                await show(*await asyncio.to_thread(
+                    _vote_collect_confirmation, entry or "", tz, since, till, today, target_user_id,
+                ))
+            else:
+                # The buttons go first, so a second tap has nothing left to press.
+                await show(f"Собираю заявки {_vote_range_label(since, till, today)} -- прогресс ниже.", None)
+                synthetic_message = {
+                    "message_id": trigger.get("message_id"),
+                    "chat": {"id": chat.get("id"), "type": chat.get("type") or "private"},
+                    "from": clicker,
+                    "text": f"/vote собрать {since.isoformat()} {till.isoformat()}",
+                }
+                task = asyncio.create_task(handle_vote_command(
+                    api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
+                    background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+                ))
+                background_tasks.add(task)
+                task.add_done_callback(background_tasks.discard)
+    except ValueError:
+        # A hand-made or mangled button: start the picker over rather than guess.
+        await show(*_vote_date_picker(today, target_user_id, problem="Не понял дату."))
+
+
 # One collection per chat per system at a time. Scanning a whole contest week and
 # downloading every nominated photo takes minutes, and the bot says "собираю" and then
 # nothing -- so the button gets pressed again. Without this that second press starts a
@@ -5482,12 +5785,14 @@ async def handle_vote_command(
     """Six distinct things live behind /vote, deliberately kept apart rather than one
     page that changes shape depending who opens it:
 
-    - "/vote собрать" (DM, admin-only) adds newly posted #итогинедели entries to the
-      list -- already-known ones are left alone, not re-fetched or re-processed. It reads
-      the previous and the current contest week together (VOTE_COLLECT_WEEKS) into the
-      current week's poll, and makes that poll the one the page opens; everything found
-      waits in moderation until an administrator admits it. "/vote добавить" is the quick
-      variant that stops at the newest work already collected (VOTE_ADD_NEW_WORDS).
+    - "/vote собрать" (DM, admin-only) first asks WHICH DAYS, in a calendar (see
+      _vote_date_picker), then collects exactly that span's #итогинедели posts into the
+      current week's poll and makes it the one the page opens. Works already collected
+      inside the span are left alone, not re-fetched; ones outside it leave the poll, as
+      the confirmation step said they would. Everything found waits in moderation until
+      an administrator admits it. "/vote собрать 28.09 05.10" skips the calendar.
+      "/vote добавить" is the quick variant: the fixed two-week window
+      (VOTE_COLLECT_WEEKS), stopping at the newest work already collected.
     - "/vote выбрать" (DM, admin-only) opens the moderation screen -- admit toggles, live
       counts, ballot settings, and closing the vote.
     - "/vote очистить" (DM, admin-only, tap-to-confirm) deletes the current poll outright.
@@ -5544,6 +5849,7 @@ async def handle_vote_command(
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
     collect_only_new = False
+    collect_dates = None
     image_columns = vote_image.COLUMNS
     if forced_mode == "moderate":
         wants_moderate = True
@@ -5561,7 +5867,15 @@ async def handle_vote_command(
                 break
         normalized = " ".join(argument.lower().split())
         collect_only_new = normalized in VOTE_ADD_NEW_WORDS
-        wants_collect = collect_only_new or normalized in VOTE_COLLECT_WORDS
+        # "собрать" may carry the dates on the end ("собрать 28.09 05.10"); whatever
+        # follows the word is kept for the collect branch to read.
+        collect_dates = next(
+            (normalized[len(word):].strip()
+             for word in sorted(VOTE_COLLECT_WORDS, key=len, reverse=True)
+             if normalized == word or normalized.startswith(word + " ")),
+            None,
+        )
+        wants_collect = collect_only_new or collect_dates is not None
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
@@ -5600,6 +5914,23 @@ async def handle_vote_command(
         if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
 
+        # "Собрать все заявки" is always for days somebody chose. Without dates on the
+        # end it opens the picker and collects nothing yet; the picker's "Собрать" comes
+        # back here with them. "Добавить новые" keeps its fixed window (see below).
+        collect_range = None
+        if not collect_only_new:
+            today = datetime.now(tz).date()
+            if not collect_dates:
+                await reply(*_vote_date_picker(today, user.get("id")))
+                return
+            collect_range = _parse_vote_collect_range(collect_dates, today)
+            if isinstance(collect_range, str):
+                await reply(
+                    f"{collect_range} Напиши даты так: /vote собрать 28.09 05.10 -- или просто "
+                    "/vote собрать, чтобы выбрать их в календаре."
+                )
+                return
+
         lock_key = ("vote", entry)
         if lock_key in _VOTE_COLLECTIONS_IN_PROGRESS:
             await reply(
@@ -5608,16 +5939,22 @@ async def handle_vote_command(
             )
             return
 
-        week_label = "за прошлую и эту неделю"
+        if collect_range:
+            since_day, till_day = collect_range
+            window_start, window_end = _vote_range_bounds(since_day, till_day, tz)
+            week_label = _vote_range_label(since_day, till_day, today)
+            window = {"since": window_start, "until": window_end, "stop_at_known": False}
+        else:
+            week_label = "за прошлую и эту неделю"
+            window = {"weeks": VOTE_COLLECT_WEEKS, "stop_at_known": True}
         status = await reply(
             (
                 f"Добавляю новые заявки с #итогинедели {week_label}: читаю чат до последней "
                 "уже собранной работы. Если не хватает работ за прошлую неделю -- нажми "
                 "«Собрать все заявки»."
             ) if collect_only_new else (
-                f"Собираю все заявки с #итогинедели {week_label} (с понедельника прошлой "
-                "недели). Уже собранные не скачиваю заново. Это может занять несколько "
-                "минут -- буду показывать прогресс здесь."
+                f"Собираю все заявки с #итогинедели {week_label}. Уже собранные не скачиваю "
+                "заново. Это может занять несколько минут -- буду показывать прогресс здесь."
             )
         )
         poll_id = _current_vote_poll_id(tz)
@@ -5635,12 +5972,11 @@ async def handle_vote_command(
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
                 skip_entry_ids=known_ids,
-                weeks=VOTE_COLLECT_WEEKS,
-                stop_at_known=collect_only_new,
                 progress=_vote_progress_reporter(
                     api, chat_id, (status or {}).get("message_id"), week_label, log=log,
                 ),
                 log=log,
+                **window,
             )
         except Exception:
             log(f"[bot_listener] collecting vote entries failed:\n{traceback.format_exc()}")
@@ -5653,7 +5989,16 @@ async def handle_vote_command(
         # only ever resolves and returns what's new (see its docstring). Concatenating
         # rather than replacing is what makes build_poll's "known" set include them, so
         # their admitted/vote state survives untouched.
-        all_entries = (existing_poll.entries if existing_poll else []) + new_entries
+        kept = existing_poll.entries if existing_poll else []
+        # Collected for chosen days, the poll holds exactly those days' works: one already
+        # collected that was posted outside them leaves, with its admission and votes
+        # (build_poll drops what is no longer an entry). The picker's confirmation said
+        # how many before this ran.
+        dropped = []
+        if collect_range:
+            dropped = [e for e in kept if not voting.posted_within(e, window_start, window_end)]
+            kept = [e for e in kept if voting.posted_within(e, window_start, window_end)]
+        all_entries = kept + new_entries
         poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
         # The poll just collected is the one being worked on, so it becomes what the page
         # and the status message open -- otherwise an older unmoderated poll still on disk
@@ -5663,14 +6008,19 @@ async def handle_vote_command(
         if all_entries:
             voting.make_current(poll)
         voting.save_poll(poll)
-        log(f"[bot_listener] vote poll {poll_id}: {len(all_entries)} entries ({len(new_entries)} new), {len(poll.approved)} admitted")
+        log(
+            f"[bot_listener] vote poll {poll_id} ({week_label}): {len(all_entries)} entries "
+            f"({len(new_entries)} new, {len(dropped)} outside the dates removed), "
+            f"{len(poll.approved)} admitted"
+        )
+        removed = f" Убрано работ вне этих дат: {len(dropped)}." if dropped else ""
         if not all_entries:
-            await reply(f"{week_label.capitalize()} постов с #итогинедели не нашлось.")
+            await reply(f"{week_label.capitalize()} постов с #итогинедели не нашлось.{removed}")
             return
         summary = (
             f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
             else f"Новых заявок нет (всего {len(all_entries)})."
-        )
+        ) + removed
         # Collecting a week does not necessarily hand it the page: a vote already running
         # in another week keeps it (voting.latest_poll). Said outright, because otherwise
         # the admin opens модерация, sees a different week, and concludes the collect
@@ -9920,6 +10270,11 @@ async def _dispatch_update(
             await handle_nominations_action_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, log=log,
+            )
+        elif callback_data.startswith(f"{VOTE_DATE_CALLBACK_PREFIX}:"):
+            await handle_vote_date_callback(
+                api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
+                background_tasks, vote_chat_flows, log=log,
             )
         elif callback_data.startswith(f"{VOTE_ACTION_CALLBACK_PREFIX}:"):
             await handle_vote_action_callback(

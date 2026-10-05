@@ -15,6 +15,7 @@ import asyncio
 import sys
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -34,6 +35,19 @@ def _fake_poll_id(tz):
     """Stands in for bot_listener._current_vote_poll_id so the tests don't depend on which
     ISO week they happen to run in."""
     return THIS_WEEK
+
+
+def _range():
+    """The last two weeks, ending today -- a range the date picker would hand over.
+    Relative to the day the suite runs, because a collect refuses days not yet come."""
+    today = date.today()
+    return today - timedelta(days=13), today
+
+
+def _range_text():
+    """What the picker's "Собрать" replays: the command with both dates on the end."""
+    since, till = _range()
+    return f"/vote собрать {since.isoformat()} {till.isoformat()}"
 
 
 def _entry(entry_id, name=None, media=("a.jpg",)):
@@ -79,7 +93,9 @@ class CollectWindowTests(unittest.TestCase):
         for index in range(5):
             (media / f"{index}.jpg").write_bytes(b"jpeg-ish")
 
-    def _collect(self, new_entries=(), text="/vote собрать", poll_id=THIS_WEEK):
+    def _collect(self, new_entries=(), text=None, poll_id=THIS_WEEK):
+        text = text or _range_text()
+
         async def collect_entries(**kwargs):
             self.collect_kwargs = kwargs
             return list(new_entries)
@@ -136,7 +152,8 @@ class CollectWindowTests(unittest.TestCase):
 
         self.assertEqual([e.entry_id for e in poll.entries], ["90", "91"])
         self.assertEqual(poll.approved, [])  # every work still needs a human
-        self.assertIn("за прошлую и эту неделю", " ".join(self.api.sent))
+        since, till = _range()
+        self.assertIn(f"с {since:%d.%m} по {till:%d.%m}", " ".join(self.api.sent))
 
     def test_the_scan_is_told_only_about_works_already_in_this_weeks_poll(self):
         self._collect(new_entries=[_entry("90")])
@@ -156,20 +173,24 @@ class CollectWindowTests(unittest.TestCase):
         self.assertEqual(again.approved, ["90"])
         self.assertEqual([e.entry_id for e in again.entries], ["90", "91"])
 
-    def test_collect_reads_the_previous_and_the_current_week_in_one_pass(self):
-        """On a Monday the works are in the week just ended, on a Sunday in the week still
-        running; one collection over both finds them whichever day it is pressed."""
+    def test_collect_reads_exactly_the_days_it_was_given(self):
+        """From the first day's midnight up to the midnight AFTER the last day: "по 5
+        октября" includes the 5th."""
+        since, till = _range()
         self._collect()
 
-        self.assertEqual(self.collect_kwargs["weeks"], 2)
-        self.assertNotIn("weeks_ago", self.collect_kwargs)
+        start, end = self.collect_kwargs["since"], self.collect_kwargs["until"]
+        self.assertEqual((start.date(), start.hour, start.minute), (since, 0, 0))
+        self.assertEqual((end.date(), end.hour, end.minute), (till + timedelta(days=1), 0, 0))
+        self.assertIsNotNone(start.tzinfo)
+        self.assertNotIn("weeks", self.collect_kwargs)
 
     def test_collect_all_reads_the_whole_window_past_works_already_collected(self):
         """Production, 2026-09-27: this week's poll already held two works, and a collect
         that stopped at them never reached last week."""
         self._collect(new_entries=[_entry("90")])
 
-        self._collect(text="/vote собрать")
+        self._collect()
 
         self.assertIs(self.collect_kwargs["stop_at_known"], False)
         self.assertEqual(self.collect_kwargs["skip_entry_ids"], {"90"})  # still no re-download
@@ -324,7 +345,7 @@ class ConcurrentCollectTests(unittest.TestCase):
             "message_id": 1,
             "chat": {"id": 5, "type": "private"},
             "from": {"id": 7, "username": "admin"},
-            "text": "/vote собрать",
+            "text": _range_text(),
         }
         cfg = SimpleNamespace(
             webapp_public_url="https://example.com",
@@ -369,7 +390,7 @@ class ConcurrentCollectTests(unittest.TestCase):
             "message_id": 1,
             "chat": {"id": 5, "type": "private"},
             "from": {"id": 7, "username": "admin"},
-            "text": "/vote собрать",
+            "text": _range_text(),
         }
         cfg = SimpleNamespace(
             webapp_public_url="https://example.com",
