@@ -142,6 +142,10 @@ def _artist_summary(base: str, artist: hall_of_fame.Artist, rank: int) -> dict:
         "works": len(artist.entries),
         "wins": len(artist.wins),
         "podiums": artist.podiums,
+        # The medal table the ranking is (hall_of_fame._rank), shown as it is ranked.
+        "gold": artist.medals(1),
+        "silver": artist.medals(2),
+        "bronze": artist.medals(3),
         "votes": artist.total_votes,
         "best_place": artist.best_place(),
         "badges": _badges(artist),
@@ -492,7 +496,9 @@ PAGE_HTML = r"""<!doctype html>
   .card.win { border-color: rgba(242,193,78,.45); }
 
   /* ------------------------------------------------------------------ leaderboard */
-  .board { display: grid; gap: 8px; }
+  /* minmax(0, 1fr): a grid column is otherwise as wide as its longest name, and on a
+     narrow phone that pushed the medal columns off the screen. */
+  .board { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .row { display: flex; align-items: center; gap: 12px; padding: 10px 12px; background: var(--card);
          border-radius: 14px; border: 1px solid var(--line); }
   .row:hover { border-color: rgba(255,255,255,.18); }
@@ -503,12 +509,14 @@ PAGE_HTML = r"""<!doctype html>
   .row .who .b { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .row .nums { display: flex; gap: 14px; text-align: center; font-size: 12px; color: var(--muted); }
   .row .nums b { display: block; color: var(--fg); font-size: 16px; }
+  .row .nums .medal { min-width: 26px; }
+  .row .nums .medal.none { opacity: .35; }
   @media (max-width: 520px) { .row .nums .opt { display: none; } }
   .row img.cov { width: 48px; height: 48px; border-radius: 10px; object-fit: cover; background: var(--card-hi); }
   @media (max-width: 420px) { .row img.cov { display: none; } }
 
   /* ------------------------------------------------------------------ chronology */
-  .timeline { display: grid; gap: 14px; }
+  .timeline { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
   .contest { background: var(--card); border-radius: var(--radius); border: 1px solid var(--line); padding: 16px; }
   .contest:hover { border-color: rgba(255,255,255,.18); }
   .cHead { display: flex; align-items: flex-start; gap: 12px; }
@@ -528,8 +536,9 @@ PAGE_HTML = r"""<!doctype html>
   .profile { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; margin-top: 8px; }
   .profile .n { font-size: clamp(24px, 4.5vw, 34px); font-weight: 800; line-height: 1.15; }
   .profile .u { color: var(--accent); font-weight: 600; }
-  .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 22px; }
-  @media (max-width: 520px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
+  .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 22px; }
+  @media (max-width: 720px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 420px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
   .tile { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
   .tile b { display: block; font-size: 24px; line-height: 1.2; }
   .tile span { color: var(--muted); font-size: 13px; }
@@ -726,6 +735,13 @@ function badgeLine(badges) {
   return (badges || []).map((b) => b.badge + (b.count > 1 ? `×${b.count}` : "")).join(" ");
 }
 
+// One column of the medal table; a medal not won is dimmed rather than left out, so the
+// columns line up down the leaderboard.
+function medalCount(emoji, count, title) {
+  return h("div", {class: count ? "medal" : "medal none", title: `${title}: ${count}`},
+    h("b", {}, count), emoji);
+}
+
 function artistRow(artist) {
   const rk = artist.rank <= 3 ? `rk r${artist.rank}` : "rk";
   return h("a", {class: "row", href: `#/artist/${artist.key}`},
@@ -735,9 +751,10 @@ function artistRow(artist) {
       h("div", {class: "n"}, artist.name),
       h("div", {class: "b"}, badgeLine(artist.badges) || (artist.username ? "@" + artist.username : worksLabel(artist.works)))),
     h("div", {class: "nums"},
-      h("div", {}, h("b", {}, artist.wins), "побед"),
-      h("div", {class: "opt"}, h("b", {}, artist.podiums), "призов"),
-      h("div", {}, h("b", {}, artist.works), "работ")),
+      medalCount("🥇", artist.gold, "золото"),
+      medalCount("🥈", artist.silver, "серебро"),
+      medalCount("🥉", artist.bronze, "бронза"),
+      h("div", {class: "opt"}, h("b", {}, artist.works), "работ")),
     artist.cover ? h("img", {class: "cov", src: artist.cover, alt: "", loading: "lazy"}) : null);
 }
 
@@ -879,7 +896,7 @@ async function screenArtists() {
   };
   draw("");
   return [h("h1", {}, "Художники"),
-          h("p", {class: "lead"}, "Все, кто участвовал в конкурсах, — по победам, призовым местам и голосам."),
+          h("p", {class: "lead"}, "Все, кто участвовал в конкурсах, — по медалям: сначала золото, потом серебро, потом бронза; при равенстве — по голосам."),
           h("div", {class: "section", style: "margin-top:18px"},
             h("input", {class: "search", type: "search", placeholder: "Найти по имени или @нику", oninput: (e) => draw(e.target.value)}),
             h("div", {style: "height:14px"}), board)];
@@ -899,8 +916,9 @@ async function screenArtist(key) {
           : artist.username ? h("div", {class: "u"}, "@" + artist.username) : null,
         h("div", {class: "muted", style: "margin-top:4px"}, `${artist.rank}-е место среди художников`))),
     h("div", {class: "tiles"},
-      h("div", {class: "tile"}, h("b", {}, artist.wins), h("span", {}, "побед")),
-      h("div", {class: "tile"}, h("b", {}, artist.podiums), h("span", {}, "призовых мест")),
+      h("div", {class: "tile"}, h("b", {}, `🥇 ${artist.gold}`), h("span", {}, "золото — 1 место")),
+      h("div", {class: "tile"}, h("b", {}, `🥈 ${artist.silver}`), h("span", {}, "серебро — 2 место")),
+      h("div", {class: "tile"}, h("b", {}, `🥉 ${artist.bronze}`), h("span", {}, "бронза — 3 место")),
       h("div", {class: "tile"}, h("b", {}, artist.works), h("span", {}, "работ в конкурсах")),
       h("div", {class: "tile"}, h("b", {}, artist.votes), h("span", {}, "голосов всего"))),
     artist.badges.length ? section("Значки и ачивки", null, null, badgePills(artist.badges)) : null,

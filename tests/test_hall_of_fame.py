@@ -250,6 +250,21 @@ class ReadingTests(_Store):
         self.assertEqual(hall.by_key["4"].podiums, 0)      # fourth, with a nought
         self.assertEqual(hall.by_key["3"].best_place(), 3)
 
+    def test_the_ranking_is_a_medal_table_silver_before_any_number_of_bronzes(self):
+        """Under the old rule (wins, then podium places) two bronzes beat one silver."""
+        hall = hall_of_fame.build_hall([
+            self._contest("2026-W39", [("1", 9, "Победа", 9), ("2", 1, "Серебро", 5), ("3", 2, "Бронза", 4)]),
+            self._contest("2026-W40", [("4", 9, "Победа", 9), ("5", 3, "Другой", 6), ("6", 2, "Бронза", 5)]),
+        ])
+        bronze, silver = hall.by_key["2"], hall.by_key["1"]
+        self.assertEqual((bronze.medals(1), bronze.medals(2), bronze.medals(3)), (0, 0, 2))
+        self.assertEqual((silver.medals(1), silver.medals(2), silver.medals(3)), (0, 1, 0))
+        self.assertEqual([a.key for a in hall.artists], ["9", "3", "1", "2"])
+
+    def test_a_place_nobody_voted_for_earns_no_medal(self):
+        hall = hall_of_fame.build_hall([self._contest("2026-W39", [("1", 1, "Аня", 3), ("2", 2, "Боря", 0)])])
+        self.assertEqual(hall.by_key["2"].medals(2), 0)
+
     def test_a_post_with_a_hidden_sender_still_has_a_page(self):
         hall = hall_of_fame.build_hall([self._contest("2026-W39", [("1", None, "Скрытый", 3)])])
         (artist,) = hall.artists

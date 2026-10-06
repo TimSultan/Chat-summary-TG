@@ -508,6 +508,11 @@ class Artist:
     def podiums(self) -> int:
         return sum(1 for contest, work in self.entries if contest.on_podium(work))
 
+    def medals(self, place: int) -> int:
+        """How many times this artist took `place` (1, 2 or 3) with votes behind it --
+        the podium rule (Contest.podium): a nought earns no medal, whatever its place."""
+        return sum(1 for contest, work in self.entries if work.place == place and contest.on_podium(work))
+
     @property
     def total_votes(self) -> int:
         return sum(work.votes for _, work in self.entries)
@@ -526,8 +531,10 @@ class Hall:
 
 
 def _rank(artist: Artist) -> tuple:
-    return (-len(artist.wins), -artist.podiums, -artist.total_votes, -len(artist.entries),
-            artist.name.lower())
+    """The medal table: golds, then silvers, then bronzes -- so one silver outranks any
+    number of bronzes, as at the Olympics -- then votes, then works entered."""
+    return (-artist.medals(1), -artist.medals(2), -artist.medals(3), -artist.total_votes,
+            -len(artist.entries), artist.name.lower())
 
 
 def build_hall(contests: list[Contest]) -> Hall:

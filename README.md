@@ -1101,12 +1101,13 @@ every work they entered and every badge they won. Four screens, picked by the UR
 `#fragment`:
 
 - **Зал славы** — the latest winner large, with the podium beside it; the recent winners
-  as a gallery; the best artists (wins, then podium places, then votes); the thematic
+  as a gallery; the best artists, ranked as a medal table (🥇 golds, then 🥈 silvers, then
+  🥉 bronzes -- a place with no votes earns no medal -- then votes); the thematic
   contests and how they work.
 - **Хронология** — every contest newest first, grouped by month, with its podium; one tap
   opens all its works. Filters: all, итоги недели, тематические.
 - **Художники** — the whole leaderboard, searchable by name or @tag.
-- **Профиль художника** — avatar, @tag (a link to Telegram), wins / podium places / works /
+- **Профиль художника** — avatar, @tag (a link to Telegram), 🥇 gold / 🥈 silver / 🥉 bronze / works /
   votes, the badges (each weekly win is the same 🏆 with a count; each thematic contest is
   its own badge — the one the administrator gave it when collecting, 🏅 if none), and every
   work they entered.

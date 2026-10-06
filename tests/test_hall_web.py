@@ -158,6 +158,7 @@ class HallApiTests(AsyncTestCase):
     async def test_an_artist_page_has_every_work_and_every_badge(self):
         data = (await self._json("/api/artists/1"))["artist"]
         self.assertEqual((data["rank"], data["wins"], data["podiums"], data["works"], data["votes"]), (1, 2, 3, 3, 13))
+        self.assertEqual((data["gold"], data["silver"], data["bronze"]), (2, 1, 0))
         self.assertEqual([w["contest"] for w in data["entries"]], ["2026-W40-abcdef", "2026-W40", "2026-W39"])
         self.assertEqual(data["entries"][0]["contest_title"], "Лучший аниме-покрас")
         self.assertEqual(data["badges"], [
@@ -286,6 +287,20 @@ class HeroPhotoTests(unittest.TestCase):
         page = hall_web.PAGE_HTML
         self.assertNotIn("margin-top: auto", re.search(r"\.podiumMini \{([^}]*)\}", page).group(1))
         self.assertIn("align-self: start", re.search(r"\.heroInfo \{([^}]*)\}", page).group(1))
+
+
+class LeaderboardLayoutTests(unittest.TestCase):
+    def test_rows_can_shrink_to_a_narrow_phone(self):
+        """A grid column is as wide as its longest name unless told otherwise, and on a
+        360px phone that pushed the bronze column off the screen."""
+        for name in ("board", "timeline"):
+            with self.subTest(name=name):
+                rule = re.search(rf"\.{name} \{{([^}}]*)\}}", hall_web.PAGE_HTML).group(1)
+                self.assertIn("minmax(0, 1fr)", rule)
+
+    def test_every_row_shows_all_three_medals(self):
+        for medal in ('medalCount("🥇", artist.gold', 'medalCount("🥈", artist.silver', 'medalCount("🥉", artist.bronze'):
+            self.assertIn(medal, hall_web.PAGE_HTML)
 
 
 class PageScriptSyntaxTests(unittest.TestCase):
