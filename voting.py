@@ -1262,6 +1262,34 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
     return path
 
 
+def results_poll_ids(entry: str) -> list[str]:
+    """The poll ids this chat has an announced results record for, oldest id first --
+    including weeks whose poll has since been cleared, since clearing keeps the results."""
+    directory = _voting_dir() / "results"
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    return sorted(path.stem[len(prefix):] for path in directory.glob(f"{prefix}*.json"))
+
+
+def load_archived_poll(entry: str, poll_id: str) -> Poll | None:
+    """A cleared poll out of archive_dir(), or None. A week cleared twice has a time stamp
+    on the end of its file name (see archive_all_polls); the newest of those is returned."""
+    directory = archive_dir()
+    if not directory.exists():
+        return None
+    exact = directory / poll_path(entry, poll_id).name
+    candidates = [exact] if exact.exists() else sorted(
+        directory.glob(f"{_poll_key(entry)}_{poll_id}_*.json"), reverse=True,
+    )
+    for path in candidates:
+        try:
+            return Poll.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            continue
+    return None
+
+
 def load_results(entry: str, poll_id: str) -> dict | None:
     """The record save_results wrote, or None if there is none or it is unreadable --
     same tolerance as load_poll: a corrupt file means "nothing announced yet" to every

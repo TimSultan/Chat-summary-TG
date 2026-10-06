@@ -209,6 +209,9 @@ async def handle_poll(request: web.Request) -> web.Response:
     payload = {
         "poll_id": poll.poll_id,
         "chat": poll.entry,
+        # What the contest is called: "Итоги недели", or a thematic contest's own title.
+        "title": poll.label(),
+        "hashtag": poll.hashtag,
         "open": poll.open,
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
@@ -675,6 +678,8 @@ def _public_payload(entry_name: str, base: str, bot_username: str) -> dict:
     winner = poll.winner()
     return {
         "poll_id": poll.poll_id,
+        "title": poll.label(),
+        "hashtag": poll.hashtag,
         "open": poll.open,
         "max_choices": poll.max_choices,
         "allow_revote": poll.allow_revote,
@@ -1528,6 +1533,8 @@ function syncPicks() {
 }
 
 function render() {
+  // A thematic contest is named on its own ballot, not as the weekly one.
+  $("title").textContent = poll.title || "Итоги недели";
   renderWinnerBanner();
   renderResults();
   updateAdminButtons();
@@ -1537,7 +1544,7 @@ function render() {
     closeReel();
     $("msg").hidden = false;
     $("msg").textContent = poll.is_admin
-      ? "За сегодня и вчера заявок с #итогинедели не нашлось."
+      ? `За сегодня и вчера заявок с ${poll.hashtag || "#итогинедели"} не нашлось.`
       : "Работы ещё не допущены к голосованию. Загляни позже.";
     $("go").hidden = true;
     $("notice").hidden = true;
@@ -2984,7 +2991,7 @@ BROWSER_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <header class="hero">
-    <div class="eyebrow">Голосование · итоги недели</div>
+    <div class="eyebrow" id="eyebrow">Голосование · итоги недели</div>
     <h1>Выберите лучшие работы</h1>
     <p class="lead">Версия для браузера — для тех, у кого голосование не открывается в Telegram.</p>
   </header>
@@ -3395,6 +3402,7 @@ if (window.ResizeObserver) {
     const response = await fetch(PREFIX + "/api/public", { cache: "no-store" });
     if (!response.ok) throw new Error("Сервер ответил " + response.status);
     poll = await response.json();
+    if (poll.title) $("eyebrow").textContent = `Голосование · ${poll.title}`;
   } catch (e) {
     $("steps").hidden = true;
     showNotice("Не получилось загрузить работы", "Обновите страницу через минуту.");

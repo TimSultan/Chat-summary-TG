@@ -165,6 +165,18 @@ class BrowserPageTests(_Storage, AsyncTestCase):
         self.assertFalse(data["open"])
         self.assertEqual(data["winner"]["id"], "202")
 
+    async def test_a_thematic_contest_is_named_on_its_ballot(self):
+        poll = _seed()
+        self.assertEqual((await self._public())["title"], "Итоги недели")
+        poll.hashtag, poll.title = "#аниме", "Лучший аниме-покрас"
+        voting.save_poll(poll)
+        vote_web_cache = self.client.server.app[vote_web._PUBLIC_CACHE_KEY]
+        vote_web_cache.clear()
+        data = await self._public()
+        self.assertEqual((data["title"], data["hashtag"]), ("Лучший аниме-покрас", "#аниме"))
+        self.assertIn('$("eyebrow").textContent', vote_web.BROWSER_HTML)
+        self.assertIn('$("title").textContent = poll.title', vote_web.PAGE_HTML)
+
     async def test_no_poll_is_said_plainly(self):
         data = await self._public()
         self.assertIsNone(data["poll_id"])

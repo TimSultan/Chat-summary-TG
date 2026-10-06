@@ -107,6 +107,9 @@ ARENA_IMPORT_ERROR: str | None = None
 # Vote v3, the nominations test (nominations*), on a guard of its own for the same
 # reason: it is new, and nothing new may be able to take /vote down with it.
 NOMINATIONS_IMPORT_ERROR: str | None = None
+# The Hall of Fame site (hall_of_fame*, hall_web), likewise: a broken hall must cost the
+# hall and nothing else -- not the ballot, and not the close that records into it.
+HALL_IMPORT_ERROR: str | None = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -176,6 +179,12 @@ try:
 except Exception:  # noqa: BLE001
     NOMINATIONS_IMPORT_ERROR = traceback.format_exc()
     nominations = nominations_web = None
+try:
+    import hall_of_fame
+    import hall_web
+except Exception:  # noqa: BLE001
+    HALL_IMPORT_ERROR = traceback.format_exc()
+    hall_of_fame = hall_web = None
 
 
 def game_available() -> bool:
@@ -205,6 +214,11 @@ def arena_available() -> bool:
 def nominations_available() -> bool:
     """The same for vote v3 (/vote3, the nominations test)."""
     return NOMINATIONS_IMPORT_ERROR is None
+
+
+def hall_available() -> bool:
+    """The same for the Hall of Fame (/hall)."""
+    return HALL_IMPORT_ERROR is None
 
 
 GAME_UNAVAILABLE_NOTICE = (
@@ -577,6 +591,18 @@ NOMINATIONS_ACTIONS = {
     "clearyes": "/vote3 очистить да",
 }
 
+# ------------------------------------------------------------ the Hall of Fame (/hall)
+#
+# «Доска почёта»: every closed /vote contest -- the weekly one and the thematic ones -- with
+# its whole field, the artists' pages and their badges (hall_of_fame.py, hall_web.py at
+# /hall on the voting server). A contest is recorded when its vote is closed; "/hall
+# импорт" (DM, administrators) brings in the weeks announced before the hall existed.
+HALL_COMMANDS = ("/hall", "/зал", "/доска")
+HALL_IMPORT_WORDS = frozenset({"импорт", "import", "история", "history"})
+HALL_OPEN_BUTTON_TEXT = "🏆 Доска почёта"
+HALL_ACTION_CALLBACK_PREFIX = "hallaction"
+HALL_ACTIONS = {"import": "/hall импорт"}
+
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
     "collect": "/vote собрать",
@@ -628,6 +654,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "hall", "description": "Доска почёта: победители и их работы"},
     {"command": "pet", "description": "Моё существо"},
 )
 GROUP_CHAT_COMMANDS = (
@@ -640,6 +667,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "hall", "description": "Доска почёта: победители и их работы"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},
 )
@@ -6060,6 +6088,172 @@ async def handle_nominations_command(
     )
 
 
+def _hall_page_url(cfg) -> str | None:
+    if not cfg.webapp_public_url or hall_web is None:
+        return None
+    return f"{cfg.webapp_public_url}{hall_web.ROUTE_PREFIX}"
+
+
+def _record_vote_in_hall(poll, standings: list, log=print) -> None:
+    """Writes a just-closed vote into the Hall of Fame. Synchronous disk and image work
+    (photo copies, thumbnails), so callers run it in a worker thread; and best-effort,
+    because the vote itself is already closed and saved -- a hall that failed to record
+    must not cost the administrator their results draft. "/hall импорт" picks up any
+    week this missed, from the results record written beside it."""
+    if hall_of_fame is None or not standings:
+        return
+    try:
+        contest = hall_of_fame.record_poll(poll, standings)
+        log(f"[bot_listener] recorded poll {poll.poll_id} in the Hall of Fame ({len(contest.works)} works)")
+    except Exception:
+        log(f"[bot_listener] could not record poll {poll.poll_id} in the Hall of Fame:\n{traceback.format_exc()}")
+
+
+def _hall_action_callback_data(action: str, user_id) -> str:
+    return f"{HALL_ACTION_CALLBACK_PREFIX}:{action}:{user_id}"
+
+
+def _parse_hall_action_callback(data: str) -> tuple[str, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != HALL_ACTION_CALLBACK_PREFIX or parts[1] not in HALL_ACTIONS:
+        return None
+    try:
+        return parts[1], int(parts[2])
+    except ValueError:
+        return None
+
+
+async def handle_hall_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    log=print,
+) -> None:
+    """"/hall": the link to the Hall of Fame -- a plain url, so it opens from a group as
+    well as from the DM, and in any browser. In the DM it is also a Mini App button, and
+    an administrator gets "📥 Перенести историю" ("/hall импорт"), which records every
+    announced week the hall does not have yet."""
+    chat = message["chat"]
+    chat_id = chat["id"]
+    is_private = chat.get("type") == "private"
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message.get("message_id"),
+                parse_mode=None, reply_markup=reply_markup,
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to send the hall reply: {e}")
+            return None
+
+    if not hall_available():
+        await reply("Доска почёта сейчас недоступна — чиню. Голосование (/vote) работает как обычно.")
+        return
+    url = _hall_page_url(cfg)
+    if not url:
+        await reply("Доска почёта не настроена: не задан WEBAPP_PUBLIC_URL (нужен https-адрес приложения).")
+        return
+    if not entry:
+        await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS).")
+        return
+
+    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+    for spelling in HALL_COMMANDS:
+        if argument.lower().startswith(spelling):
+            argument = argument[len(spelling):]
+            break
+    wants_import = " ".join(argument.lower().split()) in HALL_IMPORT_WORDS
+
+    async def is_admin() -> bool:
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        return admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+
+    if wants_import:
+        if not is_private:
+            await reply("Перенос истории — только в личке с ботом.")
+            return
+        if not await is_admin():
+            await reply("Переносить историю в Доску почёта могут только администраторы.")
+            return
+        await reply("Переношу прошлые итоги в Доску почёта… Это может занять минуту: копирую фото.")
+        try:
+            # Copies photos and draws thumbnails for every week it brings in: a worker
+            # thread, so the chat is not kept waiting behind it.
+            counts = await asyncio.to_thread(hall_of_fame.import_history, entry)
+        except Exception:
+            log(f"[bot_listener] the hall import failed:\n{traceback.format_exc()}")
+            await reply("Не получилось перенести историю — смотри логи.")
+            return
+        lines = [f"Готово. Перенесено конкурсов: {counts['added']}, уже были: {counts['known']}."]
+        if counts["without_photos"]:
+            lines.append(
+                f"Без фото: {counts['without_photos']} — их голосования очистили раньше, чем "
+                "появилась Доска почёта; имена, места и голоса на месте."
+            )
+        await reply("\n".join(lines), reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
+        return
+
+    hall = await asyncio.to_thread(hall_of_fame.snapshot, entry)
+    summary = (
+        f"Конкурсов: {len(hall.contests)} · художников: {len(hall.artists)}."
+        if hall.contests else
+        "Пока пусто: первый победитель появится здесь, как только закроется голосование."
+    )
+    text = f"Доска почёта — победители, их работы и вся хронология итогов.\n{summary}\n\n{url}"
+    if not is_private:
+        await reply(text, reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
+        return
+    rows = [
+        [{"text": HALL_OPEN_BUTTON_TEXT, "web_app": {"url": url}}],
+        [{"text": "Открыть в браузере", "url": url}],
+    ]
+    if await is_admin():
+        rows.append([{"text": "📥 Перенести историю итогов",
+                      "callback_data": _hall_action_callback_data("import", user.get("id"))}])
+    await reply(text, reply_markup={"inline_keyboard": rows})
+
+
+async def handle_hall_action_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """The /hall panel's buttons, replayed as the command they stand for -- the admin
+    check and the work happen there, as for every other panel in this file."""
+    parsed = _parse_hall_action_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, target_user_id = parsed
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    trigger = callback.get("message") or {}
+    synthetic_message = {
+        "message_id": trigger.get("message_id"),
+        "chat": trigger.get("chat") or {"id": target_user_id, "type": "private"},
+        "from": clicker,
+        "text": HALL_ACTIONS[action],
+    }
+    task = asyncio.create_task(handle_hall_command(
+        api, telethon_client, cfg, synthetic_message, entry, bot_username, log=log,
+    ))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -6534,6 +6728,9 @@ async def handle_vote_command(
                         # the картинка buttons with a framing step in front of them.
                         {"text": "✂️ Кадрировать и выгрузить", "web_app": {"url": f"{page_url}/board"}},
                     ],
+                    # Where every closed vote ends up (see _record_vote_in_hall).
+                    *([[{"text": HALL_OPEN_BUTTON_TEXT, "web_app": {"url": _hall_page_url(cfg)}}]]
+                      if _hall_page_url(cfg) else []),
                     [
                         {
                             "text": "🗑 Очистить",
@@ -10635,6 +10832,11 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, log=log,
             )
+        elif callback_data.startswith(f"{HALL_ACTION_CALLBACK_PREFIX}:"):
+            await handle_hall_action_callback(
+                api, telethon_client, cfg, callback, home_chat_ref, bot_username,
+                background_tasks, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_DATE_CALLBACK_PREFIX}:"):
             await handle_vote_date_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
@@ -10778,6 +10980,12 @@ async def _dispatch_update(
             await handle_vote_link_ballot(
                 api, telethon_client, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), start_payload, log=log,
+            )
+            return
+        if start_payload == "hall":
+            await handle_hall_command(
+                api, telethon_client, cfg, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username, log=log,
             )
             return
         if start_payload == "vote3":
@@ -11180,6 +11388,19 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, message, arena_entry, bot_username,
                 background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/hall" -- the Hall of Fame (hall_web.py). Matched as a whole word: "/hall" is a
+    # prefix of more than one English word.
+    if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in HALL_COMMANDS):
+        hall_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if hall_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_hall_command(api, telethon_client, cfg, message, hall_entry, bot_username, log=log)
         )
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
@@ -12031,6 +12252,12 @@ async def run_bot_listener(
                 if home_chat_ref
                 else None
             )
+            # Into the Hall of Fame now, while the poll's photos are certainly still on
+            # disk -- "очистить" deletes them. Off the event loop (copies, thumbnails) and
+            # in the background, so the draft is not kept waiting for the pictures.
+            hall_task = asyncio.create_task(asyncio.to_thread(_record_vote_in_hall, poll, standings, log))
+            background_tasks.add(hall_task)
+            hall_task.add_done_callback(background_tasks.discard)
             await send_vote_results_draft(
                 api, user, poll, standings, admin_chat_id, vote_result_flows, log=log,
             )
@@ -12113,6 +12340,24 @@ async def run_bot_listener(
                         )
                     except Exception:  # noqa: BLE001
                         log("[bot_listener] the nominations page (/vote3) was not mounted; "
+                            "/vote is unaffected:\n" + traceback.format_exc())
+                # The Hall of Fame site, under its own guard for the same reason as v3.
+                # Avatars through the same Bot API callable the ballot uses; the chat's
+                # @username / id for links to the original posts, resolved on first use.
+                if hall_available():
+                    async def _hall_chat():
+                        chat_id, username = await _cabinet_chat_ref(
+                            telethon_client, home_chat_ref, known_chat_ids, log=log,
+                        )
+                        return username, chat_id
+
+                    try:
+                        hall_web.attach(
+                            app, home_chat_ref or "", log=log, avatar=_fetch_vote_avatar,
+                            chat=_hall_chat, bot_username=bot_username,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log("[bot_listener] the Hall of Fame (/hall) was not mounted; "
                             "/vote is unaffected:\n" + traceback.format_exc())
                 # The pet game's own page. It needs one thing the other two don't: the
                 # player's live chat XP, because the coin balance is derived from it and
