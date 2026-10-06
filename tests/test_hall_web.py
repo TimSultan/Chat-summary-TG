@@ -282,6 +282,11 @@ class HeroPhotoTests(unittest.TestCase):
         # The full photo, not the square cover cut from it.
         self.assertIn("const heroPhoto = win.photo || win.thumb;", page)
 
+    def test_the_podium_sits_under_the_winner_not_at_the_bottom_of_the_card(self):
+        page = hall_web.PAGE_HTML
+        self.assertNotIn("margin-top: auto", re.search(r"\.podiumMini \{([^}]*)\}", page).group(1))
+        self.assertIn("align-self: start", re.search(r"\.heroInfo \{([^}]*)\}", page).group(1))
+
 
 class PageScriptSyntaxTests(unittest.TestCase):
     """One broken literal and the page opens blank while every route still answers 200."""

@@ -454,11 +454,14 @@ PAGE_HTML = r"""<!doctype html>
                      padding: 5px 12px; border-radius: 999px; font-weight: 800; font-size: 13px; }
   .heroInfo { background: linear-gradient(160deg, rgba(242,193,78,.16), rgba(242,193,78,0) 55%), var(--card);
               border-radius: var(--radius); padding: 22px; display: flex; flex-direction: column; gap: 14px;
-              border: 1px solid rgba(242,193,78,.22); }
+              border: 1px solid rgba(242,193,78,.22);
+              /* As tall as what it says, not as the photo beside it: a tall photo used to
+                 stretch it and leave the podium stranded at the bottom of an empty card. */
+              align-self: start; }
   .heroWho { display: flex; align-items: center; gap: 14px; }
   .heroWho .name { font-size: 22px; font-weight: 800; line-height: 1.2; }
   .heroMeta { color: var(--muted); font-size: 14px; }
-  .podiumMini { display: grid; gap: 8px; margin-top: auto; }
+  .podiumMini { display: grid; gap: 8px; }
   .pmRow { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 12px; background: rgba(255,255,255,.04); }
   .pmRow img.th { width: 44px; height: 44px; border-radius: 9px; object-fit: cover; background: var(--card-hi); }
   .pmRow .who { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
