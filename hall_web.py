@@ -439,9 +439,17 @@ PAGE_HTML = r"""<!doctype html>
   /* ------------------------------------------------------------------ hero winner */
   .hero { display: grid; grid-template-columns: 1.25fr 1fr; gap: 18px; margin-top: 22px; }
   @media (max-width: 760px) { .hero { grid-template-columns: 1fr; } }
+  /* The winner's whole photo, never cropped: a miniature shot tall is as much the winner as
+     one shot wide. It keeps its own proportions, up to a height a screen can hold, and the
+     room left at its sides is a blurred copy of the same photo rather than a bare frame. */
   .heroPic { position: relative; border-radius: var(--radius); overflow: hidden; background: var(--card);
-             aspect-ratio: 4 / 3; box-shadow: var(--shadow); cursor: zoom-in; }
-  .heroPic img { width: 100%; height: 100%; object-fit: cover; }
+             box-shadow: var(--shadow); cursor: zoom-in; min-height: 220px;
+             display: flex; align-items: center; justify-content: center; }
+  .heroPic .blur { position: absolute; inset: -30px; background-size: cover; background-position: center;
+                   filter: blur(28px) brightness(.5); }
+  .heroPic img.main { position: relative; display: block; width: auto; height: auto;
+                      max-width: 100%; max-height: min(78vh, 760px); }
+  .heroPic .noPic { aspect-ratio: 4 / 3; }
   .heroPic .ribbon { position: absolute; left: 14px; top: 14px; background: var(--gold); color: #2a1e00;
                      padding: 5px 12px; border-radius: 999px; font-weight: 800; font-size: 13px; }
   .heroInfo { background: linear-gradient(160deg, rgba(242,193,78,.16), rgba(242,193,78,0) 55%), var(--card);
@@ -775,9 +783,11 @@ async function screenHome() {
   }
   const top = data.latest[0];
   const win = top.winner;
+  const heroPhoto = win.photo || win.thumb;   // the full photo: the square cover would crop it
   nodes.push(h("div", {class: "hero"},
     h("div", {class: "heroPic", onclick: () => openContestWinner(top)},
-      picture(win.photo || win.thumb, win.author.name),
+      heroPhoto ? h("div", {class: "blur", style: `background-image: url("${heroPhoto}")`}) : null,
+      heroPhoto ? h("img", {class: "main", src: heroPhoto, alt: win.author.name}) : picture(null),
       h("span", {class: "ribbon"}, `${top.badge} Последний победитель`)),
     h("div", {class: "heroInfo"},
       h("a", {class: "heroWho", href: `#/artist/${win.author.key}`},

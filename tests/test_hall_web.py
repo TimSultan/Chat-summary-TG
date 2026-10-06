@@ -267,6 +267,22 @@ class PostLinkTests(unittest.TestCase):
         self.assertIsNone(asyncio.run(run((None, -1234))))
 
 
+class HeroPhotoTests(unittest.TestCase):
+    """The latest winner is shown whole: a tall miniature photo cut to a fixed frame lost
+    its top and bottom on the front page."""
+
+    def test_the_winners_photo_is_never_cropped_to_a_frame(self):
+        page = hall_web.PAGE_HTML
+        rule = re.search(r"\.heroPic img\.main \{([^}]*)\}", page).group(1)
+        self.assertNotIn("object-fit: cover", rule)
+        self.assertIn("max-width: 100%", rule)
+        self.assertIn("height: auto", rule)
+        hero = re.search(r"\.heroPic \{([^}]*)\}", page).group(1)
+        self.assertNotIn("aspect-ratio", hero)
+        # The full photo, not the square cover cut from it.
+        self.assertIn("const heroPhoto = win.photo || win.thumb;", page)
+
+
 class PageScriptSyntaxTests(unittest.TestCase):
     """One broken literal and the page opens blank while every route still answers 200."""
 
