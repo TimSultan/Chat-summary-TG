@@ -6,17 +6,19 @@ collected under its own hashtag (voting.poll_id_for). It is recorded the moment 
 is closed (record_poll, called from bot_listener) with every admitted work, its place and
 its votes, so the chronology shows the whole field and not only the podium.
 
-THE PHOTOS ARE COPIED, the same decision nominations.py made for the same reason: v1's
-"очистить" archives a poll and deletes its photos, and a hall that pointed at v1's media
-would lose every picture the first time anybody started a new week. Each work's first
+THE PHOTOS ARE COPIED, the same decision nominations.py made: v1's "очистить" moves a
+poll's photos into its archive (they used to be deleted outright), and a hall that pointed
+at v1's media would lose every picture the first time anybody started a new week. Where
+the copies are hardlinks (same disk) they cost no extra space. Each work's first
 photo also gets a square thumbnail, framed the way the administrator framed it for the
 board picture (voting.Poll.crops) or filling the square when nobody did -- a gallery of
 full-size phone photos would be megabytes per screen.
 
 History from before the hall existed comes in through import_history: the announced
 results records under voting/results survive a clear, and so does every closed poll still
-on disk. A week whose photos were cleared before the hall existed comes in without them --
-the names, places and votes are all still true.
+on disk, with the photos its clear archived. A week whose photos were deleted (by a clear
+from before clears kept them) comes in without them, and works_missing_photos /
+attach_photos let the bot fetch them back from the posts in the chat.
 
 Storage is DATA_DIR/hall_of_fame/<chat key>/: one JSON file per contest under contests/,
 the pictures under media/<contest id>/. Reads go through a cache keyed on the files' own
@@ -86,6 +88,20 @@ def _int_or_none(value) -> int | None:
         return None
 
 
+def _clean_crop(raw) -> dict | None:
+    """Three finite numbers with a positive size, or None -- a nonsense crop costs a cover
+    its framing, never the record (voting._clean_crops' rule)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        x, y, size = float(raw["x"]), float(raw["y"]), float(raw["size"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(map(math.isfinite, (x, y, size))) or size <= 0:
+        return None
+    return {"x": x, "y": y, "size": size}
+
+
 def author_key(author_id, author_name: str) -> str:
     """Who a work is by, as one token for a URL: the Telegram id when there is one (a name
     changes, an id does not), else a hash of the name for a post whose sender was hidden."""
@@ -111,6 +127,9 @@ class Work:
     message_id: int = 0
     photos: list[str] = field(default_factory=list)   # under media_dir(entry, contest_id)
     thumb: str | None = None                          # the first photo's square cover
+    # How the administrator framed the first photo (voting.Poll.crops), kept so a cover
+    # drawn again later -- for a photo fetched back from the chat -- is framed the same.
+    crop: dict | None = None
 
     @property
     def key(self) -> str:
@@ -133,6 +152,7 @@ class Work:
             message_id=int(raw.get("message_id") or 0),
             photos=[str(name) for name in raw.get("photos") or [] if _SAFE_NAME.match(str(name))],
             thumb=(str(raw["thumb"]) if raw.get("thumb") and _SAFE_NAME.match(str(raw["thumb"])) else None),
+            crop=_clean_crop(raw.get("crop")),
         )
 
 
@@ -240,21 +260,29 @@ def load_contest(entry: str, contest_id: str) -> Contest | None:
 # ------------------------------------------------------------------------ photos
 
 
-def _copy_photos(names: list[str], source: Path, target: Path) -> list[str]:
-    """The names that are now in `target`: copied from `source`, or already there from an
-    earlier recording. A photo that is in neither is simply not part of the record."""
+def _copy_photos(names: list[str], sources: list[Path], target: Path) -> list[str]:
+    """The names that are now in `target`: taken from the first of `sources` that has
+    them, or already there from an earlier recording. A photo that is nowhere is simply
+    not part of the record (import_photos_from_chat can still fetch it from the post).
+
+    A hardlink where the disk allows one, a copy where it does not: a collected photo is
+    written once and never rewritten, so sharing its bytes with the poll's own file is
+    safe, and it means the hall costs no second copy of every picture."""
     present = []
     for name in names:
         if not _SAFE_NAME.match(name or ""):
             continue
         destination = target / name
         if not destination.exists():
-            origin = source / name
-            if not origin.is_file():
+            origin = next((source / name for source in sources if (source / name).is_file()), None)
+            if origin is None:
                 continue
             try:
                 target.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(origin, destination)
+                try:
+                    os.link(origin, destination)
+                except OSError:
+                    shutil.copy2(origin, destination)
             except OSError:
                 continue  # one unreadable photo costs that work a picture, not the record
         present.append(name)
@@ -308,18 +336,19 @@ def _make_thumb(directory: Path, name: str, crop: dict | None) -> str | None:
 
 def _record(
     entry: str, contest_id: str, standings: list, *, hashtag: str, title: str, badge: str,
-    created_at: str, closed_at: str, voters: int, source: Path, crops: dict,
+    created_at: str, closed_at: str, voters: int, sources: list[Path], crops: dict,
 ) -> Contest:
     target = media_dir(entry, contest_id)
     works = []
     for place, (work, votes) in enumerate(standings, start=1):
-        photos = _copy_photos(list(work.media), source, target)
-        thumb = _make_thumb(target, photos[0], crops.get(work.entry_id)) if photos else None
+        photos = _copy_photos(list(work.media), sources, target)
+        crop = _clean_crop(crops.get(work.entry_id))
+        thumb = _make_thumb(target, photos[0], crop) if photos else None
         works.append(Work(
             entry_id=str(work.entry_id), place=place, votes=int(votes),
             author_id=work.author_id, author_name=work.author_name,
             author_username=work.author_username, text=work.text, posted_at=work.posted_at,
-            message_id=int(work.message_id or 0), photos=photos, thumb=thumb,
+            message_id=int(work.message_id or 0), photos=photos, thumb=thumb, crop=crop,
         ))
     contest = Contest(
         contest_id=contest_id, entry=entry, hashtag=hashtag, title=title, badge=badge,
@@ -345,7 +374,7 @@ def record_poll(poll: "voting.Poll", standings: list | None = None, closed_at: s
             created_at=poll.created_at,
             closed_at=closed_at or datetime.now(timezone.utc).isoformat(),
             voters=len(poll.votes),
-            source=voting.media_path(poll.entry, poll.poll_id), crops=poll.crops,
+            sources=voting.photo_dirs(poll.entry, poll.poll_id), crops=poll.crops,
         )
 
 
@@ -358,10 +387,10 @@ def import_history(entry: str) -> dict:
     already in the hall is never overwritten from here -- its record is newer than any
     file this reads.
 
-    Photos come from the poll's media directory while it still exists. A week cleared
-    before the hall existed has lost them and comes in without pictures, counted in
-    `without_photos` so whoever ran the import is told rather than left to find blank
-    cards."""
+    Photos come from the poll's live media directory or the one its clear archived
+    (voting.photo_dirs). A week whose photos were deleted outright comes in without them,
+    counted in `without_photos`; the bot then fetches them back from the chat
+    (bot_listener._restore_hall_photos)."""
     added = known = without_photos = 0
     with _write_lock:
         recorded = {path.stem for path in contests_dir(entry).glob("*.json")} if contests_dir(entry).exists() else set()
@@ -401,7 +430,7 @@ def import_history(entry: str) -> dict:
                 created_at=record.get("created_at") or (poll.created_at if poll else ""),
                 closed_at=record.get("announced_at") or "",
                 voters=int(record.get("voters") or 0),
-                source=voting.media_path(entry, poll_id), crops=poll.crops if poll else {},
+                sources=voting.photo_dirs(entry, poll_id), crops=poll.crops if poll else {},
             )
             recorded.add(poll_id)
             added += 1
@@ -416,11 +445,47 @@ def import_history(entry: str) -> dict:
             _record(
                 entry, poll_id, poll.tally(), hashtag=poll.hashtag, title=poll.title,
                 badge=poll.badge, created_at=poll.created_at, closed_at=poll.created_at,
-                voters=len(poll.votes), source=voting.media_path(entry, poll_id), crops=poll.crops,
+                voters=len(poll.votes), sources=voting.photo_dirs(entry, poll_id), crops=poll.crops,
             )
             recorded.add(poll_id)
             added += 1
     return {"added": added, "known": known, "without_photos": without_photos}
+
+
+def works_missing_photos(entry: str) -> list[tuple[str, str, int]]:
+    """(contest id, entry id, message id) of every work in the hall with no picture --
+    a week whose photos were deleted before the hall kept copies. The message id is the
+    post's first message, which is what an entry id is (voting.Entry), so a record made
+    before message ids were stored still points at its post."""
+    missing = []
+    for contest in snapshot(entry).contests:
+        for work in contest.works:
+            if work.photos:
+                continue
+            message_id = work.message_id or (int(work.entry_id) if work.entry_id.isdigit() else 0)
+            if message_id:
+                missing.append((contest.contest_id, work.entry_id, message_id))
+    return missing
+
+
+def attach_photos(entry: str, contest_id: str, entry_id: str, names: list[str]) -> bool:
+    """Puts photos fetched back from the chat (already in media_dir) into a work's record,
+    with a fresh cover. Returns whether the work now has a picture."""
+    with _write_lock:
+        contest = load_contest(entry, contest_id)
+        if contest is None:
+            return False
+        work = next((w for w in contest.works if w.entry_id == str(entry_id)), None)
+        if work is None:
+            return False
+        directory = media_dir(entry, contest_id)
+        present = [name for name in names if _SAFE_NAME.match(name or "") and (directory / name).is_file()]
+        if not present:
+            return False
+        work.photos = present
+        work.thumb = _make_thumb(directory, present[0], work.crop)
+        save_contest(contest)
+        return True
 
 
 # ------------------------------------------------------------------------------ reading

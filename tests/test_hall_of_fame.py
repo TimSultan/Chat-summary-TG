@@ -164,23 +164,42 @@ class RecordTests(_Store):
 
 
 class ImportTests(_Store):
-    def test_announced_weeks_come_in_and_a_cleared_one_without_photos(self):
+    def test_announced_weeks_come_in_with_the_photos_their_clear_archived(self):
         early = self._poll(poll_id="2026-W39")
         voting.save_results(early, early.tally(), "текст")
-        voting.archive_all_polls(CHAT)       # cleared before the hall existed: photos gone
+        voting.archive_all_polls(CHAT)       # cleared: its photos are in the archive now
         late = self._poll(poll_id="2026-W40")
         voting.save_results(late, late.tally(), "текст")
 
         counts = hall_of_fame.import_history(CHAT)
 
-        self.assertEqual(counts, {"added": 2, "known": 0, "without_photos": 1})
+        self.assertEqual(counts, {"added": 2, "known": 0, "without_photos": 0})
         cleared = hall_of_fame.load_contest(CHAT, "2026-W39")
         self.assertEqual([w.entry_id for w in cleared.works], ["2", "1", "3"])
-        self.assertTrue(all(not w.photos for w in cleared.works))
+        self.assertTrue(all(w.photos and w.thumb for w in cleared.works))
         # The posting time comes back from the archived poll file.
         self.assertEqual(cleared.works[0].posted_at, "2026-10-01T12:00:00+03:00")
         live = hall_of_fame.load_contest(CHAT, "2026-W40")
         self.assertTrue(all(w.photos for w in live.works))
+
+    def test_a_week_cleared_before_photos_were_kept_comes_in_without_them(self):
+        early = self._poll(poll_id="2026-W39")
+        voting.save_results(early, early.tally(), "текст")
+        voting.archive_all_polls(CHAT)
+        for directory in voting.photo_dirs(CHAT, "2026-W39"):   # what an old clear did
+            for photo in directory.glob("*"):
+                photo.unlink()
+
+        self.assertEqual(hall_of_fame.import_history(CHAT), {"added": 1, "known": 0, "without_photos": 1})
+        self.assertTrue(all(not w.photos for w in hall_of_fame.load_contest(CHAT, "2026-W39").works))
+
+    def test_a_copied_photo_shares_the_polls_bytes_where_the_disk_allows(self):
+        poll = self._poll()
+        hall_of_fame.record_poll(poll, poll.tally())
+        original = voting.media_path(CHAT, WEEK) / "1_0.jpg"
+        copy = hall_of_fame.media_file(CHAT, WEEK, "1_0.jpg")
+        self.assertEqual(copy.read_bytes(), original.read_bytes())
+        self.assertTrue(copy.samefile(original))
 
     def test_a_closed_vote_that_was_never_announced_comes_in_too(self):
         self._poll()

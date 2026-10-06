@@ -579,11 +579,13 @@ async def handle_export_image(request: web.Request) -> web.Response:
 
 
 async def handle_clear(request: web.Request) -> web.Response:
-    """Deletes the current poll outright -- entries, votes, admitted flags, downloaded
-    photos, all of it -- so the next "/vote собрать" starts a genuinely fresh poll.
-    Administrators only. Unlike announcing, there is nothing to keep on a failure here:
-    delete_poll is a local filesystem operation, not a Telegram send that can fail
-    independently of the state change."""
+    """Takes the current poll off the page -- entries, votes, admitted flags, photos --
+    so the next "/vote собрать" starts a genuinely fresh poll. Administrators only.
+
+    Into the archive, not the bin (voting.delete_poll): the week's ballots, entrants and
+    pictures stay on disk, out of sight of the page. Unlike announcing, there is nothing
+    to keep on a failure here: it is a local filesystem move, not a Telegram send that can
+    fail independently of the state change."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -2086,8 +2088,8 @@ $("announce").addEventListener("click", async () => {
 
 $("clear").addEventListener("click", async () => {
   if (!confirm(
-    "Точно очистить голосование? Все заявки, голоса и настройки удалятся безвозвратно " +
-    "-- дальше нужно будет /vote собрать заново."
+    "Точно очистить голосование? Заявки, голоса и фото уйдут со страницы в архив -- " +
+    "история не пропадёт, но дальше нужно будет /vote собрать заново."
   )) return;
   const button = $("clear");
   button.disabled = true;

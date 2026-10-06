@@ -25,13 +25,14 @@ import json
 import math
 import os
 import re
-import shutil
 import threading
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
+
+import archive_store
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 VOTING_DIR = DATA_DIR / "voting"
@@ -516,6 +517,45 @@ async def collect_entries(
     return entries
 
 
+async def download_post_photos(client, entity, message_id: int, media_dir: Path, log=print) -> list[str] | None:
+    """Downloads the photos of the post whose FIRST message is `message_id` into
+    `media_dir`, under the names collect_entries gives them, and returns those names --
+    or None when the post is gone from the chat.
+
+    Every work is a post in the chat, so a photo lost from disk can be fetched again from
+    there: this is how the Hall of Fame gets back the pictures of a week whose photos were
+    deleted before anything kept them. An album is the post's own message plus the ones
+    after it that share its grouped_id; the index in each name counts every message of the
+    album, photo or not, exactly as the collect did, so a re-download lands on the name
+    the records already carry.
+    """
+    head = await client.get_messages(entity, ids=int(message_id))
+    if head is None or getattr(head, "action", None) is not None:
+        return None
+    group = [head]
+    if getattr(head, "grouped_id", None):
+        following = await client.get_messages(
+            entity, ids=list(range(int(message_id) + 1, int(message_id) + MAX_ALBUM_ITEMS)),
+        )
+        group += [m for m in following or [] if m is not None and m.grouped_id == head.grouped_id]
+    group.sort(key=lambda m: m.id)
+    media_dir.mkdir(parents=True, exist_ok=True)
+    names = []
+    for index, message in enumerate(group[:MAX_ALBUM_ITEMS]):
+        if not message.photo:
+            continue
+        name = f"{head.id}_{index}.jpg"
+        path = media_dir / name
+        if not path.exists():
+            try:
+                await client.download_media(message, file=str(path))
+            except Exception as e:  # one unreadable photo must not lose the rest of the post
+                log(f"[voting] could not download photo {message.id}: {e}")
+                continue
+        names.append(name)
+    return names
+
+
 # ------------------------------------------------------------------------------ the poll
 
 
@@ -755,18 +795,34 @@ def save_poll(poll: Poll) -> None:
 
 
 def delete_poll(entry: str, poll_id: str) -> bool:
-    """Deletes a poll's JSON file and its downloaded media outright, rather than just
-    resetting its fields in place -- "start over" means the next /vote собрать builds a
-    genuinely fresh poll (its own created_at), not a same-poll reset that would still
-    carry the old identity. Returns whether there was anything to delete."""
+    """Takes one poll out of the live set -- the moderation screen's "🗑 Очистить
+    голосование". The next /vote собрать then builds a genuinely fresh poll (its own
+    created_at), not a same-poll reset that would still carry the old identity.
+
+    Despite the name, NOTHING IS DELETED: the file and its photos move into archive_dir(),
+    the same as archive_all_polls does. This used to unlink both, and a week cleared from
+    the moderation screen was lost -- ballots, entrants and pictures -- for good. Returns
+    whether there was a poll to take away."""
     path = poll_path(entry, poll_id)
     existed = path.exists()
-    if existed:
-        path.unlink()
-    media_dir = media_path(entry, poll_id)
-    if media_dir.exists():
-        shutil.rmtree(media_dir)
+    archive_store.move_to_archive(path, media_path(entry, poll_id), archive_dir())
     return existed
+
+
+def snapshot_poll(entry: str, poll_id: str) -> Path | None:
+    """A copy of the poll as it is now, before a collect for narrower dates removes works
+    from it -- with their admissions and their votes. The live poll then holds what the
+    administrator asked for, and what it held before is still on disk."""
+    return archive_store.snapshot(poll_path(entry, poll_id), archive_dir())
+
+
+def photo_dirs(entry: str, poll_id: str) -> list[Path]:
+    """Every directory a poll's photos may be in: its live one, then the ones it was
+    archived with (newest first) -- for anything that needs a week's pictures after the
+    week was cleared, such as the Hall of Fame's import."""
+    return [media_path(entry, poll_id)] + archive_store.archived_media_dirs(
+        archive_dir(), poll_path(entry, poll_id).stem,
+    )
 
 
 def poll_ids(entry: str) -> list[str]:
@@ -790,39 +846,29 @@ def archive_dir() -> Path:
 
 
 def archive_all_polls(entry: str) -> int:
-    """Clears the contest: every poll leaves the live set, and its photos are deleted.
+    """Clears the contest: every poll leaves the live set.
 
     "Очистить" means the contest starts over, so it cannot leave last week's poll behind
     to become `latest_poll` the moment this week's is gone -- clearing once and finding
     the previous week in its place is indistinguishable from the clear not having worked.
     Returns how many polls were cleared.
 
-    NOTHING RECORDED IS DESTROYED. The poll file is MOVED into archive_dir() rather than
-    unlinked, and the announced results (results_path) and rendered boards
-    (export_image_path) are left where they are -- clearing is "let me collect a new
-    vote", never "erase what the contest has already decided". Only the collected photos
-    go, because they are the bulk on disk and the boards have already been rendered from
-    them (see bot_listener._archive_vote_boards).
+    NOTHING RECORDED IS DESTROYED. Each poll file and its photos move into archive_dir()
+    together (archive_store.move_to_archive), and the announced results (results_path)
+    and rendered boards (export_image_path) are left where they are -- clearing is "let me
+    collect a new vote", never "erase what the contest has already decided". The photos
+    used to be deleted here as the bulk on disk; they are also the one thing nothing could
+    bring back, and the history of who entered what is what the Hall of Fame is made of.
     """
     cleared = 0
-    destination_dir = archive_dir()
     for poll_id in poll_ids(entry):
-        path = poll_path(entry, poll_id)
-        destination = destination_dir / path.name
         try:
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                # Cleared twice with a re-collect in between: keep both rather than let
-                # the second clear silently overwrite the first week's record.
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                destination = destination_dir / f"{path.stem}_{stamp}{path.suffix}"
-            path.replace(destination)
-            cleared += 1
+            if archive_store.move_to_archive(
+                poll_path(entry, poll_id), media_path(entry, poll_id), archive_dir(),
+            ) is not None:
+                cleared += 1
         except OSError:
             continue
-        media_directory = media_path(entry, poll_id)
-        if media_directory.exists():
-            shutil.rmtree(media_directory, ignore_errors=True)
     return cleared
 
 

@@ -51,6 +51,12 @@ session) -- or, more commonly, let listener.py's main() start this automatically
 alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 """
 
+# Before every project import: the modules read DATA_DIR as they load, and an attached
+# Railway Volume must be where they read it from (see storage.py).
+import storage
+
+storage.use_railway_volume()
+
 import asyncio
 import html
 import os
@@ -185,6 +191,7 @@ try:
 except Exception:  # noqa: BLE001
     HALL_IMPORT_ERROR = traceback.format_exc()
     hall_of_fame = hall_web = None
+import backup
 
 
 def game_available() -> bool:
@@ -575,7 +582,7 @@ NOMINATIONS_MODERATE_WORDS = frozenset({"выбрать", "настроить", 
 NOMINATIONS_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
 NOMINATIONS_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
 # The confirmation is a word on the end rather than a separate callback flow: clearing
-# archives the contest and deletes its photos, so it is asked first, and the button that
+# takes the contest and its photos off the page, so it is asked first, and the button that
 # answers simply replays the command with the confirmation spelled out.
 NOMINATIONS_CLEAR_CONFIRM_WORDS = frozenset({"очистить да", "clear yes"})
 NOMINATIONS_OPEN_BUTTON_TEXT = "🏷 Открыть номинации"
@@ -602,6 +609,12 @@ HALL_IMPORT_WORDS = frozenset({"импорт", "import", "история", "hist
 HALL_OPEN_BUTTON_TEXT = "🏆 Доска почёта"
 HALL_ACTION_CALLBACK_PREFIX = "hallaction"
 HALL_ACTIONS = {"import": "/hall импорт"}
+
+# "/backup" (DM; real chat administrators and the owner, not delegates -- the zip holds
+# every ballot, which is the vote-statistics screen's gate for the same reason): a zip of
+# the whole voting history, sent as a file (backup.py). One also goes to BACKUP_CHAT_ID
+# after every closed vote when that is set.
+BACKUP_COMMANDS = ("/backup", "/бэкап")
 
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
@@ -4701,8 +4714,8 @@ async def handle_vote_clear_callback(
             )
         except Exception as e:
             log(f"[bot_listener] failed to announce the vote clear: {e}")
-    # Pictures first: the boards are rendered from the photos the clear is about to
-    # delete, so archiving afterwards would find nothing left to draw.
+    # Pictures first: the boards are rendered from the live photo directories, which the
+    # clear moves into the archive, where nothing draws from them.
     archived = await _archive_vote_boards(entry, log=log)
     cleared = voting.archive_all_polls(entry)
     log(f"[bot_listener] {clicker.get('username') or target_user_id} cleared ALL vote polls ({cleared}, boards {archived})")
@@ -4711,8 +4724,8 @@ async def handle_vote_clear_callback(
             chat_id,
             (
                 f"Голосование очищено полностью: снято с показа — {cleared}.\n"
-                f"Сохранено картинками: {archived}. Итоги, статистика и сами голосования "
-                "убраны в архив, а не удалены.\n"
+                f"Сохранено картинками: {archived}. Итоги, статистика, сами голосования "
+                "и фото работ убраны в архив, а не удалены.\n"
                 "Собери заново: /vote собрать"
             ) if cleared else "Голосований и так нет.",
             parse_mode=None,
@@ -5746,7 +5759,7 @@ async def handle_arena_command(
         cleared = arena.archive_all_tournaments(entry)
         await reply(
             f"Арена очищена полностью: снято с показа турниров — {cleared}. "
-            "Сами турниры со статистикой убраны в архив, а не удалены. "
+            "Сами турниры со статистикой и фото убраны в архив, а не удалены. "
             "Голосование v1 не тронуто."
             if cleared else "Арена уже пуста."
         )
@@ -6042,7 +6055,7 @@ async def handle_nominations_command(
         cleared = await asyncio.to_thread(nominations.archive_contest, entry)
         log(f"[nominations] {user.get('username') or user.get('id')} cleared the contest ({cleared})")
         await reply(
-            "Номинации очищены и убраны в архив. Основное голосование не тронуто."
+            "Номинации очищены и убраны в архив вместе с фото. Основное голосование не тронуто."
             if cleared else "Номинаций и так нет."
         )
         return
@@ -6107,6 +6120,43 @@ def _record_vote_in_hall(poll, standings: list, log=print) -> None:
         log(f"[bot_listener] recorded poll {poll.poll_id} in the Hall of Fame ({len(contest.works)} works)")
     except Exception:
         log(f"[bot_listener] could not record poll {poll.poll_id} in the Hall of Fame:\n{traceback.format_exc()}")
+
+
+async def _restore_hall_photos(telethon_client, entry: str, log=print) -> tuple[int, int]:
+    """Fetches back from the chat every Hall of Fame photo that is missing on disk, and
+    returns (works that have pictures again, works whose post is gone).
+
+    The posts are the originals: a week whose photos were deleted -- by a clear before
+    clears kept them, or a disk that was lost -- still has every picture in the chat, and
+    each work in the hall knows the message it was posted as. Sequential on purpose: a
+    burst of downloads is what makes Telegram throttle the session the bot also reads
+    the chat with."""
+    if telethon_client is None or hall_of_fame is None:
+        return 0, 0
+    missing = await asyncio.to_thread(hall_of_fame.works_missing_photos, entry)
+    if not missing:
+        return 0, 0
+    try:
+        entity = await asyncio.wait_for(resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS)
+    except Exception as e:
+        log(f"[bot_listener] could not open the chat to restore hall photos: {e}")
+        return 0, 0
+    restored = gone = 0
+    for contest_id, entry_id, message_id in missing:
+        try:
+            names = await voting.download_post_photos(
+                telethon_client, entity, message_id, hall_of_fame.media_dir(entry, contest_id), log=log,
+            )
+        except Exception as e:
+            log(f"[bot_listener] could not fetch post {message_id} for the hall: {e}")
+            continue
+        if not names:
+            gone += 1
+            continue
+        if await asyncio.to_thread(hall_of_fame.attach_photos, entry, contest_id, entry_id, names):
+            restored += 1
+    log(f"[bot_listener] hall photos: {restored} work(s) restored from the chat, {gone} post(s) gone")
+    return restored, gone
 
 
 def _hall_action_callback_data(action: str, user_id) -> str:
@@ -6190,10 +6240,13 @@ async def handle_hall_command(
             await reply("Не получилось перенести историю — смотри логи.")
             return
         lines = [f"Готово. Перенесено конкурсов: {counts['added']}, уже были: {counts['known']}."]
-        if counts["without_photos"]:
+        restored, gone = await _restore_hall_photos(telethon_client, entry, log=log)
+        if restored:
+            lines.append(f"Фото возвращены из чата: {restored} работ.")
+        if gone:
             lines.append(
-                f"Без фото: {counts['without_photos']} — их голосования очистили раньше, чем "
-                "появилась Доска почёта; имена, места и голоса на месте."
+                f"Без фото остались {gone} работ: их посты в чате удалены, взять фото неоткуда. "
+                "Имена, места и голоса на месте."
             )
         await reply("\n".join(lines), reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
         return
@@ -6215,6 +6268,9 @@ async def handle_hall_command(
     if await is_admin():
         rows.append([{"text": "📥 Перенести историю итогов",
                       "callback_data": _hall_action_callback_data("import", user.get("id"))}])
+        warning = storage.persistence_warning()
+        if warning:
+            text = f"{warning}\n\n{text}"
     await reply(text, reply_markup={"inline_keyboard": rows})
 
 
@@ -6252,6 +6308,79 @@ async def handle_hall_action_callback(
     ))
     background_tasks.add(task)
     task.add_done_callback(background_tasks.discard)
+
+
+def _history_sources() -> dict:
+    """Where each voting store lives, by the name it has under DATA_DIR -- read from the
+    stores themselves, so a test that moves one moves its backup too. A store whose module
+    did not load is left out rather than guessed at."""
+    sources = {"voting": voting._voting_dir()}
+    if arena is not None:
+        sources["arena"] = arena._arena_dir()
+    if nominations is not None:
+        sources["nominations"] = nominations._nominations_dir()
+    if hall_of_fame is not None:
+        sources["hall_of_fame"] = hall_of_fame._hall_dir()
+    return sources
+
+
+def _backups_dir() -> Path:
+    """DATA_DIR/backups -- beside the stores, not inside one of them."""
+    return voting._voting_dir().parent / "backups"
+
+
+async def _send_history_backup(api: TelegramBotAPI, chat_id, why: str, log=print) -> str | None:
+    """Builds the zip (in a worker thread) and sends it to `chat_id`. Returns None once
+    sent, or a sentence saying why it was not -- the zip is on disk either way."""
+    try:
+        path, count = await asyncio.to_thread(backup.build_backup, _history_sources(), _backups_dir())
+    except Exception:
+        log(f"[bot_listener] building the history backup failed:\n{traceback.format_exc()}")
+        return "Не получилось собрать резервную копию — смотри логи."
+    if backup.too_big_to_send(path):
+        return (f"Резервная копия собрана ({count} записей), но больше 50 МБ — Telegram такую не "
+                f"примет. Она лежит на сервере: {path}")
+    caption = (
+        f"Резервная копия истории голосований {why}: записей — {count}. Голоса, участники, "
+        "итоги, Доска почёта. Фото в неё не входят: они в постах чата, и Доска почёта "
+        "возвращает их оттуда (/hall импорт). Чтобы восстановить — распаковать в DATA_DIR."
+    )
+    try:
+        await api.send_document_file(chat_id, path, caption=caption)
+    except Exception as e:
+        log(f"[bot_listener] sending the history backup to {chat_id} failed: {e}")
+        return f"Резервная копия собрана, но отправить её не вышло: {e}. Она лежит на сервере: {path}"
+    log(f"[bot_listener] sent a history backup ({count} records) to {chat_id}")
+    return None
+
+
+async def handle_backup_command(api: TelegramBotAPI, telethon_client, message: dict, entry: str | None,
+                                log=print) -> None:
+    """"/backup": the zip of the voting history, to whoever asked -- in the DM, and only
+    for a real administrator of the chat or the owner. Delegates are left out, as they
+    are from the vote statistics: the zip says who voted for whom."""
+    chat = message["chat"]
+    user = message.get("from") or {}
+
+    async def reply(text: str):
+        try:
+            await api.send_message(chat["id"], text, reply_to_message_id=message.get("message_id"), parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] failed to send the backup reply: {e}")
+
+    if chat.get("type") != "private":
+        await reply("Резервная копия — только в личке с ботом.")
+        return
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log) if entry else None
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, user):
+        await reply("Резервную копию могут получить только администраторы чата.")
+        return
+    warning = storage.persistence_warning()
+    if warning:
+        await reply(warning)
+    problem = await _send_history_backup(api, chat["id"], "по запросу", log=log)
+    if problem:
+        await reply(problem)
 
 
 async def handle_vote_command(
@@ -6518,6 +6647,13 @@ async def handle_vote_command(
         if collect_range:
             dropped = [e for e in kept if not voting.posted_within(e, window_start, window_end)]
             kept = [e for e in kept if voting.posted_within(e, window_start, window_end)]
+        if dropped:
+            # They leave the vote, but not the record: the poll as it was -- those works,
+            # their admissions and their votes -- is kept in the archive first.
+            try:
+                voting.snapshot_poll(entry, poll_id)
+            except OSError as e:
+                log(f"[bot_listener] could not snapshot poll {poll_id} before narrowing it: {e}")
         all_entries = kept + new_entries
         poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll, theme=theme)
         # The poll just collected is the one being worked on, so it becomes what the page
@@ -6681,6 +6817,11 @@ async def handle_vote_command(
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
         if is_manager:
             text = _vote_status_text(entry)
+            # The one place an administrator looks every week, so a history that the next
+            # deploy would wipe is said here, above the standings.
+            warning = storage.persistence_warning()
+            if warning:
+                text = f"{warning}\n\n{text}"
             admin_user_id = user.get("id")
             await reply(
                 text,
@@ -11393,6 +11534,14 @@ async def _dispatch_update(
         task.add_done_callback(background_tasks.discard)
         return
 
+    if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in BACKUP_COMMANDS):
+        task = asyncio.create_task(
+            handle_backup_command(api, telethon_client, message, home_chat_ref, log=log)
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
     # "/hall" -- the Hall of Fame (hall_web.py). Matched as a whole word: "/hall" is a
     # prefix of more than one English word.
     if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in HALL_COMMANDS):
@@ -11719,6 +11868,11 @@ async def run_bot_listener(
     that listener.py isn't running their detection either in that mode. Commands and
     /summary still work standalone: those come from the bot's own updates."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
+    # Loud at every boot: a history on a disk the next deploy wipes is otherwise found out
+    # only by the deploy that wipes it.
+    log(f"[bot_listener] keeping votes, photos and the Hall of Fame under {storage.data_dir()}")
+    if storage.persistence_warning():
+        log(f"[bot_listener] {storage.persistence_warning()}")
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
     # Maps a LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to.
@@ -12252,10 +12406,21 @@ async def run_bot_listener(
                 if home_chat_ref
                 else None
             )
-            # Into the Hall of Fame now, while the poll's photos are certainly still on
-            # disk -- "очистить" deletes them. Off the event loop (copies, thumbnails) and
-            # in the background, so the draft is not kept waiting for the pictures.
-            hall_task = asyncio.create_task(asyncio.to_thread(_record_vote_in_hall, poll, standings, log))
+            # Into the Hall of Fame now, while the poll's photos are certainly still where
+            # the poll keeps them -- "очистить" moves them into the archive. Off the event
+            # loop (copies, thumbnails) and in the background, so the draft is not kept
+            # waiting for the pictures.
+            async def _keep_the_closed_vote():
+                await asyncio.to_thread(_record_vote_in_hall, poll, standings, log)
+                # Then the zip, so it already holds the contest just recorded.
+                if getattr(cfg, "backup_chat_id", None):
+                    problem = await _send_history_backup(
+                        api, cfg.backup_chat_id, f"после голосования {poll.poll_id}", log=log,
+                    )
+                    if problem:
+                        log(f"[bot_listener] {problem}")
+
+            hall_task = asyncio.create_task(_keep_the_closed_vote())
             background_tasks.add(hall_task)
             hall_task.add_done_callback(background_tasks.discard)
             await send_vote_results_draft(

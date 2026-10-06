@@ -366,8 +366,9 @@ async def handle_moderate(request: web.Request) -> web.Response:
 
 
 async def handle_clear(request: web.Request) -> web.Response:
-    """Deletes this arena outright -- works, ballots, photos. Administrators only.
-    v1's poll is untouched by this, as by everything else here."""
+    """Takes this arena off the page -- works, ballots, photos -- into the archive, not
+    the bin (arena.delete_tournament). Administrators only. v1's poll is untouched by
+    this, as by everything else here."""
     body = await _body(request)
     user = await _authenticate(request, body)
     if not await request.app[_IS_ADMIN_KEY](user):
@@ -1198,7 +1199,7 @@ async function saveModeration() {
 $("go").addEventListener("click", () => { if (state && state.is_admin) saveModeration(); });
 
 $("clear").addEventListener("click", async () => {
-  if (!confirm("Точно очистить арену? Все работы и голоса удалятся безвозвратно. Голосование v1 это не тронет.")) return;
+  if (!confirm("Точно очистить арену? Работы, голоса и фото уйдут в архив — история не пропадёт. Голосование v1 это не тронет.")) return;
   const button = $("clear");
   button.disabled = true;
   try {

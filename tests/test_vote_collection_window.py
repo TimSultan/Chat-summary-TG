@@ -461,12 +461,29 @@ class ClearingTests(unittest.TestCase):
         # ...and the archive is invisible to everything that reads the live contest.
         self.assertEqual(voting.poll_ids(CHAT), [])
 
-    def test_the_collected_photos_are_the_one_thing_actually_deleted(self):
+    def test_the_photos_leave_the_page_with_their_poll_and_are_kept(self):
+        """They used to be the one thing a clear deleted -- and the one thing nothing could
+        bring back."""
         voting.archive_all_polls(CHAT)
 
         for poll_id in (LAST_WEEK, THIS_WEEK):
             with self.subTest(poll_id=poll_id):
                 self.assertFalse(voting.media_path(CHAT, poll_id).exists())
+                (archived,) = voting.photo_dirs(CHAT, poll_id)[1:]
+                self.assertEqual((archived / "a.jpg").read_bytes(), b"jpeg-ish")
+
+    def test_clearing_the_same_week_twice_keeps_both_sets_of_photos(self):
+        voting.archive_all_polls(CHAT)
+        media = voting.media_path(CHAT, THIS_WEEK)
+        media.mkdir(parents=True)
+        (media / "b.jpg").write_bytes(b"second")
+        voting.save_poll(voting.Poll(poll_id=THIS_WEEK, entry=CHAT, created_at="2026-08-01",
+                                     entries=[_entry("2")]))
+
+        voting.archive_all_polls(CHAT)
+
+        names = [sorted(p.name for p in d.iterdir()) for d in voting.photo_dirs(CHAT, THIS_WEEK)[1:]]
+        self.assertEqual(sorted(names), [["a.jpg"], ["b.jpg"]])
 
     def test_clearing_twice_keeps_both_records_instead_of_overwriting(self):
         voting.archive_all_polls(CHAT)
@@ -517,6 +534,9 @@ class ArenaClearingTests(unittest.TestCase):
         archived = list(arena.archive_dir().glob("*.json"))
         self.assertEqual(len(archived), 2)
         self.assertIsNone(arena.latest_tournament(CHAT))
+        # ...and their photos with them, rather than deleted.
+        photos = sorted(p.name for p in (arena.archive_dir() / "media").rglob("*.jpg"))
+        self.assertEqual(photos, ["a.jpg", "a.jpg"])
 
 
 class CarryOverIsGoneTests(unittest.TestCase):
