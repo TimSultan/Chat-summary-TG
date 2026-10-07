@@ -1142,6 +1142,16 @@ disk that was lost: every work is a post, and the hall knows its message id
 Telegram does not throttle the session). Only a work whose post was deleted from the chat
 stays without a picture; the reply says how many.
 
+**Saying what a contest was, after the fact.** A week recorded as "Итоги недели" that was
+really a thematic contest (week 40 was `#МассПокрас`) is renamed from the bot: `/hall
+конкурсы` (DM, administrators; also "✏️ Хэштег и название конкурса" under `/hall`) lists the
+contests as buttons, and the reply to a tap is the hashtag with an optional badge and title
+— `#МассПокрас 🎨 МассПокрас` — or `#итогинедели` to make it weekly again. Typed in one go:
+`/hall тема 2026-W40 #МассПокрас 🎨 МассПокрас`. A bare tag titles the contest as the tag was
+typed. It rewrites the contest in the hall, the results record it would be imported from
+again (`voting.relabel_results`), so the name survives a re-import, and remembers the theme
+for the next `/vote собрать`.
+
 **`/hall`** itself (also `/зал`, `/доска`, and in both command menus) answers with the link:
 a plain url in a group, so anybody can open it, and in the DM a Mini App button plus "Открыть
 в браузере". The administrator's bare `/vote` panel has a "🏆 Доска почёта" button too.

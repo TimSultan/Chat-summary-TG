@@ -1336,6 +1336,23 @@ def load_archived_poll(entry: str, poll_id: str) -> Poll | None:
     return None
 
 
+def relabel_results(entry: str, poll_id: str, hashtag, title: str = "", badge: str = "") -> bool:
+    """Rewrites which contest an announced results record says it was -- the hashtag,
+    title and badge the Hall of Fame imports it under -- leaving its standings alone.
+    Returns whether there was a record to rewrite."""
+    record = load_results(entry, poll_id)
+    if record is None:
+        return False
+    tag = normalize_hashtag(hashtag) or CONTEST_HASHTAG
+    weekly = tag == CONTEST_HASHTAG
+    record.update(hashtag=tag, title="" if weekly else title, badge="" if weekly else badge)
+    path = results_path(entry, poll_id)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return True
+
+
 def load_results(entry: str, poll_id: str) -> dict | None:
     """The record save_results wrote, or None if there is none or it is unreadable --
     same tolerance as load_poll: a corrupt file means "nothing announced yet" to every

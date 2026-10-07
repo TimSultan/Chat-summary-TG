@@ -184,5 +184,106 @@ class RecordOnCloseTests(_Hall):
         record.assert_not_called()
 
 
+class RelabelContestTests(_Hall):
+    """Week 40 was recorded as "Итоги недели" and was really #МассПокрас."""
+
+    WEEK = "2026-W40"
+
+    def setUp(self):
+        super().setUp()
+        poll = self._closed_poll(self.WEEK)
+        hall_of_fame.record_poll(poll)
+        voting.save_results(poll, poll.tally(), "итоги")
+
+    def _reply(self, text, user=ADMIN, prompt=None):
+        api = FakeApi()
+        prompt = prompt or f"{bot_listener.HALL_THEME_PROMPT}\n\nКод конкурса: {self.WEEK}"
+        message = {"message_id": 2, "chat": {"id": DM, "type": "private"}, "from": user, "text": text,
+                   "reply_to_message": {"message_id": 1, "text": prompt, "from": {"id": 1, "is_bot": True}}}
+
+        async def resolve(*args, **kwargs):
+            return -100
+
+        async def can_manage(api_, chat_id_, user_, entry=None):
+            return user_.get("id") == ADMIN["id"]
+
+        async def scenario():
+            with patch.object(bot_listener, "_resolve_chat_id", resolve), \
+                    patch.object(bot_listener, "_can_manage_chat", can_manage):
+                return await bot_listener.handle_hall_theme_reply(
+                    api, None, _cfg(), message, CHAT, log=lambda *_: None)
+
+        return api, asyncio.run(scenario())
+
+    def test_typed_it_becomes_the_thematic_contest_it_was(self):
+        api = self._type(f"/hall тема {self.WEEK} #МассПокрас 🎨 МассПокрас")
+        contest = hall_of_fame.load_contest(CHAT, self.WEEK)
+        self.assertEqual((contest.hashtag, contest.title, contest.badge), ("#масспокрас", "МассПокрас", "🎨"))
+        self.assertFalse(contest.is_weekly)
+        self.assertEqual(contest.winner_badge(), "🎨")
+        self.assertIn("«МассПокрас» (#масспокрас)", api.sent[0][0])
+        self.assertIn(f"https://example.com/hall#/contest/{self.WEEK}", api.sent[0][0])
+        # ...and stays so: the results record it would be imported from again says so too,
+        # and the next collect offers the theme as a button.
+        record = voting.load_results(CHAT, self.WEEK)
+        self.assertEqual((record["hashtag"], record["title"], record["badge"]), ("#масспокрас", "МассПокрас", "🎨"))
+        self.assertEqual(voting.find_theme(CHAT, "#масспокрас").title, "МассПокрас")
+
+    def test_a_bare_tag_names_the_contest_as_it_was_typed(self):
+        self._type(f"/hall тема {self.WEEK} #МассПокрас")
+        contest = hall_of_fame.load_contest(CHAT, self.WEEK)
+        self.assertEqual((contest.title, contest.label()), ("МассПокрас", "МассПокрас"))
+
+    def test_the_artists_badge_follows_the_contest(self):
+        self._type(f"/hall тема {self.WEEK} #МассПокрас 🎨 МассПокрас")
+        hall_of_fame._cache.clear()
+        (artist,) = hall_of_fame.snapshot(CHAT).artists
+        self.assertEqual([c.winner_badge() for c in artist.wins], ["🎨"])
+
+    def test_the_weekly_tag_makes_it_the_weekly_contest_again(self):
+        self._type(f"/hall тема {self.WEEK} #МассПокрас 🎨 МассПокрас")
+        self._type(f"/hall тема {self.WEEK} #итогинедели")
+        contest = hall_of_fame.load_contest(CHAT, self.WEEK)
+        self.assertTrue(contest.is_weekly)
+        self.assertEqual((contest.title, contest.badge, contest.label()), ("", "", "Итоги недели"))
+
+    def test_only_an_administrator_relabels_and_only_a_real_hashtag(self):
+        self.assertIn("только администраторы", self._type(f"/hall тема {self.WEEK} #МассПокрас", user=STRANGER).sent[0][0])
+        self.assertIn("Нужен хэштег", self._type(f"/hall тема {self.WEEK} МассПокрас").sent[0][0])
+        self.assertIn("нет", self._type("/hall тема 2026-W01 #МассПокрас").sent[0][0])
+        self.assertTrue(hall_of_fame.load_contest(CHAT, self.WEEK).is_weekly)
+
+    def test_the_contest_list_has_a_button_per_contest(self):
+        text, markup = self._type("/hall конкурсы").sent[0]
+        (button,) = _buttons(markup)
+        self.assertEqual(button["callback_data"], f"halltheme:{self.WEEK}:{ADMIN['id']}")
+        self.assertIn("2026-W40 · Итоги недели · 🥇 Аня", button["text"])
+        panel = _buttons(self._type("/hall").sent[0][1])
+        self.assertIn(f"hallaction:contests:{ADMIN['id']}", [b.get("callback_data") for b in panel])
+
+    def test_a_tap_asks_for_the_tag_with_the_contests_code(self):
+        api = FakeApi()
+        callback = {"id": "cbq", "from": ADMIN, "data": f"halltheme:{self.WEEK}:{ADMIN['id']}",
+                    "message": {"message_id": 3, "chat": {"id": DM, "type": "private"}}}
+        asyncio.run(bot_listener.handle_hall_theme_callback(api, callback, CHAT, log=lambda *_: None))
+        text, markup = api.sent[0]
+        self.assertTrue(text.startswith(bot_listener.HALL_THEME_PROMPT))
+        self.assertTrue(text.endswith(f"Код конкурса: {self.WEEK}"))
+        self.assertTrue(markup["force_reply"])
+
+    def test_the_reply_relabels_and_a_stranger_cannot(self):
+        api, handled = self._reply("#МассПокрас 🎨 МассПокрас", user=STRANGER)
+        self.assertTrue(handled)
+        self.assertTrue(hall_of_fame.load_contest(CHAT, self.WEEK).is_weekly)
+        api, handled = self._reply("#МассПокрас 🎨 МассПокрас")
+        self.assertTrue(handled)
+        self.assertEqual(hall_of_fame.load_contest(CHAT, self.WEEK).label(), "МассПокрас")
+        self.assertIn("Готово", api.sent[0][0])
+
+    def test_only_an_answer_to_that_prompt_is_claimed(self):
+        _, handled = self._reply("#МассПокрас", prompt="Какой текст написать в объявлении?")
+        self.assertFalse(handled)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -488,6 +488,24 @@ def attach_photos(entry: str, contest_id: str, entry_id: str, names: list[str]) 
         return True
 
 
+def relabel_contest(entry: str, contest_id: str, hashtag, title: str = "", badge: str = "") -> Contest | None:
+    """Says what a recorded contest was, after the fact: its hashtag, title and winner's
+    badge -- a week recorded as "Итоги недели" that was really a thematic contest (or the
+    other way round). Returns the contest as it now is, or None when there is no such
+    contest. The weekly hashtag clears the title and badge: that contest has fixed ones."""
+    tag = voting.normalize_hashtag(hashtag) or voting.CONTEST_HASHTAG
+    with _write_lock:
+        contest = load_contest(entry, contest_id)
+        if contest is None:
+            return None
+        contest.hashtag = tag
+        weekly = tag == voting.CONTEST_HASHTAG
+        contest.title = "" if weekly else (title or "")[:voting.THEME_TITLE_MAX_LENGTH].strip()
+        contest.badge = "" if weekly else (badge or "")[:voting.THEME_BADGE_MAX_LENGTH].strip()
+        save_contest(contest)
+        return contest
+
+
 # ------------------------------------------------------------------------------ reading
 
 

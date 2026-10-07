@@ -608,7 +608,18 @@ HALL_COMMANDS = ("/hall", "/зал", "/доска")
 HALL_IMPORT_WORDS = frozenset({"импорт", "import", "история", "history"})
 HALL_OPEN_BUTTON_TEXT = "🏆 Доска почёта"
 HALL_ACTION_CALLBACK_PREFIX = "hallaction"
-HALL_ACTIONS = {"import": "/hall импорт"}
+HALL_ACTIONS = {"import": "/hall импорт", "contests": "/hall конкурсы"}
+# Saying after the fact what a recorded contest was -- a week recorded as "Итоги недели"
+# that was really #МассПокрас. "/hall конкурсы" lists the contests as buttons; a tap asks
+# for the hashtag and title (HALL_THEME_PROMPT, answered by a reply, matched by the
+# contest's code on its last line, so nothing is held in memory). Typed in one go:
+# "/hall тема 2026-W40 #МассПокрас 🎨 МассПокрас". "#итогинедели" makes it weekly again.
+HALL_CONTESTS_WORDS = frozenset({"конкурсы", "конкурс", "contests"})
+HALL_THEME_WORDS = ("тема", "theme")
+HALL_THEME_CALLBACK_PREFIX = "halltheme"
+HALL_THEME_PROMPT = "✏️ Пришли хэштег этого конкурса ответом на это сообщение."
+HALL_THEME_CODE = re.compile(r"Код конкурса: ([A-Za-z0-9_.-]+)\s*$")
+HALL_CONTEST_BUTTONS = 20
 
 # "/backup" (DM; real chat administrators and the owner, not delegates -- the zip holds
 # every ballot, which is the vote-statistics screen's gate for the same reason): a zip of
@@ -6159,6 +6170,113 @@ async def _restore_hall_photos(telethon_client, entry: str, log=print) -> tuple[
     return restored, gone
 
 
+def _hall_contest_label(contest) -> str:
+    """"2026-W40 · Итоги недели · 🥇 Аня" -- one contest, as a button names it."""
+    winner = contest.winner()
+    parts = [contest.week() or contest.contest_id, contest.label()]
+    if winner is not None:
+        parts.append(f"🥇 {winner.author_name}")
+    return " · ".join(parts)
+
+
+async def _relabel_hall_contest(entry: str, contest_id: str, theme_text: str, url: str | None, log=print) -> str:
+    """Applies "#хэштег [значок] [название]" to a recorded contest -- in the Hall of Fame,
+    in the results record it would be imported from again, and as a remembered theme so
+    the next collect offers it -- and says what it did, in one sentence for the reply."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", contest_id or ""):
+        return "Не понял, какой это конкурс — открой /hall конкурсы."
+    parsed = voting.parse_theme_text(theme_text) if (theme_text or "").startswith("#") else None
+    if parsed is None:
+        return ("Нужен хэштег с # в начале: «#МассПокрас», можно со значком и названием — "
+                "«#МассПокрас 🎨 МассПокрас». «#итогинедели» вернёт обычные итоги недели.")
+    tag, title, badge = parsed
+    if not voting.is_weekly_hashtag(tag) and not title:
+        # The tag as it was typed reads better than the lower-cased one: "МассПокрас".
+        title = theme_text.split()[0].lstrip("#")
+
+    def apply():
+        contest = hall_of_fame.relabel_contest(entry, contest_id, tag, title, badge)
+        if contest is None:
+            return None
+        voting.relabel_results(entry, contest_id, tag, contest.title, contest.badge)
+        if not contest.is_weekly:
+            voting.remember_theme(entry, tag, contest.title, contest.badge or None)
+        return contest
+
+    contest = await asyncio.to_thread(apply)
+    if contest is None:
+        return f"Конкурса {contest_id} на Доске почёта нет — открой /hall конкурсы."
+    log(f"[bot_listener] hall contest {contest_id} is now {contest.hashtag} «{contest.label()}»")
+    what = "итоги недели" if contest.is_weekly else f"«{contest.label()}» ({contest.hashtag}), значок победителя {contest.winner_badge()}"
+    return f"Готово: {contest.week() or contest_id} теперь {what}." + (f"\n{url}#/contest/{contest_id}" if url else "")
+
+
+def _hall_theme_callback_data(contest_id: str, user_id) -> str:
+    return f"{HALL_THEME_CALLBACK_PREFIX}:{contest_id}:{user_id}"
+
+
+async def handle_hall_theme_callback(api: TelegramBotAPI, callback: dict, entry: str | None, log=print) -> None:
+    """A tap on one contest of "/hall конкурсы": asks for its hashtag and title. The
+    administrator check comes with the reply, which is what changes anything."""
+    parts = (callback.get("data") or "").split(":")
+    if (len(parts) != 3 or parts[0] != HALL_THEME_CALLBACK_PREFIX
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1]) or not parts[2].lstrip("-").isdigit()):
+        await api.answer_callback_query(callback["id"])
+        return
+    contest_id, target_user_id = parts[1], int(parts[2])
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    hall = await asyncio.to_thread(hall_of_fame.snapshot, entry or "")
+    contest = hall.by_id.get(contest_id)
+    now = f"Сейчас: {_hall_contest_label(contest)}" if contest else ""
+    chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id") or target_user_id
+    try:
+        await api.send_message(
+            chat_id,
+            f"{HALL_THEME_PROMPT}\nМожно со значком победителя и названием: «#МассПокрас 🎨 МассПокрас». "
+            f"«#итогинедели» — обычные итоги недели.\n\n{now}\nКод конкурса: {contest_id}",
+            parse_mode=None,
+            reply_markup={"force_reply": True, "selective": True},
+        )
+    except Exception as e:
+        log(f"[bot_listener] could not ask for a hall contest's hashtag: {e}")
+
+
+async def handle_hall_theme_reply(api: TelegramBotAPI, telethon_client, cfg, message: dict,
+                                  entry: str | None, log=print) -> bool:
+    """A DM reply to HALL_THEME_PROMPT: the hashtag and title for the contest its code
+    names. Returns True once the message was such a reply. Re-checks the administrator."""
+    chat = message.get("chat") or {}
+    replied = message.get("reply_to_message") or {}
+    prompt = str(replied.get("text") or "")
+    if (chat.get("type") != "private" or not (replied.get("from") or {}).get("is_bot")
+            or not prompt.startswith(HALL_THEME_PROMPT)):
+        return False
+
+    async def answer(text: str) -> None:
+        try:
+            await api.send_message(chat["id"], text, reply_to_message_id=message.get("message_id"), parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] could not answer a hall contest's hashtag: {e}")
+
+    code = HALL_THEME_CODE.search(prompt)
+    if code is None or hall_of_fame is None or not entry:
+        await answer("Не понял, какой это конкурс — открой /hall конкурсы заново.")
+        return True
+    user = message.get("from") or {}
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+    if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+        await answer("Менять конкурсы на Доске почёта могут только администраторы.")
+        return True
+    await answer(await _relabel_hall_contest(
+        entry, code.group(1), " ".join(str(message.get("text") or "").split()), _hall_page_url(cfg), log=log,
+    ))
+    return True
+
+
 def _hall_action_callback_data(action: str, user_id) -> str:
     return f"{HALL_ACTION_CALLBACK_PREFIX}:{action}:{user_id}"
 
@@ -6218,6 +6336,9 @@ async def handle_hall_command(
             argument = argument[len(spelling):]
             break
     wants_import = " ".join(argument.lower().split()) in HALL_IMPORT_WORDS
+    wants_contests = " ".join(argument.lower().split()) in HALL_CONTESTS_WORDS
+    words = argument.split()
+    theme_request = (words[1:] if words and words[0].lower() in HALL_THEME_WORDS else None)
 
     async def is_admin() -> bool:
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
@@ -6251,6 +6372,35 @@ async def handle_hall_command(
         await reply("\n".join(lines), reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
         return
 
+    if wants_contests or theme_request is not None:
+        if not is_private:
+            await reply("Это — только в личке с ботом.")
+            return
+        if not await is_admin():
+            await reply("Менять конкурсы на Доске почёта могут только администраторы.")
+            return
+        if theme_request:
+            await reply(await _relabel_hall_contest(
+                entry, theme_request[0], " ".join(theme_request[1:]), url, log=log,
+            ))
+            return
+        if theme_request is not None:
+            await reply("Напиши так: /hall тема 2026-W40 #МассПокрас — или открой /hall конкурсы.")
+            return
+        hall = await asyncio.to_thread(hall_of_fame.snapshot, entry)
+        if not hall.contests:
+            await reply("На Доске почёта пока нет конкурсов.")
+            return
+        rows = [[{"text": _hall_contest_label(contest)[:64],
+                  "callback_data": _hall_theme_callback_data(contest.contest_id, user.get("id"))}]
+                for contest in hall.contests[:HALL_CONTEST_BUTTONS]]
+        await reply(
+            "Какой конкурс поправить? Нажми на него и пришли его хэштег и название — "
+            "например «#МассПокрас 🎨 МассПокрас». Сначала самые новые.",
+            reply_markup={"inline_keyboard": rows},
+        )
+        return
+
     hall = await asyncio.to_thread(hall_of_fame.snapshot, entry)
     summary = (
         f"Конкурсов: {len(hall.contests)} · художников: {len(hall.artists)}."
@@ -6268,6 +6418,9 @@ async def handle_hall_command(
     if await is_admin():
         rows.append([{"text": "📥 Перенести историю итогов",
                       "callback_data": _hall_action_callback_data("import", user.get("id"))}])
+        if hall.contests:
+            rows.append([{"text": "✏️ Хэштег и название конкурса",
+                          "callback_data": _hall_action_callback_data("contests", user.get("id"))}])
         warning = storage.persistence_warning()
         if warning:
             text = f"{warning}\n\n{text}"
@@ -10973,6 +11126,8 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, log=log,
             )
+        elif callback_data.startswith(f"{HALL_THEME_CALLBACK_PREFIX}:"):
+            await handle_hall_theme_callback(api, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{HALL_ACTION_CALLBACK_PREFIX}:"):
             await handle_hall_action_callback(
                 api, telethon_client, cfg, callback, home_chat_ref, bot_username,
@@ -11365,6 +11520,10 @@ async def _dispatch_update(
     if await handle_vote_result_text_input(
         api, message, vote_result_flows, log=log
     ):
+        return
+
+    # The answer to "/hall конкурсы"'s question: which hashtag a recorded contest had.
+    if await handle_hall_theme_reply(api, telethon_client, cfg, message, home_chat_ref, log=log):
         return
 
     # The answer to the picker's "✏️ Новый хэштег". Recognised by the prompt it replies
