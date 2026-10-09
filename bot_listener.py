@@ -4444,7 +4444,8 @@ def _vote_page_url(cfg) -> str | None:
 
 # The way round a Telegram that will not open the Mini App: a plain web page in the phone's
 # browser (vote_web.BROWSER_HTML) whose last step is a link back to this bot carrying the
-# choices. Put beside every v1 vote button, worded the way the owner asked for it.
+# choices. Put beside the v1 vote buttons except the posted announcement's, worded the
+# way the owner asked for it.
 VOTE_BROWSER_BUTTON_TEXT = "Если Бот не работает"
 
 
@@ -6533,11 +6534,9 @@ async def handle_vote_chat_destination_callback(
     if button is None:
         await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
         return
-    # v1's announcement also carries the browser page, for whoever's Telegram will not
-    # open the vote; the arena has no such page, so its post keeps its one button.
-    keyboard = {"inline_keyboard": [[button]] + (
-        _vote_browser_row(cfg) if (flow.get("system") or "vote") == "vote" else []
-    )}
+    # One button only: the owner wants the posted announcement without "Если Бот не
+    # работает" -- the browser page stays on the DM, the admin panel and the group reply.
+    keyboard = {"inline_keyboard": [[button]]}
 
     targets: list[tuple[str, object]] = []
     if destination in ("main", "both"):

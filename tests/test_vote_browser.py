@@ -8,7 +8,7 @@ and the ballot is cast by the Telegram account that sends it. So what is pinned 
 - the page and its data need no Telegram at all, and the data is only what the chat saw;
 - the page's link and the bot agree on the format;
 - a ballot that arrives that way keeps every rule a Mini App ballot keeps;
-- every v1 vote button now has "Если Бот не работает" beside it.
+- every v1 vote button but the posted announcement's has "Если Бот не работает" beside it.
 """
 
 import asyncio
@@ -392,7 +392,8 @@ class LinkRoutingTests(unittest.TestCase):
 
 
 class FallbackButtonTests(unittest.TestCase):
-    """"Если Бот не работает" beside every v1 vote button, leading to the browser page."""
+    """"Если Бот не работает" beside the v1 vote buttons, leading to the browser page --
+    except on the posted announcement, which keeps its one button."""
 
     def _type(self, user, manager, chat_type="private"):
         api = FakeApi()
@@ -427,7 +428,7 @@ class FallbackButtonTests(unittest.TestCase):
     def test_the_group_reply_has_it(self):
         self.assertEqual(len(self._fallback(self._type(VOTER, manager=False, chat_type="group"))), 1)
 
-    def test_v1s_announcement_carries_it_and_the_arenas_does_not(self):
+    def test_neither_announcement_carries_it(self):
         def post(system):
             api = FakeApi()
             flow = {"chat_id": DM, "user_id": ADMIN["id"], "entry": CHAT, "admin_chat_id": MAIN_CHAT_ID,
@@ -443,8 +444,10 @@ class FallbackButtonTests(unittest.TestCase):
                     api, _cfg(), press, {"f1": flow}, BOT, log=lambda *_: None))
             return next(item for item in api.sent if item["chat_id"] == MAIN_CHAT_ID)
 
-        self.assertEqual(len(self._fallback(post("vote"))), 1)
-        self.assertEqual(self._fallback(post("arena")), [])
+        for system in ("vote", "arena"):
+            posted = post(system)
+            self.assertEqual(self._fallback(posted), [])
+            self.assertEqual(len(_buttons(posted)), 1)
 
     def test_without_a_public_address_there_is_no_button_to_a_page_that_is_not_served(self):
         self.assertEqual(bot_listener._vote_browser_row(SimpleNamespace(webapp_public_url=None)), [])
