@@ -4444,8 +4444,8 @@ def _vote_page_url(cfg) -> str | None:
 
 # The way round a Telegram that will not open the Mini App: a plain web page in the phone's
 # browser (vote_web.BROWSER_HTML) whose last step is a link back to this bot carrying the
-# choices. Put beside the v1 vote buttons except the posted announcement's, worded the
-# way the owner asked for it.
+# choices. Put beside the v1 vote buttons in the DM only -- never in a group, where the
+# owner wants one button -- worded the way the owner asked for it.
 VOTE_BROWSER_BUTTON_TEXT = "Если Бот не работает"
 
 
@@ -6338,13 +6338,14 @@ async def handle_vote_command(
         return
     # Deliberately kept in the chat, unlike the stats replies this codebase otherwise
     # sweeps away as noise -- people need to be able to find the vote announcement later,
-    # so it is never scheduled for auto-delete.
+    # so it is never scheduled for auto-delete. One button only, like the posted
+    # announcement: the owner wants nothing in the group but the vote itself, so "Если Бот
+    # не работает" stays in the DM, where this button leads anyway.
     await reply(
         "Голосование за итоги недели:" if cfg.vote_miniapp_short_name
         else "Голосование за итоги недели -- открывается в личке с ботом:",
         reply_markup={"inline_keyboard": [
             [{"text": VOTE_OPEN_BUTTON_TEXT, "url": group_url}],
-            *_vote_browser_row(cfg),
         ]},
     )
     # background_tasks is now unused in this function, but stays a required parameter --
@@ -6535,7 +6536,7 @@ async def handle_vote_chat_destination_callback(
         await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
         return
     # One button only: the owner wants the posted announcement without "Если Бот не
-    # работает" -- the browser page stays on the DM, the admin panel and the group reply.
+    # работает" -- the browser page stays on the voter's DM and the admin panel.
     keyboard = {"inline_keyboard": [[button]]}
 
     targets: list[tuple[str, object]] = []

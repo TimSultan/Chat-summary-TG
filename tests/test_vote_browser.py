@@ -8,7 +8,8 @@ and the ballot is cast by the Telegram account that sends it. So what is pinned 
 - the page and its data need no Telegram at all, and the data is only what the chat saw;
 - the page's link and the bot agree on the format;
 - a ballot that arrives that way keeps every rule a Mini App ballot keeps;
-- every v1 vote button but the posted announcement's has "Если Бот не работает" beside it.
+- every v1 vote button in the DM has "Если Бот не работает" beside it, and a vote message
+  in a group has its one button only.
 """
 
 import asyncio
@@ -392,8 +393,8 @@ class LinkRoutingTests(unittest.TestCase):
 
 
 class FallbackButtonTests(unittest.TestCase):
-    """"Если Бот не работает" beside the v1 vote buttons, leading to the browser page --
-    except on the posted announcement, which keeps its one button."""
+    """"Если Бот не работает" beside the v1 vote buttons in the DM, leading to the browser
+    page -- never in a group, where the reply and the announcement keep their one button."""
 
     def _type(self, user, manager, chat_type="private"):
         api = FakeApi()
@@ -425,8 +426,10 @@ class FallbackButtonTests(unittest.TestCase):
     def test_the_administrators_panel_has_it_too(self):
         self.assertEqual(len(self._fallback(self._type(ADMIN, manager=True))), 1)
 
-    def test_the_group_reply_has_it(self):
-        self.assertEqual(len(self._fallback(self._type(VOTER, manager=False, chat_type="group"))), 1)
+    def test_the_group_reply_has_one_button_only(self):
+        reply = self._type(VOTER, manager=False, chat_type="group")
+        self.assertEqual(self._fallback(reply), [])
+        self.assertEqual(len(_buttons(reply)), 1)
 
     def test_neither_announcement_carries_it(self):
         def post(system):
