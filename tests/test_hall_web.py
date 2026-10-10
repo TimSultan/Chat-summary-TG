@@ -293,10 +293,17 @@ class LeaderboardLayoutTests(unittest.TestCase):
     def test_rows_can_shrink_to_a_narrow_phone(self):
         """A grid column is as wide as its longest name unless told otherwise, and on a
         360px phone that pushed the bronze column off the screen."""
-        for name in ("board", "timeline"):
+        for name in ("board", "timeline", "podiumMini"):
             with self.subTest(name=name):
                 rule = re.search(rf"\.{name} \{{([^}}]*)\}}", hall_web.PAGE_HTML).group(1)
                 self.assertIn("minmax(0, 1fr)", rule)
+
+    def test_the_latest_winner_fits_a_phone_whatever_the_podium_names(self):
+        """The same for the front page's winner: one long name on the podium made the
+        photo and its card wider than the phone, and the overflow was cut off at the edge."""
+        wide, narrow = re.findall(r"\.hero \{([^}]*)\}", hall_web.PAGE_HTML)
+        self.assertIn("grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr)", wide)
+        self.assertIn("grid-template-columns: minmax(0, 1fr)", narrow)
 
     def test_every_row_shows_all_three_medals(self):
         for medal in ('medalCount("🥇", artist.gold', 'medalCount("🥈", artist.silver', 'medalCount("🥉", artist.bronze'):

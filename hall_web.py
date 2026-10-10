@@ -441,8 +441,10 @@ PAGE_HTML = r"""<!doctype html>
   .ava.l { width: 96px; height: 96px; font-size: 36px; box-shadow: 0 0 0 4px var(--bg), 0 0 0 6px var(--gold); }
 
   /* ------------------------------------------------------------------ hero winner */
-  .hero { display: grid; grid-template-columns: 1.25fr 1fr; gap: 18px; margin-top: 22px; }
-  @media (max-width: 760px) { .hero { grid-template-columns: 1fr; } }
+  /* minmax(0, ...), as on the leaderboard: a bare 1fr column is as wide as the longest name
+     on the podium, and on a phone that pushed the photo and the card off the screen. */
+  .hero { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; margin-top: 22px; }
+  @media (max-width: 760px) { .hero { grid-template-columns: minmax(0, 1fr); } }
   /* The winner's whole photo, never cropped: a miniature shot tall is as much the winner as
      one shot wide. It keeps its own proportions, up to a height a screen can hold, and the
      room left at its sides is a blurred copy of the same photo rather than a bare frame. */
@@ -461,11 +463,12 @@ PAGE_HTML = r"""<!doctype html>
               border: 1px solid rgba(242,193,78,.22);
               /* As tall as what it says, not as the photo beside it: a tall photo used to
                  stretch it and leave the podium stranded at the bottom of an empty card. */
-              align-self: start; }
+              align-self: start; overflow-wrap: anywhere; }
   .heroWho { display: flex; align-items: center; gap: 14px; }
+  .heroWho > div { min-width: 0; }
   .heroWho .name { font-size: 22px; font-weight: 800; line-height: 1.2; }
   .heroMeta { color: var(--muted); font-size: 14px; }
-  .podiumMini { display: grid; gap: 8px; }
+  .podiumMini { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; }
   .pmRow { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 12px; background: rgba(255,255,255,.04); }
   .pmRow img.th { width: 44px; height: 44px; border-radius: 9px; object-fit: cover; background: var(--card-hi); }
   .pmRow .who { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -534,6 +537,7 @@ PAGE_HTML = r"""<!doctype html>
 
   /* ------------------------------------------------------------------ profile */
   .profile { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; margin-top: 8px; }
+  .profile > div { min-width: 0; overflow-wrap: anywhere; }
   .profile .n { font-size: clamp(24px, 4.5vw, 34px); font-weight: 800; line-height: 1.15; }
   .profile .u { color: var(--accent); font-weight: 600; }
   .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 22px; }
