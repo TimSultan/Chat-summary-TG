@@ -25,12 +25,14 @@ import json
 import math
 import os
 import re
-import shutil
+import threading
 import unicodedata
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
+
+import archive_store
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
 VOTING_DIR = DATA_DIR / "voting"
@@ -42,6 +44,9 @@ RESULTS_DIR = VOTING_DIR / "results"
 # The hashtag that nominates a post. Kept in sync with stats.WEEKLY_CONTEST_HASHTAG,
 # imported lazily in collect_entries so this module stays importable on its own.
 CONTEST_HASHTAG = "#итогинедели"
+# What the weekly contest is called wherever a contest needs a name (the Hall of Fame, the
+# status panel). A thematic contest is called by the title its administrator gave it.
+WEEKLY_CONTEST_TITLE = "Итоги недели"
 
 # A collection covers whole CONTEST WEEKS -- from Monday 00:00 local through the moment of
 # collecting -- rather than a rolling number of days. A rolling window's reach depends on
@@ -76,6 +81,202 @@ def _has_hashtag(text: str, hashtag: str) -> bool:
     rule as stats._has_hashtag -- duplicated rather than imported so this module has no
     dependency on stats.py's much heavier import graph."""
     return re.search(rf"(?<!\w){re.escape(hashtag)}(?!\w)", text or "", re.IGNORECASE) is not None
+
+
+# ------------------------------------------------------------------ which hashtag to collect
+#
+# /vote collects #итогинедели by default, and a THEMATIC contest ("Лучший аниме-покрас",
+# "Лучшая миниатюра 32 мм") collects a hashtag of its own. Each hashtag gets its own poll per
+# week (poll_id_for), so a thematic contest collected while the weekly vote is running can
+# never touch that vote's works, ballots, results record or board picture -- they are all
+# keyed by poll id.
+
+# Longer than this stops being a hashtag anybody types and starts being a sentence.
+HASHTAG_MAX_LENGTH = 40
+# A theme's title is a heading on a phone screen and a badge on an artist's profile.
+THEME_TITLE_MAX_LENGTH = 60
+# The badge is one emoji; a ZWJ sequence (👩‍🎨) is several code points, so this is generous.
+THEME_BADGE_MAX_LENGTH = 16
+DEFAULT_THEME_BADGE = "🏅"
+
+
+def normalize_hashtag(raw) -> str | None:
+    """'#Аниме', 'аниме' and ' #аниме ' are all '#аниме'; None when it is not a hashtag.
+
+    What Telegram itself makes tappable: '#' and then letters of any alphabet, digits and
+    '_'. Lower-cased because matching is case-insensitive anyway, and one spelling per tag
+    is what lets a tag name its own poll and its own theme."""
+    text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+    if not text:
+        return None
+    if not text.startswith("#"):
+        text = "#" + text
+    text = text.lower()
+    if len(text) > HASHTAG_MAX_LENGTH or not re.fullmatch(r"#\w+", text):
+        return None
+    return text
+
+
+def is_weekly_hashtag(hashtag) -> bool:
+    return (normalize_hashtag(hashtag) or CONTEST_HASHTAG) == CONTEST_HASHTAG
+
+
+def hashtag_slug(hashtag) -> str:
+    """'' for the weekly hashtag, six hex characters for any other.
+
+    The slug goes into a poll id, and a poll id goes into file names and photo URLs, which
+    allow only [A-Za-z0-9_.-] -- so a hash of the tag rather than the tag itself. A hash and
+    not a counter: the same tag always lands in the same poll, with nothing to look up."""
+    tag = normalize_hashtag(hashtag) or CONTEST_HASHTAG
+    if tag == CONTEST_HASHTAG:
+        return ""
+    return hashlib.sha256(tag.encode("utf-8")).hexdigest()[:6]
+
+
+def poll_id_for(week_id: str, hashtag=CONTEST_HASHTAG) -> str:
+    """The poll a collect of `hashtag` in `week_id` writes to. The weekly hashtag keeps the
+    bare week ("2026-W41") every poll before this feature has, so nothing on disk moves."""
+    slug = hashtag_slug(hashtag)
+    return f"{week_id}-{slug}" if slug else week_id
+
+
+def contest_title(hashtag, title: str = "") -> str:
+    """What a contest is called: its own title, "Итоги недели" for the weekly one, and the
+    bare hashtag for a thematic contest nobody named."""
+    if title:
+        return title
+    if is_weekly_hashtag(hashtag):
+        return WEEKLY_CONTEST_TITLE
+    return normalize_hashtag(hashtag) or str(hashtag or "")
+
+
+def parse_theme_text(text: str) -> tuple[str, str, str] | None:
+    """'#аниме 🌸 Лучший аниме-покрас' -> ('#аниме', 'Лучший аниме-покрас', '🌸').
+
+    The first word is the hashtag; an optional word with no letters or digits in it is the
+    winner's badge; the rest is the theme's title. Both may be left out. The '#' may be
+    left out too, but only when the tag is all there is -- 'просто текст' is a sentence,
+    not the tag #просто titled 'текст'. None when it is not a hashtag."""
+    words = (text or "").split()
+    if not words or (len(words) > 1 and not words[0].startswith("#")):
+        return None
+    hashtag = normalize_hashtag(words[0])
+    if hashtag is None:
+        return None
+    rest = words[1:]
+    badge = ""
+    if rest and len(rest[0]) <= THEME_BADGE_MAX_LENGTH and not any(ch.isalnum() for ch in rest[0]):
+        badge, rest = rest[0], rest[1:]
+    title = " ".join(rest)[:THEME_TITLE_MAX_LENGTH].strip()
+    return hashtag, title, badge
+
+
+@dataclass
+class Theme:
+    """A hashtag /vote has been asked to collect, with what its contest is called and the
+    badge its winner earns. Remembered so the next collect can offer it as a button."""
+
+    hashtag: str
+    title: str = ""
+    badge: str = ""
+    used_at: str = ""
+
+    @property
+    def slug(self) -> str:
+        return hashtag_slug(self.hashtag)
+
+    def label(self) -> str:
+        return contest_title(self.hashtag, self.title)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Theme | None":
+        hashtag = normalize_hashtag((raw or {}).get("hashtag"))
+        if hashtag is None:
+            return None
+        return cls(
+            hashtag=hashtag,
+            title=str(raw.get("title") or "")[:THEME_TITLE_MAX_LENGTH],
+            badge=str(raw.get("badge") or "")[:THEME_BADGE_MAX_LENGTH],
+            used_at=str(raw.get("used_at") or ""),
+        )
+
+
+# remember_theme is a read-modify-write of one small file. Its callers are admin commands,
+# which run on the event loop, but it is cheap enough to also be safe from a worker thread.
+_themes_lock = threading.Lock()
+
+
+def themes_path(entry: str) -> Path:
+    """One file per chat, in a subdirectory: latest_poll globs "<key>_*.json" straight out
+    of the voting directory, and a themes file there would be read as a poll."""
+    return _voting_dir() / "themes" / f"{_poll_key(entry)}.json"
+
+
+def load_themes(entry: str) -> list[Theme]:
+    """Every remembered theme, most recently used first. The weekly hashtag is never
+    stored here -- it is always available and has nothing to remember."""
+    path = themes_path(entry)
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+    themes = [Theme.from_dict(item) for item in (raw.get("themes") or []) if isinstance(item, dict)]
+    themes = [theme for theme in themes if theme is not None and not is_weekly_hashtag(theme.hashtag)]
+    return sorted(themes, key=lambda theme: theme.used_at, reverse=True)
+
+
+def find_theme(entry: str, slug_or_hashtag: str) -> Theme | None:
+    """A remembered theme by its slug or its hashtag; the weekly theme for '' or the
+    weekly hashtag; None for anything unknown."""
+    key = str(slug_or_hashtag or "").strip()
+    tag = normalize_hashtag(key) if key.startswith("#") else None
+    if key in ("", "-") or tag == CONTEST_HASHTAG:
+        return Theme(hashtag=CONTEST_HASHTAG)
+    for theme in load_themes(entry):
+        if theme.slug == key or theme.hashtag == tag:
+            return theme
+    return None
+
+
+def theme_for(entry: str, hashtag) -> Theme:
+    """The remembered theme for `hashtag`, or a bare one if it was never remembered."""
+    tag = normalize_hashtag(hashtag) or CONTEST_HASHTAG
+    return find_theme(entry, tag) or Theme(hashtag=tag)
+
+
+def remember_theme(entry: str, hashtag, title: str | None = None, badge: str | None = None) -> Theme:
+    """Records that `hashtag` is being collected, and returns its theme. A title or badge
+    of None keeps whatever was remembered before, so re-picking a theme from its button
+    does not wipe the name it was given when it was typed. The weekly hashtag is returned
+    as it is and never written."""
+    tag = normalize_hashtag(hashtag) or CONTEST_HASHTAG
+    if tag == CONTEST_HASHTAG:
+        return Theme(hashtag=CONTEST_HASHTAG)
+    with _themes_lock:
+        themes = load_themes(entry)
+        theme = next((t for t in themes if t.hashtag == tag), None)
+        if theme is None:
+            theme = Theme(hashtag=tag)
+            themes.append(theme)
+        if title is not None:
+            theme.title = title[:THEME_TITLE_MAX_LENGTH].strip()
+        if badge is not None:
+            theme.badge = badge[:THEME_BADGE_MAX_LENGTH].strip()
+        theme.used_at = datetime.now(timezone.utc).isoformat()
+        path = themes_path(entry)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({"themes": [t.to_dict() for t in themes]}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    return theme
 
 
 @dataclass
@@ -316,6 +517,45 @@ async def collect_entries(
     return entries
 
 
+async def download_post_photos(client, entity, message_id: int, media_dir: Path, log=print) -> list[str] | None:
+    """Downloads the photos of the post whose FIRST message is `message_id` into
+    `media_dir`, under the names collect_entries gives them, and returns those names --
+    or None when the post is gone from the chat.
+
+    Every work is a post in the chat, so a photo lost from disk can be fetched again from
+    there: this is how the Hall of Fame gets back the pictures of a week whose photos were
+    deleted before anything kept them. An album is the post's own message plus the ones
+    after it that share its grouped_id; the index in each name counts every message of the
+    album, photo or not, exactly as the collect did, so a re-download lands on the name
+    the records already carry.
+    """
+    head = await client.get_messages(entity, ids=int(message_id))
+    if head is None or getattr(head, "action", None) is not None:
+        return None
+    group = [head]
+    if getattr(head, "grouped_id", None):
+        following = await client.get_messages(
+            entity, ids=list(range(int(message_id) + 1, int(message_id) + MAX_ALBUM_ITEMS)),
+        )
+        group += [m for m in following or [] if m is not None and m.grouped_id == head.grouped_id]
+    group.sort(key=lambda m: m.id)
+    media_dir.mkdir(parents=True, exist_ok=True)
+    names = []
+    for index, message in enumerate(group[:MAX_ALBUM_ITEMS]):
+        if not message.photo:
+            continue
+        name = f"{head.id}_{index}.jpg"
+        path = media_dir / name
+        if not path.exists():
+            try:
+                await client.download_media(message, file=str(path))
+            except Exception as e:  # one unreadable photo must not lose the rest of the post
+                log(f"[voting] could not download photo {message.id}: {e}")
+                continue
+        names.append(name)
+    return names
+
+
 # ------------------------------------------------------------------------------ the poll
 
 
@@ -426,6 +666,22 @@ class Poll:
     # a separate mode -- one representation for both, so the renderer has one path.
     # An entry with no entry here is drawn fitted, exactly as before any cropping existed.
     crops: dict[str, dict] = field(default_factory=dict)
+    # The hashtag this poll's works were collected by. Every poll written before thematic
+    # contests existed collected #итогинедели, which is what a missing value means.
+    hashtag: str = CONTEST_HASHTAG
+    # A thematic contest's name and its winner's badge, copied from the theme when the poll
+    # is collected so the poll (and the Hall of Fame record made from it) says what it was
+    # without a lookup. Empty for the weekly contest.
+    title: str = ""
+    badge: str = ""
+
+    @property
+    def is_weekly(self) -> bool:
+        return is_weekly_hashtag(self.hashtag)
+
+    def label(self) -> str:
+        """"Итоги недели", or the thematic contest's title (its hashtag if untitled)."""
+        return contest_title(self.hashtag, self.title)
 
     def to_dict(self) -> dict:
         return {
@@ -441,6 +697,9 @@ class Poll:
             "max_choices": self.max_choices,
             "allow_revote": self.allow_revote,
             "crops": {k: dict(v) for k, v in self.crops.items()},
+            "hashtag": self.hashtag,
+            "title": self.title,
+            "badge": self.badge,
         }
 
     @classmethod
@@ -468,6 +727,9 @@ class Poll:
             max_choices=(int(raw["max_choices"]) if raw.get("max_choices") else None),
             allow_revote=bool(raw.get("allow_revote", True)),
             crops=_clean_crops(raw.get("crops")),
+            hashtag=normalize_hashtag(raw.get("hashtag")) or CONTEST_HASHTAG,
+            title=str(raw.get("title") or "")[:THEME_TITLE_MAX_LENGTH],
+            badge=str(raw.get("badge") or "")[:THEME_BADGE_MAX_LENGTH],
         )
 
     def approved_entries(self) -> list[Entry]:
@@ -533,18 +795,34 @@ def save_poll(poll: Poll) -> None:
 
 
 def delete_poll(entry: str, poll_id: str) -> bool:
-    """Deletes a poll's JSON file and its downloaded media outright, rather than just
-    resetting its fields in place -- "start over" means the next /vote собрать builds a
-    genuinely fresh poll (its own created_at), not a same-poll reset that would still
-    carry the old identity. Returns whether there was anything to delete."""
+    """Takes one poll out of the live set -- the moderation screen's "🗑 Очистить
+    голосование". The next /vote собрать then builds a genuinely fresh poll (its own
+    created_at), not a same-poll reset that would still carry the old identity.
+
+    Despite the name, NOTHING IS DELETED: the file and its photos move into archive_dir(),
+    the same as archive_all_polls does. This used to unlink both, and a week cleared from
+    the moderation screen was lost -- ballots, entrants and pictures -- for good. Returns
+    whether there was a poll to take away."""
     path = poll_path(entry, poll_id)
     existed = path.exists()
-    if existed:
-        path.unlink()
-    media_dir = media_path(entry, poll_id)
-    if media_dir.exists():
-        shutil.rmtree(media_dir)
+    archive_store.move_to_archive(path, media_path(entry, poll_id), archive_dir())
     return existed
+
+
+def snapshot_poll(entry: str, poll_id: str) -> Path | None:
+    """A copy of the poll as it is now, before a collect for narrower dates removes works
+    from it -- with their admissions and their votes. The live poll then holds what the
+    administrator asked for, and what it held before is still on disk."""
+    return archive_store.snapshot(poll_path(entry, poll_id), archive_dir())
+
+
+def photo_dirs(entry: str, poll_id: str) -> list[Path]:
+    """Every directory a poll's photos may be in: its live one, then the ones it was
+    archived with (newest first) -- for anything that needs a week's pictures after the
+    week was cleared, such as the Hall of Fame's import."""
+    return [media_path(entry, poll_id)] + archive_store.archived_media_dirs(
+        archive_dir(), poll_path(entry, poll_id).stem,
+    )
 
 
 def poll_ids(entry: str) -> list[str]:
@@ -568,39 +846,29 @@ def archive_dir() -> Path:
 
 
 def archive_all_polls(entry: str) -> int:
-    """Clears the contest: every poll leaves the live set, and its photos are deleted.
+    """Clears the contest: every poll leaves the live set.
 
     "Очистить" means the contest starts over, so it cannot leave last week's poll behind
     to become `latest_poll` the moment this week's is gone -- clearing once and finding
     the previous week in its place is indistinguishable from the clear not having worked.
     Returns how many polls were cleared.
 
-    NOTHING RECORDED IS DESTROYED. The poll file is MOVED into archive_dir() rather than
-    unlinked, and the announced results (results_path) and rendered boards
-    (export_image_path) are left where they are -- clearing is "let me collect a new
-    vote", never "erase what the contest has already decided". Only the collected photos
-    go, because they are the bulk on disk and the boards have already been rendered from
-    them (see bot_listener._archive_vote_boards).
+    NOTHING RECORDED IS DESTROYED. Each poll file and its photos move into archive_dir()
+    together (archive_store.move_to_archive), and the announced results (results_path)
+    and rendered boards (export_image_path) are left where they are -- clearing is "let me
+    collect a new vote", never "erase what the contest has already decided". The photos
+    used to be deleted here as the bulk on disk; they are also the one thing nothing could
+    bring back, and the history of who entered what is what the Hall of Fame is made of.
     """
     cleared = 0
-    destination_dir = archive_dir()
     for poll_id in poll_ids(entry):
-        path = poll_path(entry, poll_id)
-        destination = destination_dir / path.name
         try:
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                # Cleared twice with a re-collect in between: keep both rather than let
-                # the second clear silently overwrite the first week's record.
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                destination = destination_dir / f"{path.stem}_{stamp}{path.suffix}"
-            path.replace(destination)
-            cleared += 1
+            if archive_store.move_to_archive(
+                poll_path(entry, poll_id), media_path(entry, poll_id), archive_dir(),
+            ) is not None:
+                cleared += 1
         except OSError:
             continue
-        media_directory = media_path(entry, poll_id)
-        if media_directory.exists():
-            shutil.rmtree(media_directory, ignore_errors=True)
     return cleared
 
 
@@ -634,10 +902,14 @@ def _all_polls(entry: str) -> list[Poll]:
 
 def _ballot_rank(poll: Poll) -> int:
     """How much of a ballot a poll is -- 0 is the most, and wins. See latest_poll."""
-    if poll.approved:
+    if poll.approved and poll.open:
         return 0  # works admitted: people can vote in this one, and may be doing so now
     if poll.entries:
-        return 1  # collected, nothing admitted yet: waiting on a moderator
+        # Collected, nothing admitted yet: waiting on a moderator. Or CLOSED: the vote is
+        # over and only its result is left to look at. The two share a rank, so the newer
+        # wins -- a contest collected after a vote closed is the one being worked on now,
+        # and a closed vote still shows its result until something newer is collected.
+        return 1
     return 2      # empty: a week nobody nominated anything in
 
 
@@ -659,6 +931,11 @@ def latest_poll(entry: str) -> Poll | None:
     that one pending work moved the ballot to a poll with nothing admitted in it. Nobody
     lost a vote (they are all in their own week's file), but the ballot showed no
     candidates until this ordering was fixed.
+
+    A CLOSED vote is no longer a ballot. It keeps the page while it is the newest thing
+    there, so voters can still see its result, but a contest collected after it -- next
+    week's, or a thematic contest's own hashtag -- takes over without anybody having to
+    clear the finished one first (clearing archives every poll, the new one included).
     """
     polls = _all_polls(entry)
     if not polls:
@@ -685,13 +962,19 @@ def make_current(poll: Poll) -> Poll:
     return poll
 
 
-def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | None = None) -> Poll:
+def build_poll(
+    entry: str, poll_id: str, entries: list[Entry], existing: Poll | None = None,
+    theme: Theme | None = None,
+) -> Poll:
     """A poll for `entries`, carrying over the moderation and votes of `existing`.
 
     Re-collecting is how an administrator picks up nominations posted since the last run,
     so it must not undo the admitting they have already done or throw away votes already
     cast. Anything that is no longer among the entries drops out of both -- a deleted post
     cannot stay admitted or keep its votes.
+
+    `theme` is what the collect was for -- its hashtag, title and badge are stamped on the
+    poll. Without one the poll keeps `existing`'s, or is the weekly contest.
     """
     now = datetime.now(timezone.utc).isoformat()
     poll = Poll(
@@ -700,6 +983,10 @@ def build_poll(entry: str, poll_id: str, entries: list[Entry], existing: Poll | 
         created_at=(existing.created_at if existing else now),
         entries=entries,
     )
+    source = theme or existing
+    if source is not None:
+        poll.hashtag = normalize_hashtag(source.hashtag) or CONTEST_HASHTAG
+        poll.title, poll.badge = source.title, source.badge
     if existing is None:
         return poll
 
@@ -925,7 +1212,16 @@ _RESULTS_FOOTER = "Всем спасибо за участие.\nКрасим д
 _RESULTS_NOBODY = "В этот раз голосов не набрал никто."
 
 
-def format_results_text(standings: list[tuple[Entry, int]], places: int | None = None) -> str:
+def results_header(poll: "Poll | None" = None) -> str:
+    """The weekly contest's dictated header, or the thematic contest's own name."""
+    if poll is None or poll.is_weekly:
+        return _RESULTS_HEADER
+    return f"Результаты конкурса «{poll.label()}»:"
+
+
+def format_results_text(
+    standings: list[tuple[Entry, int]], places: int | None = None, header: str | None = None,
+) -> str:
     """The announcement message for a finished poll.
 
         Результаты недельного голосования:
@@ -946,6 +1242,8 @@ def format_results_text(standings: list[tuple[Entry, int]], places: int | None =
     `standings` is a tally() result: already ordered, every admitted entry included.
     Positions are positional -- a tie shares no number, the tally's own ordering decides,
     because the chat needs one unambiguous winner to hand the prize to.
+
+    `header` replaces the first line -- results_header(poll) names a thematic contest.
     """
     lines = []
     for index, (entry, votes) in enumerate(standings if places is None else standings[:places], start=1):
@@ -955,7 +1253,7 @@ def format_results_text(standings: list[tuple[Entry, int]], places: int | None =
     if not any(votes > 0 for _, votes in standings):
         lines = []
     body = "\n".join(lines) if lines else _RESULTS_NOBODY
-    return f"{_RESULTS_HEADER}\n{body}\n\n{_RESULTS_FOOTER}"
+    return f"{header or _RESULTS_HEADER}\n{body}\n\n{_RESULTS_FOOTER}"
 
 
 def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> Path:
@@ -981,16 +1279,23 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
         "announced_at": datetime.now(timezone.utc).isoformat(),
         "voters": len(poll.votes),
         "text": text,
+        # Which contest this was: the Hall of Fame (hall_of_fame.import_history) reads
+        # these back for a week whose poll file has since been archived.
+        "hashtag": poll.hashtag,
+        "title": poll.title,
+        "badge": poll.badge,
         "standings": [
             {
                 "place": place,
                 "entry_id": e.entry_id,
+                "message_id": e.message_id,
                 "author_id": e.author_id,
                 "author_name": e.author_name,
                 "author_username": e.author_username,
                 "votes": votes,
                 "text": e.text,
                 "media": list(e.media),
+                "posted_at": e.posted_at,
             }
             for place, (e, votes) in enumerate(standings, start=1)
         ],
@@ -1001,6 +1306,51 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
     temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
     return path
+
+
+def results_poll_ids(entry: str) -> list[str]:
+    """The poll ids this chat has an announced results record for, oldest id first --
+    including weeks whose poll has since been cleared, since clearing keeps the results."""
+    directory = _voting_dir() / "results"
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    return sorted(path.stem[len(prefix):] for path in directory.glob(f"{prefix}*.json"))
+
+
+def load_archived_poll(entry: str, poll_id: str) -> Poll | None:
+    """A cleared poll out of archive_dir(), or None. A week cleared twice has a time stamp
+    on the end of its file name (see archive_all_polls); the newest of those is returned."""
+    directory = archive_dir()
+    if not directory.exists():
+        return None
+    exact = directory / poll_path(entry, poll_id).name
+    candidates = [exact] if exact.exists() else sorted(
+        directory.glob(f"{_poll_key(entry)}_{poll_id}_*.json"), reverse=True,
+    )
+    for path in candidates:
+        try:
+            return Poll.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError, TypeError, ValueError):
+            continue
+    return None
+
+
+def relabel_results(entry: str, poll_id: str, hashtag, title: str = "", badge: str = "") -> bool:
+    """Rewrites which contest an announced results record says it was -- the hashtag,
+    title and badge the Hall of Fame imports it under -- leaving its standings alone.
+    Returns whether there was a record to rewrite."""
+    record = load_results(entry, poll_id)
+    if record is None:
+        return False
+    tag = normalize_hashtag(hashtag) or CONTEST_HASHTAG
+    weekly = tag == CONTEST_HASHTAG
+    record.update(hashtag=tag, title="" if weekly else title, badge="" if weekly else badge)
+    path = results_path(entry, poll_id)
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+    return True
 
 
 def load_results(entry: str, poll_id: str) -> dict | None:

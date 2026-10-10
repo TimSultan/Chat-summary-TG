@@ -16,8 +16,8 @@ name, the ids of the pool works playing in it, and its own ballots. The same wor
 in several nominations, and a ballot in one is not a ballot in another.
 
 The photos are COPIED into v3's own directory rather than served out of v1's, which is
-the one thing the two do not share: v1's "очистить" deletes its photos, and a nominations
-vote still running at that moment must not lose its pictures.
+the one thing the two do not share: v1's "очистить" moves its photos into v1's archive,
+and a nominations vote still running at that moment must not lose its pictures.
 
 One contest rather than one per ISO week (a poll's and a tournament's key): nominations are
 built by hand, and a week key would hide all of them behind a fresh empty week the first
@@ -40,6 +40,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+import archive_store
 import voting
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "."))
@@ -242,19 +243,16 @@ def update_contest(entry: str, mutate, create: bool = False):
 
 
 def archive_contest(entry: str) -> bool:
-    """Starts over: the contest leaves the live set and its photos are deleted.
+    """Starts over: the contest leaves the live set.
 
-    The file is MOVED into archive_dir() rather than unlinked -- its ballots are the only
-    record of how the nominations went. Returns whether there was anything to clear."""
+    Nothing is destroyed: the file -- its ballots are the only record of how the
+    nominations went -- and its photos move into archive_dir() together
+    (archive_store.move_to_archive). The photos used to be deleted here. Returns whether
+    there was anything to clear."""
     with _write_lock:
         path = contest_path(entry)
         existed = path.exists()
-        if existed:
-            destination_dir = archive_dir()
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-            path.replace(destination_dir / f"{path.stem}_{stamp}{path.suffix}")
-        shutil.rmtree(media_path(entry), ignore_errors=True)
+        archive_store.move_to_archive(path, media_path(entry), archive_dir())
         return existed
 
 

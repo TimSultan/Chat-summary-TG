@@ -59,6 +59,9 @@ class Config:
     stats_catchup_days: int
     post_stats_access_token: str | None
     post_stats_scoped_tokens: dict[str, str]
+    # Where a zip of the voting history is posted after every closed vote (see backup.py):
+    # a chat id or @username. None keeps backups to "/backup", on demand.
+    backup_chat_id: str | None = None
 
 
 def build_session(cfg: "Config"):
@@ -241,4 +244,5 @@ def load_config() -> Config:
         stats_catchup_days=stats_catchup_days,
         post_stats_access_token=post_stats_access_token,
         post_stats_scoped_tokens=post_stats_scoped_tokens,
+        backup_chat_id=(os.getenv("BACKUP_CHAT_ID", "").strip() or None),
     )

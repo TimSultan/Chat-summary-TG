@@ -682,7 +682,9 @@ class StorageTests(unittest.TestCase):
         voting.save_poll(voting.Poll(poll_id="p", entry="Chat A", created_at="t0", entries=[]))
         self.assertIsNone(voting.latest_poll("Chat B"))
 
-    def test_delete_poll_removes_the_file_and_its_media(self):
+    def test_delete_poll_takes_the_poll_off_the_page_and_keeps_it_in_the_archive(self):
+        """The moderation screen's "🗑 Очистить голосование" used to unlink the poll and
+        its photos, and that week's ballots, entrants and pictures were gone for good."""
         voting.save_poll(voting.Poll(poll_id="p", entry="Chat", created_at="t0", entries=[]))
         media_dir = voting.media_path("Chat", "p")
         media_dir.mkdir(parents=True)
@@ -693,6 +695,9 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(existed)
         self.assertIsNone(voting.load_poll("Chat", "p"))
         self.assertFalse(media_dir.exists())
+        self.assertIsNotNone(voting.load_archived_poll("Chat", "p"))
+        (archived_media,) = voting.photo_dirs("Chat", "p")[1:]
+        self.assertEqual((archived_media / "photo.jpg").read_bytes(), b"x")
 
     def test_deleting_a_poll_that_never_existed_reports_so(self):
         self.assertFalse(voting.delete_poll("Chat", "never-existed"))

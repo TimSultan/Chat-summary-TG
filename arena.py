@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
+import archive_store
 import arena_core
 from arena_core import TIE
 from voting import Entry
@@ -224,13 +225,14 @@ def latest_tournament(entry: str) -> Tournament | None:
 
 
 def delete_tournament(entry: str, tournament_id: str) -> bool:
+    """Takes one tournament out of the live set -- the arena page's clear button.
+
+    Despite the name, nothing is deleted: the file and its photos move into archive_dir()
+    (archive_store.move_to_archive), the same as archive_all_tournaments does. This used
+    to unlink both, which erased the week's ballots and pictures for good."""
     path = tournament_path(entry, tournament_id)
     existed = path.exists()
-    if existed:
-        path.unlink()
-    directory = media_path(entry, tournament_id)
-    if directory.exists():
-        shutil.rmtree(directory)
+    archive_store.move_to_archive(path, media_path(entry, tournament_id), archive_dir())
     return existed
 
 
@@ -252,33 +254,26 @@ def tournament_ids(entry: str) -> list[str]:
 
 
 def archive_all_tournaments(entry: str) -> int:
-    """Clears the arena: every tournament leaves the live set, its photos are deleted.
+    """Clears the arena: every tournament leaves the live set.
 
     Clearing one week at a time made "очистить" look broken -- it removed whatever
     latest_tournament pointed at, so a second tap silently ate the week BEFORE the one the
     admin meant. Starting over clears the lot. Returns how many were cleared.
 
-    The tournament file is MOVED into archive_dir(), not unlinked. Unlike v1 the arena
-    keeps no separate results record: its entries, ballots and standings all live in that
-    one file, so deleting it really would erase the week's statistics.
+    Nothing is destroyed: each tournament file and its photos move into archive_dir()
+    together. Unlike v1 the arena keeps no separate results record -- its entries, ballots
+    and standings all live in that one file -- and the photos used to be deleted here,
+    which is the part that could never come back.
     """
     cleared = 0
-    destination_dir = archive_dir()
     for tournament_id in tournament_ids(entry):
-        path = tournament_path(entry, tournament_id)
-        destination = destination_dir / path.name
         try:
-            destination_dir.mkdir(parents=True, exist_ok=True)
-            if destination.exists():
-                stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-                destination = destination_dir / f"{path.stem}_{stamp}{path.suffix}"
-            path.replace(destination)
-            cleared += 1
+            if archive_store.move_to_archive(
+                tournament_path(entry, tournament_id), media_path(entry, tournament_id), archive_dir(),
+            ) is not None:
+                cleared += 1
         except OSError:
             continue
-        media_directory = media_path(entry, tournament_id)
-        if media_directory.exists():
-            shutil.rmtree(media_directory, ignore_errors=True)
         invalidate_standings(tournament_id)
     return cleared
 

@@ -15,6 +15,12 @@ Stop with Ctrl+C.
 client and a log callback that writes into the GUI's log pane instead of stdout.
 """
 
+# Before every project import: the modules read DATA_DIR as they load, and an attached
+# Railway Volume must be where they read it from (see storage.py).
+import storage
+
+storage.use_railway_volume()
+
 import asyncio
 import html
 import re

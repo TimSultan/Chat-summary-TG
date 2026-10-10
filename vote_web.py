@@ -209,6 +209,9 @@ async def handle_poll(request: web.Request) -> web.Response:
     payload = {
         "poll_id": poll.poll_id,
         "chat": poll.entry,
+        # What the contest is called: "Итоги недели", or a thematic contest's own title.
+        "title": poll.label(),
+        "hashtag": poll.hashtag,
         "open": poll.open,
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
@@ -576,11 +579,13 @@ async def handle_export_image(request: web.Request) -> web.Response:
 
 
 async def handle_clear(request: web.Request) -> web.Response:
-    """Deletes the current poll outright -- entries, votes, admitted flags, downloaded
-    photos, all of it -- so the next "/vote собрать" starts a genuinely fresh poll.
-    Administrators only. Unlike announcing, there is nothing to keep on a failure here:
-    delete_poll is a local filesystem operation, not a Telegram send that can fail
-    independently of the state change."""
+    """Takes the current poll off the page -- entries, votes, admitted flags, photos --
+    so the next "/vote собрать" starts a genuinely fresh poll. Administrators only.
+
+    Into the archive, not the bin (voting.delete_poll): the week's ballots, entrants and
+    pictures stay on disk, out of sight of the page. Unlike announcing, there is nothing
+    to keep on a failure here: it is a local filesystem move, not a Telegram send that can
+    fail independently of the state change."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -675,6 +680,8 @@ def _public_payload(entry_name: str, base: str, bot_username: str) -> dict:
     winner = poll.winner()
     return {
         "poll_id": poll.poll_id,
+        "title": poll.label(),
+        "hashtag": poll.hashtag,
         "open": poll.open,
         "max_choices": poll.max_choices,
         "allow_revote": poll.allow_revote,
@@ -1528,6 +1535,8 @@ function syncPicks() {
 }
 
 function render() {
+  // A thematic contest is named on its own ballot, not as the weekly one.
+  $("title").textContent = poll.title || "Итоги недели";
   renderWinnerBanner();
   renderResults();
   updateAdminButtons();
@@ -1537,7 +1546,7 @@ function render() {
     closeReel();
     $("msg").hidden = false;
     $("msg").textContent = poll.is_admin
-      ? "За сегодня и вчера заявок с #итогинедели не нашлось."
+      ? `За сегодня и вчера заявок с ${poll.hashtag || "#итогинедели"} не нашлось.`
       : "Работы ещё не допущены к голосованию. Загляни позже.";
     $("go").hidden = true;
     $("notice").hidden = true;
@@ -2079,8 +2088,8 @@ $("announce").addEventListener("click", async () => {
 
 $("clear").addEventListener("click", async () => {
   if (!confirm(
-    "Точно очистить голосование? Все заявки, голоса и настройки удалятся безвозвратно " +
-    "-- дальше нужно будет /vote собрать заново."
+    "Точно очистить голосование? Заявки, голоса и фото уйдут со страницы в архив -- " +
+    "история не пропадёт, но дальше нужно будет /vote собрать заново."
   )) return;
   const button = $("clear");
   button.disabled = true;
@@ -2984,7 +2993,7 @@ BROWSER_HTML = """<!doctype html>
 <body>
 <div class="wrap">
   <header class="hero">
-    <div class="eyebrow">Голосование · итоги недели</div>
+    <div class="eyebrow" id="eyebrow">Голосование · итоги недели</div>
     <h1>Выберите лучшие работы</h1>
     <p class="lead">Версия для браузера — для тех, у кого голосование не открывается в Telegram.</p>
   </header>
@@ -3395,6 +3404,7 @@ if (window.ResizeObserver) {
     const response = await fetch(PREFIX + "/api/public", { cache: "no-store" });
     if (!response.ok) throw new Error("Сервер ответил " + response.status);
     poll = await response.json();
+    if (poll.title) $("eyebrow").textContent = `Голосование · ${poll.title}`;
   } catch (e) {
     $("steps").hidden = true;
     showNotice("Не получилось загрузить работы", "Обновите страницу через минуту.");

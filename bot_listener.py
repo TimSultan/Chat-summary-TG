@@ -51,6 +51,12 @@ session) -- or, more commonly, let listener.py's main() start this automatically
 alongside its own Telethon listener when TELEGRAM_BOT_TOKEN is set.
 """
 
+# Before every project import: the modules read DATA_DIR as they load, and an attached
+# Railway Volume must be where they read it from (see storage.py).
+import storage
+
+storage.use_railway_volume()
+
 import asyncio
 import html
 import os
@@ -107,6 +113,9 @@ ARENA_IMPORT_ERROR: str | None = None
 # Vote v3, the nominations test (nominations*), on a guard of its own for the same
 # reason: it is new, and nothing new may be able to take /vote down with it.
 NOMINATIONS_IMPORT_ERROR: str | None = None
+# The Hall of Fame site (hall_of_fame*, hall_web), likewise: a broken hall must cost the
+# hall and nothing else -- not the ballot, and not the close that records into it.
+HALL_IMPORT_ERROR: str | None = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -176,6 +185,13 @@ try:
 except Exception:  # noqa: BLE001
     NOMINATIONS_IMPORT_ERROR = traceback.format_exc()
     nominations = nominations_web = None
+try:
+    import hall_of_fame
+    import hall_web
+except Exception:  # noqa: BLE001
+    HALL_IMPORT_ERROR = traceback.format_exc()
+    hall_of_fame = hall_web = None
+import backup
 
 
 def game_available() -> bool:
@@ -205,6 +221,11 @@ def arena_available() -> bool:
 def nominations_available() -> bool:
     """The same for vote v3 (/vote3, the nominations test)."""
     return NOMINATIONS_IMPORT_ERROR is None
+
+
+def hall_available() -> bool:
+    """The same for the Hall of Fame (/hall)."""
+    return HALL_IMPORT_ERROR is None
 
 
 GAME_UNAVAILABLE_NOTICE = (
@@ -463,6 +484,15 @@ VOTE_COLLECT_WEEKS = 2
 # days. Every button carries the dates picked so far, so the picker holds no server state
 # and survives a restart. "/vote собрать 28.09 05.10" typed out skips the calendar.
 VOTE_DATE_CALLBACK_PREFIX = "votedate"
+# WHICH HASHTAG the collect reads is chosen on the picker's first screen too: #итогинедели
+# unless the administrator picks a thematic contest's own tag ("🏷 Хэштег"). A tag picked
+# once is remembered (voting.remember_theme) and offered as a button after that; a new one
+# is typed in answer to VOTE_HASHTAG_PROMPT, or straight into the command:
+# "/vote собрать #аниме 🌸 Лучший аниме-покрас 28.09 05.10". The picker's buttons carry
+# the tag's six-character slug rather than the tag, which would not fit in 64 bytes.
+VOTE_HASHTAG_PROMPT = "Пришли хэштег конкурса ответом на это сообщение."
+# How many remembered themes the hashtag screen offers as buttons, newest first.
+VOTE_THEMES_SHOWN = 8
 # The longest span the picker will collect. A collect downloads every nomination's photos,
 # and one mis-tapped month a year back would be minutes of scanning and hundreds of
 # downloads; a contest is a week or two.
@@ -552,7 +582,7 @@ NOMINATIONS_MODERATE_WORDS = frozenset({"выбрать", "настроить", 
 NOMINATIONS_RESULTS_WORDS = frozenset({"итоги", "результаты", "standings", "results"})
 NOMINATIONS_CLEAR_WORDS = frozenset({"очистить", "сброс", "clear", "reset"})
 # The confirmation is a word on the end rather than a separate callback flow: clearing
-# archives the contest and deletes its photos, so it is asked first, and the button that
+# takes the contest and its photos off the page, so it is asked first, and the button that
 # answers simply replays the command with the confirmation spelled out.
 NOMINATIONS_CLEAR_CONFIRM_WORDS = frozenset({"очистить да", "clear yes"})
 NOMINATIONS_OPEN_BUTTON_TEXT = "🏷 Открыть номинации"
@@ -567,6 +597,35 @@ NOMINATIONS_ACTIONS = {
     "clear": "/vote3 очистить",
     "clearyes": "/vote3 очистить да",
 }
+
+# ------------------------------------------------------------ the Hall of Fame (/hall)
+#
+# «Доска почёта»: every closed /vote contest -- the weekly one and the thematic ones -- with
+# its whole field, the artists' pages and their badges (hall_of_fame.py, hall_web.py at
+# /hall on the voting server). A contest is recorded when its vote is closed; "/hall
+# импорт" (DM, administrators) brings in the weeks announced before the hall existed.
+HALL_COMMANDS = ("/hall", "/зал", "/доска")
+HALL_IMPORT_WORDS = frozenset({"импорт", "import", "история", "history"})
+HALL_OPEN_BUTTON_TEXT = "🏆 Доска почёта"
+HALL_ACTION_CALLBACK_PREFIX = "hallaction"
+HALL_ACTIONS = {"import": "/hall импорт", "contests": "/hall конкурсы"}
+# Saying after the fact what a recorded contest was -- a week recorded as "Итоги недели"
+# that was really #МассПокрас. "/hall конкурсы" lists the contests as buttons; a tap asks
+# for the hashtag and title (HALL_THEME_PROMPT, answered by a reply, matched by the
+# contest's code on its last line, so nothing is held in memory). Typed in one go:
+# "/hall тема 2026-W40 #МассПокрас 🎨 МассПокрас". "#итогинедели" makes it weekly again.
+HALL_CONTESTS_WORDS = frozenset({"конкурсы", "конкурс", "contests"})
+HALL_THEME_WORDS = ("тема", "theme")
+HALL_THEME_CALLBACK_PREFIX = "halltheme"
+HALL_THEME_PROMPT = "✏️ Пришли хэштег этого конкурса ответом на это сообщение."
+HALL_THEME_CODE = re.compile(r"Код конкурса: ([A-Za-z0-9_.-]+)\s*$")
+HALL_CONTEST_BUTTONS = 20
+
+# "/backup" (DM; real chat administrators and the owner, not delegates -- the zip holds
+# every ballot, which is the vote-statistics screen's gate for the same reason): a zip of
+# the whole voting history, sent as a file (backup.py). One also goes to BACKUP_CHAT_ID
+# after every closed vote when that is set.
+BACKUP_COMMANDS = ("/backup", "/бэкап")
 
 VOTE_ACTION_CALLBACK_PREFIX = "voteaction"
 VOTE_ACTIONS = {
@@ -619,6 +678,7 @@ PRIVATE_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "hall", "description": "Доска почёта: победители и их работы"},
     {"command": "pet", "description": "Моё существо"},
 )
 GROUP_CHAT_COMMANDS = (
@@ -631,6 +691,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "shop", "description": "Магазин"},
     {"command": "tree", "description": "Наше дерево ЕПХ"},
     {"command": "vote", "description": "Голосование за итоги недели"},
+    {"command": "hall", "description": "Доска почёта: победители и их работы"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},
 )
@@ -4584,6 +4645,9 @@ def _vote_status_text(entry: str) -> str:
         f"Неделя: {poll.poll_id} · Проголосовало: {len(poll.votes)} чел. · "
         f"{'открыто' if poll.open else 'закрыто'}"
     ]
+    if not poll.is_weekly:
+        # A thematic contest's poll id ends in a slug nobody can read: say which it is.
+        lines.insert(0, f"Конкурс: {poll.label()} ({poll.hashtag})")
     top = poll.tally()[:3]
     # poll.tally() lists every APPROVED entry, zero-vote ones included -- so "top" alone
     # doesn't mean anyone actually voted, only that something was admitted.
@@ -4662,8 +4726,8 @@ async def handle_vote_clear_callback(
             )
         except Exception as e:
             log(f"[bot_listener] failed to announce the vote clear: {e}")
-    # Pictures first: the boards are rendered from the photos the clear is about to
-    # delete, so archiving afterwards would find nothing left to draw.
+    # Pictures first: the boards are rendered from the live photo directories, which the
+    # clear moves into the archive, where nothing draws from them.
     archived = await _archive_vote_boards(entry, log=log)
     cleared = voting.archive_all_polls(entry)
     log(f"[bot_listener] {clicker.get('username') or target_user_id} cleared ALL vote polls ({cleared}, boards {archived})")
@@ -4672,8 +4736,8 @@ async def handle_vote_clear_callback(
             chat_id,
             (
                 f"Голосование очищено полностью: снято с показа — {cleared}.\n"
-                f"Сохранено картинками: {archived}. Итоги, статистика и сами голосования "
-                "убраны в архив, а не удалены.\n"
+                f"Сохранено картинками: {archived}. Итоги, статистика, сами голосования "
+                "и фото работ убраны в архив, а не удалены.\n"
                 "Собери заново: /vote собрать"
             ) if cleared else "Голосований и так нет.",
             parse_mode=None,
@@ -4759,18 +4823,89 @@ def _parse_vote_collect_range(text: str, today: date) -> tuple[date, date] | str
     return _vote_range_problem(since, till, today) or (since, till)
 
 
-def _vote_date_callback_data(action: str, user_id, first: str = "-", second: str = "-") -> str:
-    return f"{VOTE_DATE_CALLBACK_PREFIX}:{action}:{first}:{second}:{user_id}"
+def _vote_date_callback_data(action: str, user_id, first: str = "-", second: str = "-",
+                             theme: str = "") -> str:
+    """`theme` is the hashtag's slug (voting.hashtag_slug), appended only for a thematic
+    contest -- so every #итогинедели button reads exactly as it did before themes."""
+    data = f"{VOTE_DATE_CALLBACK_PREFIX}:{action}:{first}:{second}:{user_id}"
+    return f"{data}:{theme}" if theme else data
 
 
-def _parse_vote_date_callback(data: str) -> tuple[str, str, str, int] | None:
+def _parse_vote_date_callback(data: str) -> tuple[str, str, str, int, str] | None:
+    """(action, first, second, user id, theme slug -- '' for #итогинедели)."""
     parts = (data or "").split(":")
-    if len(parts) != 5 or parts[0] != VOTE_DATE_CALLBACK_PREFIX:
+    if len(parts) not in (5, 6) or parts[0] != VOTE_DATE_CALLBACK_PREFIX:
+        return None
+    theme = parts[5] if len(parts) == 6 else ""
+    if theme and not re.fullmatch(r"[0-9a-f]{6}", theme):
         return None
     try:
-        return parts[1], parts[2], parts[3], int(parts[4])
+        return parts[1], parts[2], parts[3], int(parts[4]), theme
     except ValueError:
         return None
+
+
+def _split_vote_collect_argument(rest: str) -> tuple[str, str]:
+    """What follows "/vote собрать", split into the theme and the dates:
+    '#аниме 🌸 Лучший аниме-покрас 28.09 05.10' -> ('#аниме 🌸 Лучший аниме-покрас',
+    '28.09 05.10'). No leading '#' means there is no theme, only dates."""
+    rest = " ".join((rest or "").split())
+    if not rest.startswith("#"):
+        return "", rest
+    # Looked for after the hashtag itself, so a tag with digits in it is not read as a date.
+    first_word = rest.split(" ", 1)[0]
+    match = _VOTE_DATE_TOKEN.search(rest, len(first_word))
+    if match is None:
+        return rest, ""
+    return rest[:match.start()].strip(), rest[match.start():].strip()
+
+
+def _vote_theme_line(theme) -> str:
+    """'#итогинедели', or '#аниме — «Лучший аниме-покрас» (значок 🌸)'."""
+    if theme is None or voting.is_weekly_hashtag(theme.hashtag):
+        return voting.CONTEST_HASHTAG
+    line = theme.hashtag
+    if theme.title:
+        line += f" — «{theme.title}»"
+    if theme.badge:
+        line += f" (значок {theme.badge})"
+    return line
+
+
+def _vote_hashtag_screen(entry: str, user_id, current) -> tuple[str, dict]:
+    """"Какой хэштег собрать?": the weekly tag, every remembered thematic one (newest
+    first), and "✏️ Новый хэштег". Choosing one goes back to the first day of the picker
+    with it; nothing is collected from here."""
+    current_slug = current.slug if current is not None else ""
+    themes = voting.load_themes(entry)[:VOTE_THEMES_SHOWN]
+
+    def option(theme, slug: str) -> list[dict]:
+        mark = "✓ " if slug == current_slug else ""
+        label = (f"{theme.hashtag} — {theme.title}" if theme.title else theme.hashtag)
+        return [{"text": f"{mark}{theme.badge + ' ' if theme.badge else ''}{label}"[:64],
+                 "callback_data": _vote_date_callback_data("hs", user_id, theme=slug)}]
+
+    rows = [option(voting.Theme(hashtag=voting.CONTEST_HASHTAG), "")]
+    rows += [option(theme, theme.slug) for theme in themes]
+    rows.append([{"text": "✏️ Новый хэштег", "callback_data": _vote_date_callback_data("hn", user_id)}])
+    rows.append([{"text": "‹ Назад", "callback_data": _vote_date_callback_data("back", user_id, theme=current_slug)},
+                 {"text": "✖️ Отмена", "callback_data": _vote_date_callback_data("x", user_id)}])
+    text = (
+        f"Какой хэштег собрать? Сейчас: {_vote_theme_line(current)}.\n\n"
+        f"{voting.CONTEST_HASHTAG} — еженедельные итоги. Для тематического конкурса выбери "
+        "его хэштег или добавь новый: у каждого хэштега своё голосование, и итоги недели "
+        "он не трогает."
+    )
+    return text, {"inline_keyboard": rows}
+
+
+def _vote_hashtag_prompt_text() -> str:
+    return (
+        f"{VOTE_HASHTAG_PROMPT}\n\n"
+        "Например: #аниме\n"
+        "Можно сразу со значком победителя и названием темы:\n"
+        "#аниме 🌸 Лучший аниме-покрас"
+    )
 
 
 def _vote_calendar_rows(month: date, user_id, lowest: date, highest: date,
@@ -4810,28 +4945,42 @@ def _vote_calendar_rows(month: date, user_id, lowest: date, highest: date,
 
 
 def _vote_date_picker(today: date, user_id, month: date | None = None,
-                      since: date | None = None, problem: str | None = None) -> tuple[str, dict]:
+                      since: date | None = None, problem: str | None = None,
+                      theme=None) -> tuple[str, dict]:
     """The picker's screen: step 1 (no `since` yet) asks for the first day and offers
-    ready-made periods; step 2 asks for the last day, from `since` onward."""
+    ready-made periods; step 2 asks for the last day, from `since` onward.
+
+    `theme` (a voting.Theme; None is #итогинедели) is which hashtag the collect will read.
+    Step 1 names it and has the button that changes it; every button carries its slug."""
+    slug = theme.slug if theme is not None else ""
+    hashtag = theme.hashtag if theme is not None else voting.CONTEST_HASHTAG
+
+    def data(action: str, first: str = "-", second: str = "-") -> str:
+        return _vote_date_callback_data(action, user_id, first, second, theme=slug)
+
     cancel = [{"text": "✖️ Отмена", "callback_data": _vote_date_callback_data("x", user_id)}]
-    intro = (f"{problem}\n\n" if problem else "") + "Собрать заявки с #итогинедели заново.\n\n"
+    intro = (f"{problem}\n\n" if problem else "") + f"Собрать заявки с {hashtag} заново.\n"
+    if slug:
+        intro += f"Конкурс: {_vote_theme_line(theme)}.\n"
+    intro += "\n"
     if since is None:
         earliest = today - timedelta(days=365)
         # Opens on the month of a week ago: the first day is usually last week's Monday,
         # and early in a month that is in the month before -- one page back otherwise.
         rows = _vote_calendar_rows(
             month or (today - timedelta(days=7)), user_id, earliest, today,
-            pick=lambda day: _vote_date_callback_data("f", user_id, day.strftime("%Y%m%d")),
-            navigate=lambda m: _vote_date_callback_data("fm", user_id, m.strftime("%Y%m")),
+            pick=lambda day: data("f", day.strftime("%Y%m%d")),
+            navigate=lambda m: data("fm", m.strftime("%Y%m")),
         )
         monday = today - timedelta(days=today.weekday())
 
         def preset(label: str, start: date) -> dict:
-            return {"text": label, "callback_data": _vote_date_callback_data(
-                "t", user_id, start.strftime("%Y%m%d"), today.strftime("%Y%m%d"))}
+            return {"text": label, "callback_data": data(
+                "t", start.strftime("%Y%m%d"), today.strftime("%Y%m%d"))}
 
         rows.append([preset("Эта неделя", monday), preset("Прошлая и эта", monday - timedelta(days=7))])
         rows.append([preset("7 дней", today - timedelta(days=6)), preset("14 дней", today - timedelta(days=13))])
+        rows.append([{"text": f"🏷 Хэштег: {hashtag} — сменить", "callback_data": data("h")}])
         rows.append(cancel)
         return (intro + "Шаг 1 из 2: с какого дня? Или выбери готовый период внизу.",
                 {"inline_keyboard": rows})
@@ -4840,34 +4989,40 @@ def _vote_date_picker(today: date, user_id, month: date | None = None,
     stamp = since.strftime("%Y%m%d")
     rows = _vote_calendar_rows(
         month or latest, user_id, since, latest,
-        pick=lambda day: _vote_date_callback_data("t", user_id, stamp, day.strftime("%Y%m%d")),
-        navigate=lambda m: _vote_date_callback_data("tm", user_id, stamp, m.strftime("%Y%m")),
+        pick=lambda day: data("t", stamp, day.strftime("%Y%m%d")),
+        navigate=lambda m: data("tm", stamp, m.strftime("%Y%m")),
         marked=since,
     )
     if latest == today:
-        rows.append([{"text": f"По сегодня ({_vote_day(today)})", "callback_data": _vote_date_callback_data(
-            "t", user_id, stamp, today.strftime("%Y%m%d"))}])
-    rows.append([{"text": "‹ Другая дата начала", "callback_data": _vote_date_callback_data("back", user_id)}] + cancel)
+        rows.append([{"text": f"По сегодня ({_vote_day(today)})", "callback_data": data(
+            "t", stamp, today.strftime("%Y%m%d"))}])
+    rows.append([{"text": "‹ Другая дата начала", "callback_data": data("back")}] + cancel)
     return (intro + f"С {_vote_day(since, today)}.\nШаг 2 из 2: по какой день включительно?",
             {"inline_keyboard": rows})
 
 
 def _vote_collect_confirmation(entry: str, tz, since: date, till: date, today: date,
-                               user_id) -> tuple[str, dict]:
+                               user_id, theme=None) -> tuple[str, dict]:
     """The last screen before the collect: the dates in words, and -- because the poll
     will hold exactly those days' works -- how many already-collected works fall outside
     them and will leave the vote, admitted ones and voted-for ones counted separately.
-    Reads the poll the collect writes to, and changes nothing."""
-    poll = voting.load_poll(entry, _current_vote_poll_id(tz))
+    Reads the poll the collect writes to (that hashtag's, see voting.poll_id_for), and
+    changes nothing."""
+    hashtag = theme.hashtag if theme is not None else voting.CONTEST_HASHTAG
+    slug = theme.slug if theme is not None else ""
+    poll = voting.load_poll(entry, voting.poll_id_for(_current_vote_poll_id(tz), hashtag))
     start, end = _vote_range_bounds(since, till, tz)
     outside = [e for e in poll.entries if not voting.posted_within(e, start, end)] if poll else []
     lines = [
         f"Собрать заявки {_vote_range_label(since, till, today)} ({_ru_days((till - since).days + 1)})?",
         "",
-        "В голосование попадут работы с #итогинедели, опубликованные в эти дни. Уже "
+        f"В голосование попадут работы с {hashtag}, опубликованные в эти дни. Уже "
         "собранные работы из этих дней останутся со своими допусками и голосами и заново "
         "не скачиваются.",
     ]
+    if slug:
+        lines += ["", f"Конкурс: {_vote_theme_line(theme)}. У него своё голосование -- "
+                      f"работы с {voting.CONTEST_HASHTAG} и их голоса он не трогает."]
     if outside:
         admitted = set(poll.approved)
         voted_for = {choice for choices in poll.votes.values() for choice in choices}
@@ -4883,8 +5038,8 @@ def _vote_collect_confirmation(entry: str, tz, since: date, till: date, today: d
                       + ". Они уйдут из голосования."]
     span = (since.strftime("%Y%m%d"), till.strftime("%Y%m%d"))
     return "\n".join(lines), {"inline_keyboard": [
-        [{"text": "✅ Собрать", "callback_data": _vote_date_callback_data("go", user_id, *span)}],
-        [{"text": "✏️ Другие даты", "callback_data": _vote_date_callback_data("back", user_id)},
+        [{"text": "✅ Собрать", "callback_data": _vote_date_callback_data("go", user_id, *span, theme=slug)}],
+        [{"text": "✏️ Другие даты", "callback_data": _vote_date_callback_data("back", user_id, theme=slug)},
          {"text": "✖️ Отмена", "callback_data": _vote_date_callback_data("x", user_id)}],
     ]}
 
@@ -4904,12 +5059,15 @@ async def handle_vote_date_callback(
     """Every tap on the "/vote собрать" date picker. Navigation edits the picker message
     in place; "Собрать" replays "/vote собрать <from> <till>" through handle_vote_command,
     so the admin/DM gate and the collect itself live in one place -- the same trick the
-    status panel's buttons use. Bound to the administrator who asked, like those."""
+    status panel's buttons use. Bound to the administrator who asked, like those.
+
+    The hashtag travels as its slug on every button; "h" opens the hashtag screen, "hs"
+    picks a tag from it, and "hn" asks for a new one (see handle_vote_hashtag_reply)."""
     parsed = _parse_vote_date_callback(callback.get("data"))
     if parsed is None:
         await api.answer_callback_query(callback["id"])
         return
-    action, first, second, target_user_id = parsed
+    action, first, second, target_user_id, slug = parsed
     clicker = callback.get("from") or {}
     if clicker.get("id") != target_user_id:
         await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
@@ -4933,34 +5091,60 @@ async def handle_vote_date_callback(
     def day(stamp: str) -> date:
         return datetime.strptime(stamp, "%Y%m%d").date()
 
+    if action == "hn":
+        # A new message rather than an edit: a force-reply can only be attached to one.
+        # The answer is recognised by the prompt it replies to, so nothing is held here.
+        try:
+            await api.send_message(chat.get("id"), _vote_hashtag_prompt_text(), parse_mode=None,
+                                   reply_markup={"force_reply": True, "selective": True})
+        except Exception as e:
+            log(f"[bot_listener] could not ask for a vote hashtag: {e}")
+        return
+
+    theme = voting.find_theme(entry or "", slug) if slug else None
+    if slug and theme is None:
+        # A tag the registry no longer knows (a hand-made button, or a lost file): the
+        # collect must never fall back to some other hashtag silently.
+        text, markup = _vote_hashtag_screen(entry or "", target_user_id, None)
+        await show(f"Не знаю такого хэштега -- выбери заново.\n\n{text}", markup)
+        return
+
     try:
         if action == "x":
             await show("Сбор заявок отменён -- ничего не изменилось.", None)
+        elif action == "h":
+            await show(*_vote_hashtag_screen(entry or "", target_user_id, theme))
+        elif action == "hs":
+            if theme is not None:
+                theme = voting.remember_theme(entry or "", theme.hashtag)
+            await show(*_vote_date_picker(today, target_user_id, theme=theme))
         elif action in ("back", "fm"):
             month = datetime.strptime(first, "%Y%m").date() if action == "fm" else None
-            await show(*_vote_date_picker(today, target_user_id, month=month))
+            await show(*_vote_date_picker(today, target_user_id, month=month, theme=theme))
         elif action == "f":
-            await show(*_vote_date_picker(today, target_user_id, since=day(first)))
+            await show(*_vote_date_picker(today, target_user_id, since=day(first), theme=theme))
         elif action == "tm":
             await show(*_vote_date_picker(today, target_user_id, since=day(first),
-                                          month=datetime.strptime(second, "%Y%m").date()))
+                                          month=datetime.strptime(second, "%Y%m").date(), theme=theme))
         elif action in ("t", "go"):
             since, till = day(first), day(second)
             problem = _vote_range_problem(since, till, today)
             if problem:
-                await show(*_vote_date_picker(today, target_user_id, problem=problem))
+                await show(*_vote_date_picker(today, target_user_id, problem=problem, theme=theme))
             elif action == "t":
                 await show(*await asyncio.to_thread(
                     _vote_collect_confirmation, entry or "", tz, since, till, today, target_user_id,
+                    theme,
                 ))
             else:
                 # The buttons go first, so a second tap has nothing left to press.
                 await show(f"Собираю заявки {_vote_range_label(since, till, today)} -- прогресс ниже.", None)
+                tag = f"{theme.hashtag} " if theme is not None else ""
                 synthetic_message = {
                     "message_id": trigger.get("message_id"),
                     "chat": {"id": chat.get("id"), "type": chat.get("type") or "private"},
                     "from": clicker,
-                    "text": f"/vote собрать {since.isoformat()} {till.isoformat()}",
+                    "text": f"/vote собрать {tag}{since.isoformat()} {till.isoformat()}",
                 }
                 task = asyncio.create_task(handle_vote_command(
                     api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
@@ -4971,6 +5155,61 @@ async def handle_vote_date_callback(
     except ValueError:
         # A hand-made or mangled button: start the picker over rather than guess.
         await show(*_vote_date_picker(today, target_user_id, problem="Не понял дату."))
+
+
+async def handle_vote_hashtag_reply(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    tz,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    vote_chat_flows: dict[str, dict] | None = None,
+    log=print,
+) -> bool:
+    """The answer to "✏️ Новый хэштег": a DM reply to the bot's VOTE_HASHTAG_PROMPT.
+
+    Recognised by the prompt it answers rather than by a flow held in memory, so it still
+    works after a restart. The text is handed to "/vote собрать" as typed -- "#аниме 🌸
+    Лучший аниме-покрас" -- which checks the administrator, remembers the theme and opens
+    the date picker for it, exactly as if the command had been written out. Returns True
+    once the message was such an answer, so nothing else treats it as chat input."""
+    chat = message.get("chat") or {}
+    replied = message.get("reply_to_message") or {}
+    if (
+        chat.get("type") != "private"
+        or not (replied.get("from") or {}).get("is_bot")
+        or not str(replied.get("text") or "").startswith(VOTE_HASHTAG_PROMPT)
+    ):
+        return False
+    text = " ".join(str(message.get("text") or "").split())
+    if not text or text.lower() in ("/cancel", "отмена"):
+        try:
+            await api.send_message(chat["id"], "Хорошо, хэштег не меняю.", parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] could not answer a cancelled vote hashtag: {e}")
+        return True
+    if voting.parse_theme_text(text) is None:
+        try:
+            await api.send_message(
+                chat["id"],
+                "Это не хэштег: нужны буквы, цифры или _ после #, например #аниме. "
+                "Ответь на вопрос выше ещё раз.",
+                parse_mode=None,
+            )
+        except Exception as e:
+            log(f"[bot_listener] could not refuse a vote hashtag: {e}")
+        return True
+    synthetic_message = dict(message, text=f"/vote собрать {text if text.startswith('#') else '#' + text}")
+    task = asyncio.create_task(handle_vote_command(
+        api, telethon_client, cfg, tz, synthetic_message, entry, bot_username,
+        background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+    ))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return True
 
 
 # One collection per chat per system at a time. Scanning a whole contest week and
@@ -5532,7 +5771,7 @@ async def handle_arena_command(
         cleared = arena.archive_all_tournaments(entry)
         await reply(
             f"Арена очищена полностью: снято с показа турниров — {cleared}. "
-            "Сами турниры со статистикой убраны в архив, а не удалены. "
+            "Сами турниры со статистикой и фото убраны в архив, а не удалены. "
             "Голосование v1 не тронуто."
             if cleared else "Арена уже пуста."
         )
@@ -5828,7 +6067,7 @@ async def handle_nominations_command(
         cleared = await asyncio.to_thread(nominations.archive_contest, entry)
         log(f"[nominations] {user.get('username') or user.get('id')} cleared the contest ({cleared})")
         await reply(
-            "Номинации очищены и убраны в архив. Основное голосование не тронуто."
+            "Номинации очищены и убраны в архив вместе с фото. Основное голосование не тронуто."
             if cleared else "Номинаций и так нет."
         )
         return
@@ -5874,6 +6113,430 @@ async def handle_nominations_command(
     )
 
 
+def _hall_page_url(cfg) -> str | None:
+    if not cfg.webapp_public_url or hall_web is None:
+        return None
+    return f"{cfg.webapp_public_url}{hall_web.ROUTE_PREFIX}"
+
+
+def _record_vote_in_hall(poll, standings: list, log=print) -> None:
+    """Writes a just-closed vote into the Hall of Fame. Synchronous disk and image work
+    (photo copies, thumbnails), so callers run it in a worker thread; and best-effort,
+    because the vote itself is already closed and saved -- a hall that failed to record
+    must not cost the administrator their results draft. "/hall импорт" picks up any
+    week this missed, from the results record written beside it."""
+    if hall_of_fame is None or not standings:
+        return
+    try:
+        contest = hall_of_fame.record_poll(poll, standings)
+        log(f"[bot_listener] recorded poll {poll.poll_id} in the Hall of Fame ({len(contest.works)} works)")
+    except Exception:
+        log(f"[bot_listener] could not record poll {poll.poll_id} in the Hall of Fame:\n{traceback.format_exc()}")
+
+
+async def _restore_hall_photos(telethon_client, entry: str, log=print) -> tuple[int, int]:
+    """Fetches back from the chat every Hall of Fame photo that is missing on disk, and
+    returns (works that have pictures again, works whose post is gone).
+
+    The posts are the originals: a week whose photos were deleted -- by a clear before
+    clears kept them, or a disk that was lost -- still has every picture in the chat, and
+    each work in the hall knows the message it was posted as. Sequential on purpose: a
+    burst of downloads is what makes Telegram throttle the session the bot also reads
+    the chat with."""
+    if telethon_client is None or hall_of_fame is None:
+        return 0, 0
+    missing = await asyncio.to_thread(hall_of_fame.works_missing_photos, entry)
+    if not missing:
+        return 0, 0
+    try:
+        entity = await asyncio.wait_for(resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS)
+    except Exception as e:
+        log(f"[bot_listener] could not open the chat to restore hall photos: {e}")
+        return 0, 0
+    restored = gone = 0
+    for contest_id, entry_id, message_id in missing:
+        try:
+            names = await voting.download_post_photos(
+                telethon_client, entity, message_id, hall_of_fame.media_dir(entry, contest_id), log=log,
+            )
+        except Exception as e:
+            log(f"[bot_listener] could not fetch post {message_id} for the hall: {e}")
+            continue
+        if not names:
+            gone += 1
+            continue
+        if await asyncio.to_thread(hall_of_fame.attach_photos, entry, contest_id, entry_id, names):
+            restored += 1
+    log(f"[bot_listener] hall photos: {restored} work(s) restored from the chat, {gone} post(s) gone")
+    return restored, gone
+
+
+def _hall_contest_label(contest) -> str:
+    """"2026-W40 · Итоги недели · 🥇 Аня" -- one contest, as a button names it."""
+    winner = contest.winner()
+    parts = [contest.week() or contest.contest_id, contest.label()]
+    if winner is not None:
+        parts.append(f"🥇 {winner.author_name}")
+    return " · ".join(parts)
+
+
+async def _relabel_hall_contest(entry: str, contest_id: str, theme_text: str, url: str | None, log=print) -> str:
+    """Applies "#хэштег [значок] [название]" to a recorded contest -- in the Hall of Fame,
+    in the results record it would be imported from again, and as a remembered theme so
+    the next collect offers it -- and says what it did, in one sentence for the reply."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", contest_id or ""):
+        return "Не понял, какой это конкурс — открой /hall конкурсы."
+    parsed = voting.parse_theme_text(theme_text) if (theme_text or "").startswith("#") else None
+    if parsed is None:
+        return ("Нужен хэштег с # в начале: «#МассПокрас», можно со значком и названием — "
+                "«#МассПокрас 🎨 МассПокрас». «#итогинедели» вернёт обычные итоги недели.")
+    tag, title, badge = parsed
+    if not voting.is_weekly_hashtag(tag) and not title:
+        # The tag as it was typed reads better than the lower-cased one: "МассПокрас".
+        title = theme_text.split()[0].lstrip("#")
+
+    def apply():
+        contest = hall_of_fame.relabel_contest(entry, contest_id, tag, title, badge)
+        if contest is None:
+            return None
+        voting.relabel_results(entry, contest_id, tag, contest.title, contest.badge)
+        if not contest.is_weekly:
+            voting.remember_theme(entry, tag, contest.title, contest.badge or None)
+        return contest
+
+    contest = await asyncio.to_thread(apply)
+    if contest is None:
+        return f"Конкурса {contest_id} на Доске почёта нет — открой /hall конкурсы."
+    log(f"[bot_listener] hall contest {contest_id} is now {contest.hashtag} «{contest.label()}»")
+    what = "итоги недели" if contest.is_weekly else f"«{contest.label()}» ({contest.hashtag}), значок победителя {contest.winner_badge()}"
+    return f"Готово: {contest.week() or contest_id} теперь {what}." + (f"\n{url}#/contest/{contest_id}" if url else "")
+
+
+def _hall_theme_callback_data(contest_id: str, user_id) -> str:
+    return f"{HALL_THEME_CALLBACK_PREFIX}:{contest_id}:{user_id}"
+
+
+async def handle_hall_theme_callback(api: TelegramBotAPI, callback: dict, entry: str | None, log=print) -> None:
+    """A tap on one contest of "/hall конкурсы": asks for its hashtag and title. The
+    administrator check comes with the reply, which is what changes anything."""
+    parts = (callback.get("data") or "").split(":")
+    if (len(parts) != 3 or parts[0] != HALL_THEME_CALLBACK_PREFIX
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1]) or not parts[2].lstrip("-").isdigit()):
+        await api.answer_callback_query(callback["id"])
+        return
+    contest_id, target_user_id = parts[1], int(parts[2])
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    hall = await asyncio.to_thread(hall_of_fame.snapshot, entry or "")
+    contest = hall.by_id.get(contest_id)
+    now = f"Сейчас: {_hall_contest_label(contest)}" if contest else ""
+    chat_id = ((callback.get("message") or {}).get("chat") or {}).get("id") or target_user_id
+    try:
+        await api.send_message(
+            chat_id,
+            f"{HALL_THEME_PROMPT}\nМожно со значком победителя и названием: «#МассПокрас 🎨 МассПокрас». "
+            f"«#итогинедели» — обычные итоги недели.\n\n{now}\nКод конкурса: {contest_id}",
+            parse_mode=None,
+            reply_markup={"force_reply": True, "selective": True},
+        )
+    except Exception as e:
+        log(f"[bot_listener] could not ask for a hall contest's hashtag: {e}")
+
+
+async def handle_hall_theme_reply(api: TelegramBotAPI, telethon_client, cfg, message: dict,
+                                  entry: str | None, log=print) -> bool:
+    """A DM reply to HALL_THEME_PROMPT: the hashtag and title for the contest its code
+    names. Returns True once the message was such a reply. Re-checks the administrator."""
+    chat = message.get("chat") or {}
+    replied = message.get("reply_to_message") or {}
+    prompt = str(replied.get("text") or "")
+    if (chat.get("type") != "private" or not (replied.get("from") or {}).get("is_bot")
+            or not prompt.startswith(HALL_THEME_PROMPT)):
+        return False
+
+    async def answer(text: str) -> None:
+        try:
+            await api.send_message(chat["id"], text, reply_to_message_id=message.get("message_id"), parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] could not answer a hall contest's hashtag: {e}")
+
+    code = HALL_THEME_CODE.search(prompt)
+    if code is None or hall_of_fame is None or not entry:
+        await answer("Не понял, какой это конкурс — открой /hall конкурсы заново.")
+        return True
+    user = message.get("from") or {}
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+    if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+        await answer("Менять конкурсы на Доске почёта могут только администраторы.")
+        return True
+    await answer(await _relabel_hall_contest(
+        entry, code.group(1), " ".join(str(message.get("text") or "").split()), _hall_page_url(cfg), log=log,
+    ))
+    return True
+
+
+def _hall_action_callback_data(action: str, user_id) -> str:
+    return f"{HALL_ACTION_CALLBACK_PREFIX}:{action}:{user_id}"
+
+
+def _parse_hall_action_callback(data: str) -> tuple[str, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 3 or parts[0] != HALL_ACTION_CALLBACK_PREFIX or parts[1] not in HALL_ACTIONS:
+        return None
+    try:
+        return parts[1], int(parts[2])
+    except ValueError:
+        return None
+
+
+async def handle_hall_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    message: dict,
+    entry: str | None,
+    bot_username: str | None,
+    log=print,
+) -> None:
+    """"/hall": the link to the Hall of Fame -- a plain url, so it opens from a group as
+    well as from the DM, and in any browser. In the DM it is also a Mini App button, and
+    an administrator gets "📥 Перенести историю" ("/hall импорт"), which records every
+    announced week the hall does not have yet."""
+    chat = message["chat"]
+    chat_id = chat["id"]
+    is_private = chat.get("type") == "private"
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message.get("message_id"),
+                parse_mode=None, reply_markup=reply_markup,
+            )
+        except Exception as e:
+            log(f"[bot_listener] failed to send the hall reply: {e}")
+            return None
+
+    if not hall_available():
+        await reply("Доска почёта сейчас недоступна — чиню. Голосование (/vote) работает как обычно.")
+        return
+    url = _hall_page_url(cfg)
+    if not url:
+        await reply("Доска почёта не настроена: не задан WEBAPP_PUBLIC_URL (нужен https-адрес приложения).")
+        return
+    if not entry:
+        await reply("Не настроен основной чат (LISTENER_ALLOWED_CHATS).")
+        return
+
+    argument = stats.strip_command_bot_mention(message.get("text") or "", bot_username)
+    for spelling in HALL_COMMANDS:
+        if argument.lower().startswith(spelling):
+            argument = argument[len(spelling):]
+            break
+    wants_import = " ".join(argument.lower().split()) in HALL_IMPORT_WORDS
+    wants_contests = " ".join(argument.lower().split()) in HALL_CONTESTS_WORDS
+    words = argument.split()
+    theme_request = (words[1:] if words and words[0].lower() in HALL_THEME_WORDS else None)
+
+    async def is_admin() -> bool:
+        admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+        return admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+
+    if wants_import:
+        if not is_private:
+            await reply("Перенос истории — только в личке с ботом.")
+            return
+        if not await is_admin():
+            await reply("Переносить историю в Доску почёта могут только администраторы.")
+            return
+        await reply("Переношу прошлые итоги в Доску почёта… Это может занять минуту: копирую фото.")
+        try:
+            # Copies photos and draws thumbnails for every week it brings in: a worker
+            # thread, so the chat is not kept waiting behind it.
+            counts = await asyncio.to_thread(hall_of_fame.import_history, entry)
+        except Exception:
+            log(f"[bot_listener] the hall import failed:\n{traceback.format_exc()}")
+            await reply("Не получилось перенести историю — смотри логи.")
+            return
+        lines = [f"Готово. Перенесено конкурсов: {counts['added']}, уже были: {counts['known']}."]
+        restored, gone = await _restore_hall_photos(telethon_client, entry, log=log)
+        if restored:
+            lines.append(f"Фото возвращены из чата: {restored} работ.")
+        if gone:
+            lines.append(
+                f"Без фото остались {gone} работ: их посты в чате удалены, взять фото неоткуда. "
+                "Имена, места и голоса на месте."
+            )
+        await reply("\n".join(lines), reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
+        return
+
+    if wants_contests or theme_request is not None:
+        if not is_private:
+            await reply("Это — только в личке с ботом.")
+            return
+        if not await is_admin():
+            await reply("Менять конкурсы на Доске почёта могут только администраторы.")
+            return
+        if theme_request:
+            await reply(await _relabel_hall_contest(
+                entry, theme_request[0], " ".join(theme_request[1:]), url, log=log,
+            ))
+            return
+        if theme_request is not None:
+            await reply("Напиши так: /hall тема 2026-W40 #МассПокрас — или открой /hall конкурсы.")
+            return
+        hall = await asyncio.to_thread(hall_of_fame.snapshot, entry)
+        if not hall.contests:
+            await reply("На Доске почёта пока нет конкурсов.")
+            return
+        rows = [[{"text": _hall_contest_label(contest)[:64],
+                  "callback_data": _hall_theme_callback_data(contest.contest_id, user.get("id"))}]
+                for contest in hall.contests[:HALL_CONTEST_BUTTONS]]
+        await reply(
+            "Какой конкурс поправить? Нажми на него и пришли его хэштег и название — "
+            "например «#МассПокрас 🎨 МассПокрас». Сначала самые новые.",
+            reply_markup={"inline_keyboard": rows},
+        )
+        return
+
+    hall = await asyncio.to_thread(hall_of_fame.snapshot, entry)
+    summary = (
+        f"Конкурсов: {len(hall.contests)} · художников: {len(hall.artists)}."
+        if hall.contests else
+        "Пока пусто: первый победитель появится здесь, как только закроется голосование."
+    )
+    text = f"Доска почёта — победители, их работы и вся хронология итогов.\n{summary}\n\n{url}"
+    if not is_private:
+        await reply(text, reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]})
+        return
+    rows = [
+        [{"text": HALL_OPEN_BUTTON_TEXT, "web_app": {"url": url}}],
+        [{"text": "Открыть в браузере", "url": url}],
+    ]
+    if await is_admin():
+        rows.append([{"text": "📥 Перенести историю итогов",
+                      "callback_data": _hall_action_callback_data("import", user.get("id"))}])
+        if hall.contests:
+            rows.append([{"text": "✏️ Хэштег и название конкурса",
+                          "callback_data": _hall_action_callback_data("contests", user.get("id"))}])
+        warning = storage.persistence_warning()
+        if warning:
+            text = f"{warning}\n\n{text}"
+    await reply(text, reply_markup={"inline_keyboard": rows})
+
+
+async def handle_hall_action_callback(
+    api: TelegramBotAPI,
+    telethon_client,
+    cfg,
+    callback: dict,
+    entry: str | None,
+    bot_username: str | None,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """The /hall panel's buttons, replayed as the command they stand for -- the admin
+    check and the work happen there, as for every other panel in this file."""
+    parsed = _parse_hall_action_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, target_user_id = parsed
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    trigger = callback.get("message") or {}
+    synthetic_message = {
+        "message_id": trigger.get("message_id"),
+        "chat": trigger.get("chat") or {"id": target_user_id, "type": "private"},
+        "from": clicker,
+        "text": HALL_ACTIONS[action],
+    }
+    task = asyncio.create_task(handle_hall_command(
+        api, telethon_client, cfg, synthetic_message, entry, bot_username, log=log,
+    ))
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def _history_sources() -> dict:
+    """Where each voting store lives, by the name it has under DATA_DIR -- read from the
+    stores themselves, so a test that moves one moves its backup too. A store whose module
+    did not load is left out rather than guessed at."""
+    sources = {"voting": voting._voting_dir()}
+    if arena is not None:
+        sources["arena"] = arena._arena_dir()
+    if nominations is not None:
+        sources["nominations"] = nominations._nominations_dir()
+    if hall_of_fame is not None:
+        sources["hall_of_fame"] = hall_of_fame._hall_dir()
+    return sources
+
+
+def _backups_dir() -> Path:
+    """DATA_DIR/backups -- beside the stores, not inside one of them."""
+    return voting._voting_dir().parent / "backups"
+
+
+async def _send_history_backup(api: TelegramBotAPI, chat_id, why: str, log=print) -> str | None:
+    """Builds the zip (in a worker thread) and sends it to `chat_id`. Returns None once
+    sent, or a sentence saying why it was not -- the zip is on disk either way."""
+    try:
+        path, count = await asyncio.to_thread(backup.build_backup, _history_sources(), _backups_dir())
+    except Exception:
+        log(f"[bot_listener] building the history backup failed:\n{traceback.format_exc()}")
+        return "Не получилось собрать резервную копию — смотри логи."
+    if backup.too_big_to_send(path):
+        return (f"Резервная копия собрана ({count} записей), но больше 50 МБ — Telegram такую не "
+                f"примет. Она лежит на сервере: {path}")
+    caption = (
+        f"Резервная копия истории голосований {why}: записей — {count}. Голоса, участники, "
+        "итоги, Доска почёта. Фото в неё не входят: они в постах чата, и Доска почёта "
+        "возвращает их оттуда (/hall импорт). Чтобы восстановить — распаковать в DATA_DIR."
+    )
+    try:
+        await api.send_document_file(chat_id, path, caption=caption)
+    except Exception as e:
+        log(f"[bot_listener] sending the history backup to {chat_id} failed: {e}")
+        return f"Резервная копия собрана, но отправить её не вышло: {e}. Она лежит на сервере: {path}"
+    log(f"[bot_listener] sent a history backup ({count} records) to {chat_id}")
+    return None
+
+
+async def handle_backup_command(api: TelegramBotAPI, telethon_client, message: dict, entry: str | None,
+                                log=print) -> None:
+    """"/backup": the zip of the voting history, to whoever asked -- in the DM, and only
+    for a real administrator of the chat or the owner. Delegates are left out, as they
+    are from the vote statistics: the zip says who voted for whom."""
+    chat = message["chat"]
+    user = message.get("from") or {}
+
+    async def reply(text: str):
+        try:
+            await api.send_message(chat["id"], text, reply_to_message_id=message.get("message_id"), parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] failed to send the backup reply: {e}")
+
+    if chat.get("type") != "private":
+        await reply("Резервная копия — только в личке с ботом.")
+        return
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log) if entry else None
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, user):
+        await reply("Резервную копию могут получить только администраторы чата.")
+        return
+    warning = storage.persistence_warning()
+    if warning:
+        await reply(warning)
+    problem = await _send_history_backup(api, chat["id"], "по запросу", log=log)
+    if problem:
+        await reply(problem)
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -5892,7 +6555,9 @@ async def handle_vote_command(
 
     - "/vote собрать" (DM, admin-only) first asks WHICH DAYS, in a calendar (see
       _vote_date_picker), then collects exactly that span's #итогинедели posts into the
-      current week's poll and makes it the one the page opens. Works already collected
+      current week's poll and makes it the one the page opens. The picker's "🏷 Хэштег"
+      collects a thematic contest's own tag instead, into that tag's own poll for the
+      week ("/vote собрать #аниме 🌸 Лучший аниме-покрас 28.09 05.10" typed out). Works already collected
       inside the span are left alone, not re-fetched; ones outside it leave the poll, as
       the confirmation step said they would. Everything found waits in moderation until
       an administrator admits it. "/vote собрать 28.09 05.10" skips the calendar.
@@ -5955,6 +6620,7 @@ async def handle_vote_command(
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
     collect_only_new = False
     collect_dates = None
+    collect_theme_text = ""
     image_columns = vote_image.COLUMNS
     if forced_mode == "moderate":
         wants_moderate = True
@@ -5972,14 +6638,19 @@ async def handle_vote_command(
                 break
         normalized = " ".join(argument.lower().split())
         collect_only_new = normalized in VOTE_ADD_NEW_WORDS
-        # "собрать" may carry the dates on the end ("собрать 28.09 05.10"); whatever
-        # follows the word is kept for the collect branch to read.
-        collect_dates = next(
-            (normalized[len(word):].strip()
-             for word in sorted(VOTE_COLLECT_WORDS, key=len, reverse=True)
+        # "собрать" may carry a hashtag and the dates on the end ("собрать #аниме 🌸
+        # Лучший аниме-покрас 28.09 05.10"); whatever follows the word is kept for the
+        # collect branch to read -- in its original case, since a theme's title has one.
+        collect_word = next(
+            (word for word in sorted(VOTE_COLLECT_WORDS, key=len, reverse=True)
              if normalized == word or normalized.startswith(word + " ")),
             None,
         )
+        collect_dates = None
+        if collect_word is not None:
+            collect_theme_text, collect_dates = _split_vote_collect_argument(
+                " ".join(argument.split())[len(collect_word):]
+            )
         wants_collect = collect_only_new or collect_dates is not None
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
@@ -6016,8 +6687,32 @@ async def handle_vote_command(
         return True
 
     if wants_collect:
+        theme_parts = voting.parse_theme_text(collect_theme_text) if collect_theme_text else None
+        if collect_theme_text and theme_parts is None:
+            await reply(
+                "Не понял хэштег: нужны буквы, цифры или _ после #. Например: "
+                "/vote собрать #аниме -- или просто /vote собрать и кнопка «🏷 Хэштег»."
+            )
+            return
         if not await require_admin_in_dm("Собирать заявки могут только администраторы."):
             return
+
+        # Which hashtag: the one typed (remembered, with its title and badge if given --
+        # left out, they keep what was remembered before), else #итогинедели. "Добавить
+        # новые" has no tag of its own and tops up the contest the page is showing.
+        if theme_parts is not None:
+            tag, title, badge = theme_parts
+            theme = voting.remember_theme(entry, tag, title or None, badge or None)
+        elif collect_only_new:
+            shown_poll = voting.latest_poll(entry)
+            theme = voting.theme_for(entry, shown_poll.hashtag if shown_poll else voting.CONTEST_HASHTAG)
+            if shown_poll is not None and not shown_poll.is_weekly:
+                theme.title = theme.title or shown_poll.title
+                theme.badge = theme.badge or shown_poll.badge
+        else:
+            theme = voting.Theme(hashtag=voting.CONTEST_HASHTAG)
+        hashtag = theme.hashtag
+        picker_theme = None if voting.is_weekly_hashtag(hashtag) else theme
 
         # "Собрать все заявки" is always for days somebody chose. Without dates on the
         # end it opens the picker and collects nothing yet; the picker's "Собрать" comes
@@ -6026,7 +6721,7 @@ async def handle_vote_command(
         if not collect_only_new:
             today = datetime.now(tz).date()
             if not collect_dates:
-                await reply(*_vote_date_picker(today, user.get("id")))
+                await reply(*_vote_date_picker(today, user.get("id"), theme=picker_theme))
                 return
             collect_range = _parse_vote_collect_range(collect_dates, today)
             if isinstance(collect_range, str):
@@ -6054,15 +6749,17 @@ async def handle_vote_command(
             window = {"weeks": VOTE_COLLECT_WEEKS, "stop_at_known": True}
         status = await reply(
             (
-                f"Добавляю новые заявки с #итогинедели {week_label}: читаю чат до последней "
+                f"Добавляю новые заявки с {hashtag} {week_label}: читаю чат до последней "
                 "уже собранной работы. Если не хватает работ за прошлую неделю -- нажми "
                 "«Собрать все заявки»."
             ) if collect_only_new else (
-                f"Собираю все заявки с #итогинедели {week_label}. Уже собранные не скачиваю "
+                f"Собираю все заявки с {hashtag} {week_label}. Уже собранные не скачиваю "
                 "заново. Это может занять несколько минут -- буду показывать прогресс здесь."
             )
         )
-        poll_id = _current_vote_poll_id(tz)
+        # Each hashtag has its own poll in the week, so a thematic contest is collected
+        # beside the weekly vote and never into it (see voting.poll_id_for).
+        poll_id = voting.poll_id_for(_current_vote_poll_id(tz), hashtag)
         existing_poll = voting.load_poll(entry, poll_id)
 
         # Nothing is copied out of another poll: this one holds exactly what the chat scan
@@ -6076,6 +6773,7 @@ async def handle_vote_command(
                 chat_ref=entry,
                 tz=tz,
                 media_dir=voting.media_path(entry, poll_id),
+                hashtag=hashtag,
                 skip_entry_ids=known_ids,
                 progress=_vote_progress_reporter(
                     api, chat_id, (status or {}).get("message_id"), week_label, log=log,
@@ -6103,8 +6801,15 @@ async def handle_vote_command(
         if collect_range:
             dropped = [e for e in kept if not voting.posted_within(e, window_start, window_end)]
             kept = [e for e in kept if voting.posted_within(e, window_start, window_end)]
+        if dropped:
+            # They leave the vote, but not the record: the poll as it was -- those works,
+            # their admissions and their votes -- is kept in the archive first.
+            try:
+                voting.snapshot_poll(entry, poll_id)
+            except OSError as e:
+                log(f"[bot_listener] could not snapshot poll {poll_id} before narrowing it: {e}")
         all_entries = kept + new_entries
-        poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll)
+        poll = voting.build_poll(entry, poll_id, all_entries, existing=existing_poll, theme=theme)
         # The poll just collected is the one being worked on, so it becomes what the page
         # and the status message open -- otherwise an older unmoderated poll still on disk
         # (one the old "за прошлую неделю" button wrote, say) could be handed to the
@@ -6120,7 +6825,7 @@ async def handle_vote_command(
         )
         removed = f" Убрано работ вне этих дат: {len(dropped)}." if dropped else ""
         if not all_entries:
-            await reply(f"{week_label.capitalize()} постов с #итогинедели не нашлось.{removed}")
+            await reply(f"{week_label.capitalize()} постов с {hashtag} не нашлось.{removed}")
             return
         summary = (
             f"Новых заявок: {len(new_entries)} (всего {len(all_entries)})." if new_entries
@@ -6131,16 +6836,27 @@ async def handle_vote_command(
         # the admin opens модерация, sees a different week, and concludes the collect
         # failed -- and, worse, might clear a live vote trying to fix it.
         shown = voting.latest_poll(entry)
+        # A different hashtag's vote is "другой конкурс", not "другая неделя" -- it may well
+        # be this very week. Either way closing it is what hands the page over: a closed
+        # vote ranks with a pending one and the newer wins (voting._ballot_rank), whereas
+        # clearing would archive this freshly collected poll too.
+        other = (
+            "открыта пока другая неделя -- " + shown.poll_id
+            if shown is not None and shown.hashtag == poll.hashtag
+            else f"открыт пока другой конкурс -- {shown.label()} ({shown.poll_id})"
+            if shown is not None else ""
+        )
         elsewhere = (
             ""
             if shown is None or shown.poll_id == poll_id else
-            f"\n\nНо открыта пока другая неделя -- {shown.poll_id}: там идёт голосование "
+            f"\n\nНо {other}: там идёт голосование "
             f"({len(shown.votes)} голосов, работ допущено {len(shown.approved)}). "
-            "Оно и остаётся на странице. Подведи в нём итоги или очисти голосование, "
-            "чтобы перейти к этой неделе -- заявки уже собраны и никуда не денутся."
+            "Оно и остаётся на странице. Подведи в нём итоги (закрой голосование) -- и "
+            "откроется это; заявки уже собраны и никуда не денутся."
         )
+        contest = "" if poll.is_weekly else f" Конкурс: {poll.label()} ({hashtag})."
         await reply(
-            f"{summary} Неделя: {poll_id} (заявки {week_label}). "
+            f"{summary} Неделя: {poll_id} (заявки {week_label}).{contest} "
             f"Открой модерацию и отметь, какие работы допустить.{elsewhere}",
             reply_markup={"inline_keyboard": [[
                 {"text": "🛠 Модерация заявок", "web_app": {"url": f"{page_url}?mode=admin"}}
@@ -6255,6 +6971,11 @@ async def handle_vote_command(
         is_manager = admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
         if is_manager:
             text = _vote_status_text(entry)
+            # The one place an administrator looks every week, so a history that the next
+            # deploy would wipe is said here, above the standings.
+            warning = storage.persistence_warning()
+            if warning:
+                text = f"{warning}\n\n{text}"
             admin_user_id = user.get("id")
             await reply(
                 text,
@@ -6302,6 +7023,9 @@ async def handle_vote_command(
                         # the картинка buttons with a framing step in front of them.
                         {"text": "✂️ Кадрировать и выгрузить", "web_app": {"url": f"{page_url}/board"}},
                     ],
+                    # Where every closed vote ends up (see _record_vote_in_hall).
+                    *([[{"text": HALL_OPEN_BUTTON_TEXT, "web_app": {"url": _hall_page_url(cfg)}}]]
+                      if _hall_page_url(cfg) else []),
                     [
                         {
                             "text": "🗑 Очистить",
@@ -6603,7 +7327,7 @@ def _vote_result_keyboard(flow_id: str) -> dict:
     ]]}
 
 
-def _vote_results_text(standings: list, places: int | None = None) -> str:
+def _vote_results_text(standings: list, places: int | None = None, header: str | None = None) -> str:
     """voting.format_results_text owns the wording -- this only guarantees there IS one.
 
     `places` is passed straight through, and None (the default) means every entrant gets a
@@ -6614,11 +7338,15 @@ def _vote_results_text(standings: list, places: int | None = None) -> str:
     to a bare list keeps the flow alive at the cost of the dictated wording.
     """
     try:
+        # The weekly wording is called exactly as before; only a thematic contest, which
+        # names itself in the first line, passes a header.
+        if header:
+            return voting.format_results_text(standings, places, header=header)
         return voting.format_results_text(standings, places)
     except Exception:
         # Not traceback-logged at error level on purpose: this also covers running against
         # an older voting.py that has no format_results_text at all.
-        lines = ["Результаты недельного голосования:"]
+        lines = [header or "Результаты недельного голосования:"]
         for index, (entry, votes) in enumerate(
             standings if places is None else standings[:places], start=1
         ):
@@ -6696,7 +7424,9 @@ async def send_vote_results_draft(
     if chat_id is None or not standings:
         return
 
-    text = _vote_results_text(standings)
+    # A poll with no hashtag of its own is the weekly contest, whose header is dictated.
+    thematic = not getattr(poll, "is_weekly", True)
+    text = _vote_results_text(standings, header=voting.results_header(poll) if thematic else None)
     _save_vote_results(poll, standings, text, log=log)
 
     # One live draft per admin, plus the usual TTL sweep -- a second "подведи итоги" in the
@@ -10396,6 +11126,13 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
                 background_tasks, log=log,
             )
+        elif callback_data.startswith(f"{HALL_THEME_CALLBACK_PREFIX}:"):
+            await handle_hall_theme_callback(api, callback, home_chat_ref, log=log)
+        elif callback_data.startswith(f"{HALL_ACTION_CALLBACK_PREFIX}:"):
+            await handle_hall_action_callback(
+                api, telethon_client, cfg, callback, home_chat_ref, bot_username,
+                background_tasks, log=log,
+            )
         elif callback_data.startswith(f"{VOTE_DATE_CALLBACK_PREFIX}:"):
             await handle_vote_date_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,
@@ -10539,6 +11276,12 @@ async def _dispatch_update(
             await handle_vote_link_ballot(
                 api, telethon_client, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), start_payload, log=log,
+            )
+            return
+        if start_payload == "hall":
+            await handle_hall_command(
+                api, telethon_client, cfg, message,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), bot_username, log=log,
             )
             return
         if start_payload == "vote3":
@@ -10779,6 +11522,19 @@ async def _dispatch_update(
     ):
         return
 
+    # The answer to "/hall конкурсы"'s question: which hashtag a recorded contest had.
+    if await handle_hall_theme_reply(api, telethon_client, cfg, message, home_chat_ref, log=log):
+        return
+
+    # The answer to the picker's "✏️ Новый хэштег". Recognised by the prompt it replies
+    # to, so it claims nothing else -- and it has to come before the command matching
+    # below, because the answer is a bare "#аниме", not a command.
+    if await handle_vote_hashtag_reply(
+        api, telethon_client, cfg, tz, message, home_chat_ref, bot_username,
+        background_tasks, vote_chat_flows, log=log,
+    ):
+        return
+
     # Before any command match: a creature's name is free text and could easily be
     # something starting with a slash.
     if await maybe_handle_pets_flow_message(
@@ -10932,6 +11688,27 @@ async def _dispatch_update(
                 api, telethon_client, cfg, tz, message, arena_entry, bot_username,
                 background_tasks, log=log, vote_chat_flows=vote_chat_flows,
             )
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in BACKUP_COMMANDS):
+        task = asyncio.create_task(
+            handle_backup_command(api, telethon_client, message, home_chat_ref, log=log)
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/hall" -- the Hall of Fame (hall_web.py). Matched as a whole word: "/hall" is a
+    # prefix of more than one English word.
+    if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in HALL_COMMANDS):
+        hall_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if hall_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_hall_command(api, telethon_client, cfg, message, hall_entry, bot_username, log=log)
         )
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
@@ -11250,6 +12027,11 @@ async def run_bot_listener(
     that listener.py isn't running their detection either in that mode. Commands and
     /summary still work standalone: those come from the bot's own updates."""
     allowed_chats = set(c.lower().lstrip("@") for c in cfg.listener_allowed_chats)
+    # Loud at every boot: a history on a disk the next deploy wipes is otherwise found out
+    # only by the deploy that wipes it.
+    log(f"[bot_listener] keeping votes, photos and the Hall of Fame under {storage.data_dir()}")
+    if storage.persistence_warning():
+        log(f"[bot_listener] {storage.persistence_warning()}")
     background_tasks: set[asyncio.Task] = set()
     summary_queue: asyncio.Queue = asyncio.Queue()
     # Maps a LISTENER_ALLOWED_CHATS entry to the Bot-API chat_id it corresponds to.
@@ -11783,6 +12565,23 @@ async def run_bot_listener(
                 if home_chat_ref
                 else None
             )
+            # Into the Hall of Fame now, while the poll's photos are certainly still where
+            # the poll keeps them -- "очистить" moves them into the archive. Off the event
+            # loop (copies, thumbnails) and in the background, so the draft is not kept
+            # waiting for the pictures.
+            async def _keep_the_closed_vote():
+                await asyncio.to_thread(_record_vote_in_hall, poll, standings, log)
+                # Then the zip, so it already holds the contest just recorded.
+                if getattr(cfg, "backup_chat_id", None):
+                    problem = await _send_history_backup(
+                        api, cfg.backup_chat_id, f"после голосования {poll.poll_id}", log=log,
+                    )
+                    if problem:
+                        log(f"[bot_listener] {problem}")
+
+            hall_task = asyncio.create_task(_keep_the_closed_vote())
+            background_tasks.add(hall_task)
+            hall_task.add_done_callback(background_tasks.discard)
             await send_vote_results_draft(
                 api, user, poll, standings, admin_chat_id, vote_result_flows, log=log,
             )
@@ -11865,6 +12664,24 @@ async def run_bot_listener(
                         )
                     except Exception:  # noqa: BLE001
                         log("[bot_listener] the nominations page (/vote3) was not mounted; "
+                            "/vote is unaffected:\n" + traceback.format_exc())
+                # The Hall of Fame site, under its own guard for the same reason as v3.
+                # Avatars through the same Bot API callable the ballot uses; the chat's
+                # @username / id for links to the original posts, resolved on first use.
+                if hall_available():
+                    async def _hall_chat():
+                        chat_id, username = await _cabinet_chat_ref(
+                            telethon_client, home_chat_ref, known_chat_ids, log=log,
+                        )
+                        return username, chat_id
+
+                    try:
+                        hall_web.attach(
+                            app, home_chat_ref or "", log=log, avatar=_fetch_vote_avatar,
+                            chat=_hall_chat, bot_username=bot_username,
+                        )
+                    except Exception:  # noqa: BLE001
+                        log("[bot_listener] the Hall of Fame (/hall) was not mounted; "
                             "/vote is unaffected:\n" + traceback.format_exc())
                 # The pet game's own page. It needs one thing the other two don't: the
                 # player's live chat XP, because the coin balance is derived from it and

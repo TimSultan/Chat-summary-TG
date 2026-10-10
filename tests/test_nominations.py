@@ -303,7 +303,7 @@ class SyncFromV1Tests(_Storage):
         nominations.update_contest(
             CHAT, lambda c: nominations.set_nomination_entries(c, anime.nomination_id, ["2"]))
 
-        voting.archive_all_polls(CHAT)  # /vote очистить: its photos are deleted too
+        voting.archive_all_polls(CHAT)  # /vote очистить: its photos leave with the poll
         nominations.sync_from_v1(CHAT)
 
         # Work 1 was only raw material and goes; work 2 is a candidate in a running vote
@@ -311,7 +311,7 @@ class SyncFromV1Tests(_Storage):
         self.assertEqual(self._pool(), ["2"])
         self.assertTrue((nominations.media_path(CHAT) / "2_0.jpg").is_file())
 
-    def test_clearing_v3_deletes_its_own_photos_and_never_v1s(self):
+    def test_clearing_v3_archives_its_own_photos_and_never_touches_v1s(self):
         self._seed_poll()
         nominations.sync_from_v1(CHAT)
         before = self._snapshot()
@@ -320,6 +320,8 @@ class SyncFromV1Tests(_Storage):
 
         self.assertIsNone(nominations.load_contest(CHAT))
         self.assertFalse(nominations.media_path(CHAT).exists())
+        kept = sorted(p.name for p in (nominations.archive_dir() / "media").rglob("*.jpg"))
+        self.assertEqual(kept, ["1_0.jpg", "2_0.jpg", "2_1.jpg"])
         archived = list(nominations.archive_dir().glob("*.json"))
         self.assertEqual(len(archived), 1)
         self.assertEqual(len(json.loads(archived[0].read_text(encoding="utf-8"))["entries"]), 2)

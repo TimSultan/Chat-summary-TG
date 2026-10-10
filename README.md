@@ -906,6 +906,31 @@ page that changes shape depending on who opens it:
   it** — the collect reply says so outright — and takes the page once that vote is
   announced or cleared. There is no week picker; one contest is live at a time.
 
+  **A closed vote is no longer a ballot.** It shares its rank with a collected-but-
+  unmoderated poll, so whichever is newer has the page: a finished vote keeps showing its
+  result until something is collected after it, and then that takes over. Before, a
+  closed vote kept the page until somebody cleared — and clearing archives every poll,
+  the one just collected along with it. A vote that is still open keeps the page as before.
+
+  **Which hashtag.** The picker's first screen names the hashtag it will read —
+  `#итогинедели` unless changed — with a "🏷 Хэштег" button: the weekly tag, every
+  thematic contest's tag collected before (newest first, `voting.load_themes`), and
+  "✏️ Новый хэштег", answered by replying to the bot's question. The answer may carry the
+  winner's badge and the contest's title too: `#аниме 🌸 Лучший аниме-покрас`. It can all
+  be typed instead: `/vote собрать #аниме 🌸 Лучший аниме-покрас 28.09 05.10` (tag, optional
+  badge, optional title, optional dates — without dates the calendar opens for that tag).
+  A tag picked once is remembered, with its title and badge, in `voting/themes/`, outside
+  the glob `latest_poll` reads.
+
+  **Each hashtag has its own poll for the week** (`voting.poll_id_for`): `2026-W41` stays
+  the weekly contest's, and a theme's is `2026-W41-<six hex>`, a hash of the tag because
+  poll ids go into file names and photo URLs. So a thematic contest collected beside the
+  weekly vote never touches that vote's works, ballots, results record or board picture —
+  all of them are keyed by poll id. The poll carries `hashtag`, `title` and `badge`; the
+  status panel names a thematic contest, its announcement is headed "Результаты конкурса
+  «…»" (the weekly wording is unchanged), and "Добавить новые" tops up whichever contest
+  the page is showing, with that contest's tag.
+
   **Starting a new week carries last week's field over**, minus its top 3: the podium has
   had its week, everything below it runs again, and the reply says how many came across.
   Only works that were **admitted** last week are carried (un-admitting is the only way to
@@ -990,12 +1015,14 @@ page that changes shape depending on who opens it:
   the loaded font genuinely has no glyph for, detected by comparing each character's
   bitmap against the one an unassigned codepoint draws. A name left with nothing promotes
   the `@tag` to its line rather than printing a blank card.
-- **`/vote очистить`** (DM, administrators only) deletes the current poll outright --
-  entries, votes, admitted flags, downloaded photos, settings, all of it -- behind a
-  tap-to-confirm inline button, same as every other irreversible action in this bot. The
-  next `/vote собрать` then starts a genuinely fresh poll rather than resetting the old
-  one in place. The moderation screen has the same action as a button
-  ("🗑 Очистить голосование"), also behind its own confirmation.
+- **`/vote очистить`** (DM, administrators only) takes every poll off the page --
+  entries, votes, admitted flags, photos, settings -- behind a tap-to-confirm inline
+  button. The next `/vote собрать` then starts a genuinely fresh poll rather than
+  resetting the old one in place. The moderation screen has the same action as a button
+  ("🗑 Очистить голосование"), also behind its own confirmation. **Nothing is deleted**:
+  each poll file and its photos move into `voting/archive/` together (see "Keeping the
+  history" below). The photos used to be deleted here, and the moderation screen's
+  button deleted the poll file too.
 - **`/vote chat`** (DM, administrators only) drafts an announcement: asks for the text via
   a force-reply (same convention as every other short text prompt in this bot -- badge
   creation, cabinet's title/coin entry), and then, instead of sending it anywhere
@@ -1064,6 +1091,110 @@ Two optional settings shape where announcements go and how their button opens:
 by default — an `@username` is all Telegram's `sendMessage` needs, so no numeric id lookup
 is involved) and `VOTE_MINIAPP_SHORT_NAME` (BotFather's `/newapp` short name, which has to
 be created by hand once, pointing at `WEBAPP_PUBLIC_URL` + `/vote`).
+
+### `/hall` — Доска почёта, the Hall of Fame
+
+A website (`hall_of_fame.py`, `hall_web.py`, mounted at `/hall` on the voting server) for
+everything the contests have decided: every closed `/vote` contest — the weekly one and the
+thematic ones — with its whole field, places and votes; a page per artist with their avatar,
+every work they entered and every badge they won. Four screens, picked by the URL's
+`#fragment`:
+
+- **Зал славы** — the latest winner large, with the podium beside it; the recent winners
+  as a gallery; the best artists, ranked as a medal table (🥇 golds, then 🥈 silvers, then
+  🥉 bronzes -- a place with no votes earns no medal -- then votes); the thematic
+  contests and how they work.
+- **Хронология** — every contest newest first, grouped by month, with its podium; one tap
+  opens all its works. Filters: all, итоги недели, тематические.
+- **Художники** — the whole leaderboard, searchable by name or @tag.
+- **Профиль художника** — avatar, @tag (a link to Telegram), 🥇 gold / 🥈 silver / 🥉 bronze / works /
+  votes, the badges (each weekly win is the same 🏆 with a count; each thematic contest is
+  its own badge — the one the administrator gave it when collecting, 🏅 if none), and every
+  work they entered.
+
+Tapping a work opens it full screen with all its photos, its caption, its place and a link
+to the original post in the chat (`t.me/<chat>/<id>`, or `t.me/c/…` for a private
+supergroup — the chat is resolved through the bot once and kept). Esc, a tap beside the
+photo or the phone's back button closes it. Opened inside Telegram, the page uses the Mini
+App back button; in an ordinary browser it is an ordinary site.
+
+**Recorded when a vote closes.** Closing a `/vote` contest (the moderation screen's "Закрыть
+голосование") writes it into the hall in a worker thread, in the background, before the
+results draft reaches the administrator — while the photos are still certainly on disk.
+**The photos are copied**, the same decision `/vote3` made: "очистить" moves a poll's
+photos into its archive, and a hall that pointed at them would go blank the first time
+anybody started a new week. Where the disk allows, the copy is a hardlink, so a picture
+costs its bytes once however many places keep it. Each work's first photo also gets a 480×480 cover, framed the way the administrator
+framed it on the cropping page (`Poll.crops`), or filling the square when nobody did — a
+gallery of full-size phone photos would be megabytes per screen. Re-closing a vote replaces
+its record (the newer close is the truth, as for the results record) and keeps the photos
+already copied. A hall that fails to record is logged and costs nothing else: the vote is
+closed and its results draft is sent either way.
+
+**History.** `/hall импорт` (DM, administrators; also the "📥 Перенести историю итогов"
+button under `/hall`) brings in every announced week the hall does not have yet, from the
+results records under `voting/results/` — which a clear keeps — and every closed poll still
+on disk, taking the photos from the poll's live or archived directory. It never overwrites a
+contest the hall already has. **Then it fetches back from the chat** every hall photo still
+missing on disk — a week whose photos were deleted by a clear before clears kept them, or a
+disk that was lost: every work is a post, and the hall knows its message id
+(`voting.download_post_photos`, the collect's own file names, one post at a time so
+Telegram does not throttle the session). Only a work whose post was deleted from the chat
+stays without a picture; the reply says how many.
+
+**Saying what a contest was, after the fact.** A week recorded as "Итоги недели" that was
+really a thematic contest (week 40 was `#МассПокрас`) is renamed from the bot: `/hall
+конкурсы` (DM, administrators; also "✏️ Хэштег и название конкурса" under `/hall`) lists the
+contests as buttons, and the reply to a tap is the hashtag with an optional badge and title
+— `#МассПокрас 🎨 МассПокрас` — or `#итогинедели` to make it weekly again. Typed in one go:
+`/hall тема 2026-W40 #МассПокрас 🎨 МассПокрас`. A bare tag titles the contest as the tag was
+typed. It rewrites the contest in the hall, the results record it would be imported from
+again (`voting.relabel_results`), so the name survives a re-import, and remembers the theme
+for the next `/vote собрать`.
+
+**`/hall`** itself (also `/зал`, `/доска`, and in both command menus) answers with the link:
+a plain url in a group, so anybody can open it, and in the DM a Mini App button plus "Открыть
+в браузере". The administrator's bare `/vote` panel has a "🏆 Доска почёта" button too.
+
+**Public and read-only.** There is nothing to vote with and nothing a voter must not see:
+only closed contests are in it, and the chat saw their results announced. Each screen asks
+for exactly what it draws (`/hall/api/overview`, `/contests`, `/contests/<id>`, `/artists`,
+`/artists/<key>`), so the front page never carries the archive. Every read goes through
+`hall_of_fame.snapshot` in a worker thread, which parses the contest files only when one has
+changed (keyed on their names, sizes and mtimes). Avatars come through the bot (the same
+callable the ballot uses) and only for somebody in the hall, cached for the process; a
+failed fetch is retried on the next view. The page carries `noindex`, so search engines
+leave members' names alone. `HALL_BRAND` (default `ЕЧХ`) is the community's name in the
+header. Storage: `DATA_DIR/hall_of_fame/<chat key>/contests/*.json` and `media/<contest id>/`.
+
+### Keeping the history — votes, entrants and photos are never lost
+
+Every contest's record — who voted for what, who took part with which work, how it ended,
+and the photos — is kept for good. Four layers:
+
+- **Nothing in the bot deletes it.** Every clear — `/vote`, `/vote2`, `/vote3`, and the
+  moderation screens' clear buttons — moves the record and its photos into that system's
+  `archive/` together (`archive_store.move_to_archive`; a second clear of the same week is
+  kept beside the first, time-stamped). A `/vote собрать` for narrower dates, which removes
+  the works posted outside them, first saves the poll as it was into
+  `voting/archive/snapshots/`. The archives are invisible to the pages and to the vote
+  statistics, which count each week once.
+- **Photos come back from the chat.** A work is a post, so a Hall of Fame photo missing on
+  disk is downloaded again from it (`/hall импорт`, see above).
+- **The disk survives a deploy.** Everything lives under `DATA_DIR`, and on Railway the
+  working directory is rebuilt on every deploy. With a Volume attached and `DATA_DIR`
+  unset, the bot uses the Volume by itself (`storage.use_railway_volume`, called first
+  thing by both entrypoints, before any module reads `DATA_DIR`). When the history is on a
+  disk the next deploy would wipe — Railway with no Volume, or `DATA_DIR` outside it — the
+  startup log says so, and so do an administrator's `/vote` panel, `/hall` and `/backup`.
+- **A copy off the server.** `/backup` (DM; real chat administrators and the owner, not
+  delegates — it holds every ballot, the vote-statistics screen's gate for the same reason)
+  sends a zip of every JSON record under `voting/`, `arena/`, `nominations/` and
+  `hall_of_fame/` (`backup.py`). With `BACKUP_CHAT_ID` set, one is posted there after every
+  closed vote too, once the Hall of Fame has recorded it. The photos stay out — they would
+  pass Telegram's 50 MB upload limit within months, and they are in the chat. The zip's
+  paths are `DATA_DIR`'s own, so restoring is unzipping it into `DATA_DIR`; the last ten are
+  also kept in `DATA_DIR/backups/`.
 
 ### `/vote2` — the second voting system (v2), running beside the first
 
