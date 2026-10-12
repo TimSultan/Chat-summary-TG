@@ -35,8 +35,13 @@ COMMAND = "/tripo"
 CALLBACK_PREFIX = "tripo"
 
 MODEL_VERSION = "v3.1-20260211"
-FACE_LIMITS = (100_000, 200_000, 500_000, 1_000_000, 1_500_000, 2_000_000)
+# What Tripo's docs call it (model id "tripo-v3.1"): their latest high-precision model.
+MODEL_LABEL = "Tripo v3.1"
+FACE_LIMITS = (100_000, 500_000, 1_000_000, 2_000_000)
 DEFAULT_FACE_LIMIT = 1_000_000
+
+# Who to ask for credits: the owner, the only one who grants them.
+CREDITS_CONTACT_URL = "https://t.me/sultan_kembayev"
 
 # Tripo's multiview order. Front is required; the others are optional.
 VIEWS = ("front", "left", "back", "right")
@@ -157,22 +162,34 @@ def parse_callback(data: str) -> tuple[str, str | None] | None:
     return parts[1], (parts[2] if len(parts) > 2 else None)
 
 
+def credit_lines(credits: int | None) -> list[str]:
+    """The balance first, then where to get more. The owner needs neither."""
+    if credits is None:
+        return ["Кредиты: без ограничений"]
+    return [
+        f"Осталось кредитов: <b>{credits}</b> · одна генерация — один кредит",
+        f'<a href="{CREDITS_CONTACT_URL}">Получить кредиты</a>',
+    ]
+
+
+def no_credits_text() -> str:
+    return "\n".join(credit_lines(0))
+
+
 def panel_text(flow: dict, credits: int | None = None) -> str:
     """`credits` is the person's balance, or None for the owner, who needs none."""
     views = flow["views"]
     view_line = " · ".join(
         f"{VIEW_LABELS[v].lower()} {'✓' if v in views else '—'}" for v in VIEWS
     )
-    lines = [
-        "<b>Tripo 3D</b>",
+    lines = credit_lines(credits) + [
         "",
+        f"<b>Tripo 3D</b> · модель <b>{MODEL_LABEL}</b> (последняя)",
         f"Виды: {view_line}",
-        f"Полигоны: <b>{format_faces(flow['faces'])}</b>",
+        f"Количество полигонов: <b>{format_faces(flow['faces'])}</b>",
         "Геометрия Ultra. Текстура, PBR, quad, части и риг выключены.",
+        "",
     ]
-    if credits is not None:
-        lines.append(f"Кредиты: <b>{credits}</b> · одна генерация — один кредит.")
-    lines.append("")
     if "front" not in views:
         lines.append(
             "Пришли фото: первое станет видом спереди. Альбом из нескольких фото "
@@ -200,15 +217,16 @@ def panel_keyboard(flow: dict, credits: int | None = None) -> dict:
         return {"text": label, "callback_data": callback_data("view", view)}
 
     def faces_button(faces: int) -> dict:
-        label = format_faces(faces)
+        # Spelled out on the button itself: a bare "500k" does not say 500k of what.
+        label = f"{format_faces(faces)} полигонов"
         if faces == flow["faces"]:
             label = f"• {label} •"
         return {"text": label, "callback_data": callback_data("faces", faces)}
 
     return {"inline_keyboard": [
         [view_button(v) for v in VIEWS],
-        [faces_button(f) for f in FACE_LIMITS[:3]],
-        [faces_button(f) for f in FACE_LIMITS[3:]],
+        [faces_button(f) for f in FACE_LIMITS[:2]],
+        [faces_button(f) for f in FACE_LIMITS[2:]],
         [
             {"text": "Убрать фото", "callback_data": callback_data("clear")},
             {"text": "Закрыть", "callback_data": callback_data("cancel")},

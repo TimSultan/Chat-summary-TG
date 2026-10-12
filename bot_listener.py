@@ -3225,10 +3225,6 @@ async def handle_via_cleaner_callback(
 # on it: taken when "Отправить" is pressed, given back if no model came of it. Only the owner
 # grants credits (/tripocredits); the owner never needs any.
 
-TRIPO_NO_CREDITS = (
-    "У тебя нет кредитов Tripo: одна генерация 3D-модели стоит один кредит. "
-    "Их начисляет владелец бота."
-)
 TRIPO_OWNER_ONLY = "Начислять кредиты Tripo может только владелец бота."
 TRIPO_NOT_CONFIGURED = "Не настроен адрес image generator web: задай переменную TRIPO_WEB_URL."
 # Tasks a "Проверить результат" / "Новая ссылка" press is already working on, so a
@@ -3328,10 +3324,10 @@ async def handle_tripo_command(
     actor = message.get("from") or {}
     owner = _tripo_is_owner(actor)
 
-    async def reply(text: str) -> None:
+    async def reply(text: str, parse_mode: str | None = None) -> None:
         try:
             await api.send_message(
-                chat_id, text, reply_to_message_id=message["message_id"], parse_mode=None,
+                chat_id, text, reply_to_message_id=message["message_id"], parse_mode=parse_mode,
             )
         except Exception:
             log(f"[bot_listener] failed to answer /tripo:\n{traceback.format_exc()}")
@@ -3339,7 +3335,8 @@ async def handle_tripo_command(
     if not actor.get("id"):
         return
     if not owner and tripo.remember_user(actor)["credits"] < 1:
-        await reply(TRIPO_NO_CREDITS)
+        # Balance first, then where to get more -- the same two lines the panel opens with.
+        await reply(tripo.no_credits_text(), parse_mode="HTML")
         return
     if not tripo.web_endpoint():
         await reply(TRIPO_NOT_CONFIGURED)

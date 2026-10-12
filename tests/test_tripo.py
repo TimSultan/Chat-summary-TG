@@ -209,22 +209,40 @@ class FakeWeb:
 
 
 class SettingsTests(unittest.TestCase):
-    def test_the_six_polygon_budgets(self):
+    def test_the_four_polygon_budgets(self):
         self.assertEqual(
             [tripo.format_faces(f) for f in tripo.FACE_LIMITS],
-            ["100k", "200k", "500k", "1M", "1.5M", "2M"],
+            ["100k", "500k", "1M", "2M"],
         )
+        self.assertIn(tripo.DEFAULT_FACE_LIMIT, tripo.FACE_LIMITS)
 
-    def test_the_panel_offers_every_budget_and_marks_the_chosen_one(self):
+    def test_the_panel_offers_every_budget_says_what_it_is_and_marks_the_chosen_one(self):
         flow = tripo.new_flow(1, DM, 0)
-        flow["faces"] = 1_500_000
+        flow["faces"] = 2_000_000
         rows = tripo.panel_keyboard(flow)["inline_keyboard"]
         budgets = [b for row in rows[1:3] for b in row]
         self.assertEqual(
             [b["callback_data"] for b in budgets],
             [f"tripo:faces:{f}" for f in tripo.FACE_LIMITS],
         )
-        self.assertEqual([b["text"] for b in budgets if "•" in b["text"]], ["• 1.5M •"])
+        self.assertEqual(
+            [b["text"] for b in budgets],
+            ["100k полигонов", "500k полигонов", "1M полигонов", "• 2M полигонов •"],
+        )
+
+    def test_the_panel_names_the_model_and_the_polygon_count(self):
+        text = tripo.panel_text(tripo.new_flow(1, DM, 0), credits=3)
+        self.assertIn("модель <b>Tripo v3.1</b> (последняя)", text)
+        self.assertIn("Количество полигонов: <b>1M</b>", text)
+
+    def test_the_panel_opens_with_the_balance_then_where_to_get_more(self):
+        lines = tripo.panel_text(tripo.new_flow(1, DM, 0), credits=3).splitlines()
+        self.assertTrue(lines[0].startswith("Осталось кредитов: <b>3</b>"))
+        self.assertEqual(lines[1], '<a href="https://t.me/sultan_kembayev">Получить кредиты</a>')
+        # The owner needs neither: the first line says so and there is no link.
+        owner = tripo.panel_text(tripo.new_flow(1, DM, 0, unlimited=True), credits=None)
+        self.assertTrue(owner.startswith("Кредиты: без ограничений\n"))
+        self.assertNotIn("Получить кредиты", owner)
 
     def test_the_request_is_ultra_geometry_with_everything_else_off(self):
         payload = tripo.submit_payload({"front": "F", "back": "B"}, 2_000_000)
@@ -405,7 +423,11 @@ class TripoBotTests(AsyncTestCase):
     async def test_somebody_without_credits_is_refused_and_nothing_opens(self):
         await bot_listener.handle_tripo_command(self.api, _command(STRANGER), self.flows, self.tasks)
         self.assertEqual(self.flows, {})
-        self.assertEqual(self.api.sent[-1]["text"], bot_listener.TRIPO_NO_CREDITS)
+        refusal = self.api.sent[-1]
+        self.assertEqual(refusal["parse_mode"], "HTML")
+        self.assertEqual(refusal["text"], tripo.no_credits_text())
+        self.assertTrue(refusal["text"].startswith("Осталось кредитов: <b>0</b>"))
+        self.assertIn(f'<a href="{tripo.CREDITS_CONTACT_URL}">Получить кредиты</a>', refusal["text"])
         # Remembered, so the owner can now grant to their @username and reach them.
         self.assertTrue(tripo.is_known(STRANGER["id"]))
 
@@ -414,14 +436,14 @@ class TripoBotTests(AsyncTestCase):
         tripo.change_credits("@someone", 2)
         flow = await self.open_panel(who=STRANGER)
         self.assertFalse(flow["unlimited"])
-        self.assertIn("Кредиты: <b>2</b>", self.api.panels()[-1]["text"])
-        go = self.api.panels()[-1]["reply_markup"]["inline_keyboard"][-1][0]["text"]
+        self.assertTrue(self.api.panels()[-1]["text"].startswith("Осталось кредитов: <b>2</b>"))
+        go =self.api.panels()[-1]["reply_markup"]["inline_keyboard"][-1][0]["text"]
         self.assertEqual(go, "Отправить на генерацию · 1 кредит")
 
-    async def test_the_owner_needs_no_credits_and_sees_none(self):
+    async def test_the_owner_needs_no_credits(self):
         flow = await self.open_panel()
         self.assertTrue(flow["unlimited"])
-        self.assertNotIn("Кредиты", self.api.panels()[-1]["text"])
+        self.assertTrue(self.api.panels()[-1]["text"].startswith("Кредиты: без ограничений"))
 
     async def test_without_the_web_address_it_says_what_to_set(self):
         with patch.dict(os.environ, {"TRIPO_WEB_URL": ""}):
@@ -457,7 +479,7 @@ class TripoBotTests(AsyncTestCase):
         await self.press("tripo:go", presser=STRANGER)
         self.assertEqual(len(self.api.documents), 1)
         self.assertEqual(tripo.balance(STRANGER["id"]), 1)
-        self.assertIn("Кредиты: <b>1</b>", self.api.panels()[-1]["text"])
+        self.assertTrue(self.api.panels()[-1]["text"].startswith("Осталось кредитов: <b>1</b>"))
 
     async def test_the_owner_is_never_charged(self):
         self.web.status_replies = [self.web.finished(render=None)]
@@ -588,15 +610,16 @@ class TripoBotTests(AsyncTestCase):
     async def test_buttons_choose_the_view_and_the_budget(self):
         flow = await self.open_panel()
         await self.press("tripo:view:back")
-        await self.press("tripo:faces:200000")
-        self.assertEqual((flow["target"], flow["faces"]), ("back", 200_000))
+        await self.press("tripo:faces:500000")
+        self.assertEqual((flow["target"], flow["faces"]), ("back", 500_000))
         await self.press("tripo:faces:123")  # not on the panel: ignored
-        self.assertEqual(flow["faces"], 200_000)
-        self.assertIn("<b>200k</b>", self.api.edits[-1]["text"])
+        await self.press("tripo:faces:200000")  # an old panel's budget, no longer offered
+        self.assertEqual(flow["faces"], 500_000)
+        self.assertIn("Количество полигонов: <b>500k</b>", self.api.edits[-1]["text"])
 
     async def test_an_old_panel_is_refused(self):
         await self.open_panel()
-        await self.press("tripo:faces:200000", message_id=1)
+        await self.press("tripo:faces:500000", message_id=1)
         self.assertIn("устарела", self.api.answers[-1])
         self.assertEqual(self.flows[OWNER["id"]]["faces"], tripo.DEFAULT_FACE_LIMIT)
 
@@ -624,13 +647,13 @@ class TripoBotTests(AsyncTestCase):
         await self.send_photo(11, "left-id")
         await self.press("tripo:view:right")
         await self.send_photo(12, "right-id")
-        await self.press("tripo:faces:1500000")
+        await self.press("tripo:faces:2000000")
         await self.press("tripo:go")
 
         submits = self.web.submits()
         self.assertEqual(len(submits), 1)
         body = submits[0]
-        self.assertEqual(body["faceLimit"], 1_500_000)
+        self.assertEqual(body["faceLimit"], 2_000_000)
         self.assertEqual(body["geometryQuality"], "detailed")
         self.assertEqual(body["tripoKey"], "tsk_test")
         self.assertEqual(set(body["viewImages"]), {"left", "right"})
@@ -645,8 +668,8 @@ class TripoBotTests(AsyncTestCase):
         self.assertEqual(len(self.api.documents), 1)
         document = self.api.documents[0]
         self.assertEqual(document["data"], self.web.model)
-        self.assertEqual(document["name"], f"tripo_1.5M_{TASK_ID[:8]}.glb")
-        self.assertIn("1.5M", document["caption"])
+        self.assertEqual(document["name"], f"tripo_2M_{TASK_ID[:8]}.glb")
+        self.assertIn("2M", document["caption"])
         self.assertEqual(len(self.api.photos), 1)  # Tripo's render, above the model
 
         self.assertFalse(flow["running"])
