@@ -258,6 +258,21 @@ class BrowserPageScriptTests(unittest.TestCase):
         self.assertIn('"https://t.me/" + encodeURIComponent(bot) + "?start=" + payload', page)
         self.assertIn('"/start " + payload', page)  # the copy-and-send fallback
 
+    def test_opening_the_reel_loads_its_photos_and_pins_the_open_one(self):
+        """Opening a photo must not let a neighbour loading late shove it off-screen (iOS/
+        Telegram WebViews have no CSS scroll anchoring). Two halves, both pinned here: the
+        reel's photos switch to eager loading on open, and the tapped work is held in place
+        while they arrive."""
+        page = vote_web.PAGE_HTML
+        # The whole poll is rendered lazily in the grid/reel markup...
+        self.assertIn('loading="lazy"', page)
+        # ...then forced to load the moment the reel opens.
+        self.assertIn('querySelectorAll(\'img[loading="lazy"]\')', page)
+        self.assertIn('im.loading = "eager"', page)
+        # And the open work is anchored through the settle rather than left to drift.
+        self.assertIn("function pinReelPhoto(anchor)", page)
+        self.assertIn("pinReelPhoto(target)", page)
+
 
 # ---------------------------------------------------------------------- the bot side
 

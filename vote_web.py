@@ -1643,6 +1643,41 @@ async function submitBallot(choices) {
 // Opens the reel at the tapped work. Every entry is in it, so from here the rest of the
 // poll is just more scrolling -- which is the point: one gesture in, then nothing to
 // close and reopen per work.
+// Manual scroll anchoring for the reel. The reel is a vertical scroll of full-width
+// photos whose heights are only known once each image loads; a photo above the one being
+// read then claims its real height and pushes the read one off-screen. CSS scroll
+// anchoring (overflow-anchor) is meant to absorb exactly this, but the WebViews Telegram
+// embeds -- iOS WKWebView above all -- do not implement it, which is why the open photo
+// "flew away" there and nowhere else. So we do it by hand: hold the tapped work at the
+// position it opened in, and on every image load correct scrollTop by however far the
+// anchor drifted. It gives up the instant the reader scrolls themselves (our own scrollTop
+// nudges raise no input event, so only a real gesture trips these), once every image has
+// loaded, or after a short safety timeout -- it must never fight a deliberate scroll.
+function pinReelPhoto(anchor) {
+  const reel = $("reel");
+  const imgs = [...$("feed").querySelectorAll("img")].filter((im) => !im.complete);
+  if (!imgs.length) return;
+  const desiredTop = anchor.getBoundingClientRect().top;
+  let live = true;
+  const events = ["touchstart", "wheel", "keydown", "pointerdown"];
+  function settle() {
+    if (!live) return;
+    const drift = anchor.getBoundingClientRect().top - desiredTop;
+    if (Math.abs(drift) > 0.5) reel.scrollTop += drift;
+  }
+  function stop() {
+    if (!live) return;
+    live = false;
+    imgs.forEach((im) => { im.removeEventListener("load", onLoad); im.removeEventListener("error", onLoad); });
+    events.forEach((ev) => reel.removeEventListener(ev, stop));
+    clearTimeout(timer);
+  }
+  function onLoad() { settle(); if (imgs.every((im) => im.complete)) stop(); }
+  imgs.forEach((im) => { im.addEventListener("load", onLoad); im.addEventListener("error", onLoad); });
+  events.forEach((ev) => reel.addEventListener(ev, stop, { passive: true }));
+  const timer = setTimeout(stop, 8000);
+}
+
 function openReel(id) {
   const reel = $("reel");
   reel.hidden = false;
@@ -1653,7 +1688,16 @@ function openReel(id) {
   // scrollTop first: scrollIntoView on the first card is a no-op if the reel is already
   // scrolled from a previous open, and the reader would land wherever they left off.
   reel.scrollTop = 0;
-  if (target) target.scrollIntoView({ block: "start" });
+  // Load every photo now that the reel is open, instead of lazily as it is scrolled: the
+  // reader opened it to look through the whole poll, and a photo arriving late is what
+  // shoved the open one out of view. Flipped here (on open) rather than in the markup so a
+  // visit that never opens the reel still pays nothing for the pictures.
+  [...$("feed").querySelectorAll('img[loading="lazy"]')].forEach((im) => { im.loading = "eager"; });
+  if (target) {
+    target.scrollIntoView({ block: "start" });
+    // ...and hold it there while those images arrive and claim their real heights.
+    pinReelPhoto(target);
+  }
   if (tg && tg.BackButton) tg.BackButton.show();
 }
 
