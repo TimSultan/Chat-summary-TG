@@ -329,6 +329,38 @@ def _is_default_impression_request(text: str, routed: dict, ref_date: date) -> b
     )
 
 
+# A request that names no period means "what did I miss", not "since midnight". Read as
+# the calendar day, a bare /summary sent at 00:28 summarised 28 minutes of chat -- which
+# is exactly what people retried in prod with "/summary 12", "/summary 4", "/summary 3".
+DEFAULT_MIN_WINDOW_HOURS = 12
+
+
+def default_lookback_hours(text: str, routed: dict, request_dt: datetime, tz) -> float | None:
+    """The rolling window to use for a request that named no period, or None to keep the
+    calendar day.
+
+    Only an early-in-the-day request is widened: by noon today already holds at least
+    DEFAULT_MIN_WINDOW_HOURS of chat, so nothing changes from then on. Explicit periods
+    ("сегодня", "вчера", a date, "за N часов") are never touched, and neither are person
+    impressions, which have their own sparse-history fallback that adds yesterday --
+    applying both would hand the model yesterday's evening twice.
+    """
+    local = request_dt.astimezone(tz)
+    ref_date = local.date()
+    if (
+        routed.get("lookback_hours") is not None
+        or routed.get("start_date") != ref_date
+        or routed.get("end_date") != ref_date
+        or EXPLICIT_TIME_RE.search(text or "")
+        or _is_default_impression_request(text, routed, ref_date)
+    ):
+        return None
+    midnight = local.replace(hour=0, minute=0, second=0, microsecond=0)
+    if (local - midnight) >= timedelta(hours=DEFAULT_MIN_WINDOW_HOURS):
+        return None
+    return DEFAULT_MIN_WINDOW_HOURS
+
+
 async def _expand_sparse_impression_history(
     client,
     chat_ref,
@@ -621,9 +653,10 @@ async def handle_request_v2(event, cfg, tz, my_username: str, sent_ids: set[int]
         await respond("Не удалось разобрать запрос.")
         return
 
+    lookback = routed["lookback_hours"] or default_lookback_hours(text, routed, msg.date, tz)
     try:
         start_date, end_date, window_start_dt, window_end_dt, lookback_hours = resolve_time_window(
-            routed["start_date"], routed["end_date"], routed["lookback_hours"], msg.date, tz, log
+            routed["start_date"], routed["end_date"], lookback, msg.date, tz, log
         )
     except DayLimitExceeded:
         await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)

@@ -16,11 +16,33 @@ written in -- see responder_v2.py -- so there is no reply_language field here.
 """
 
 import json
+import re
 from datetime import date
 
 from openai import OpenAI, OpenAIError
 
 from errors import ChatSummaryError
+
+# "/summary 12" -- the reply footer advertises "/summary + время", and people answer it
+# with a bare number of hours. The model read those as no period at all and fell back to
+# the calendar day, which right after midnight is a few minutes of chat, so a request
+# that is nothing but a number (optionally "ч"/"часа"/"h") is decided here instead. At
+# most one decimal digit, so a date such as "12.10" is never read as 12.1 hours.
+BARE_HOURS_RE = re.compile(
+    r"^(?:\s*(?:/\S+|@\w+|summary|саммари|сводка))*\s*"
+    r"(\d{1,3}(?:[.,]\d)?)\s*(?:ч|час|часа|часов|h|hours?)?\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def bare_lookback_hours(text: str) -> float | None:
+    match = BARE_HOURS_RE.match(text or "")
+    if not match:
+        return None
+    hours = float(match.group(1).replace(",", "."))
+    if hours <= 0:
+        return None
+    return int(hours) if hours.is_integer() else hours
 
 SYSTEM_PROMPT = """\
 Ты превращаешь короткое сообщение из чата в структурированный запрос на выборку истории \
@@ -38,7 +60,8 @@ SYSTEM_PROMPT = """\
 - "lookback_hours": если запрос явно просит скользящее окно за последние N часов или минут \
 (минуты переведи в часы, например "последние 90 минут" -> 1.5), а не календарный день -- \
 например "за последние 10 часов", "за последние 3 часа", "за пару часов" -- укажи это число \
-здесь (int или float). Это поле имеет приоритет над start_date/end_date, которые в коде потом \
+здесь (int или float). Голое число без единиц рядом с командой ("summary 12", "summary 3 @bob") -- \
+это тоже число часов. Это поле имеет приоритет над start_date/end_date, которые в коде потом \
 вычисляются точно от момента запроса, а не тобой -- всё равно заполни start_date/end_date своей \
 лучшей оценкой, но они будут переопределены. НЕ заполняй это поле для "сегодня"/"вчера" и прочих \
 формулировок про календарный день. Иначе null.
@@ -56,7 +79,8 @@ SYSTEM_PROMPT = """\
 второй ИИ-шаг увидит ТОЛЬКО этот текст плюс переписку, без остального контекста, так что он \
 должен быть однозначным сам по себе. Сохраняй верность исходному запросу; убирай только шум \
 (триггерное слово, префикс "@бот"), не добавляй и не убирай смысл. Если исходный запрос уже \
-представляет собой ясный самодостаточный вопрос, оставь его почти как есть.
+представляет собой ясный самодостаточный вопрос, оставь его почти как есть. Не вписывай сюда \
+даты и периоды, которых нет в исходном сообщении: точный период второй шаг получит отдельно.
 """
 
 USER_PROMPT_TEMPLATE = """\
@@ -146,6 +170,13 @@ def route_request(
         cleaned_question = cleaned_question.strip() or None
     if not cleaned_question:
         cleaned_question = text.strip()  # fall back to the raw request rather than nothing
+
+    bare_hours = bare_lookback_hours(text)
+    if bare_hours is not None:
+        # The model's restatement of "/summary 12" was "Сделай summary за 12." -- a
+        # question the answering step could only guess at.
+        lookback_hours = bare_hours
+        cleaned_question = f"Сделай сводку переписки за последние {bare_hours} ч."
 
     return {
         "start_date": start_date,

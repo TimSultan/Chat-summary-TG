@@ -12,6 +12,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -150,6 +151,10 @@ class SummaryRequestRoutingTests(unittest.TestCase):
     def setUp(self):
         self._delay = bot_listener.SUMMARY_RECEIPT_DELETE_AFTER
         bot_listener.SUMMARY_RECEIPT_DELETE_AFTER = 0
+        # An answered request is recorded to history/, which is the real one on disk.
+        patcher = patch.object(bot_listener.history, "record")
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         bot_listener.SUMMARY_RECEIPT_DELETE_AFTER = self._delay

@@ -330,6 +330,7 @@ from listener import (
     DayLimitExceeded,
     _expand_sparse_impression_history,
     _format_hours,
+    default_lookback_hours,
     extract_mentioned_usernames,
     is_summary_command,
     resolve_time_window,
@@ -4182,23 +4183,58 @@ def _home_chat_ref(cfg) -> str | None:
 
 def _telegram_html(text: str) -> str:
     """Escapes arbitrary model output for Telegram HTML, then restores the one bit of
-    formatting the summary prompt deliberately asks for: **bold topic headings**.
+    formatting the summary prompt deliberately asks for: **bold topic names**.
+
+    The prompt forbids every other kind of markdown and the model still emits some --
+    `backticks` around commands and usernames above all -- which Telegram shows as
+    literal symbols. Those are unwrapped here instead: backticks dropped, a "#" heading
+    turned bold, a "* " bullet turned into "• ". Bold never spans a line break, so one
+    stray ** cannot embolden every paragraph below it.
 
     Escaping first means usernames containing underscores and literal <, >, or & can
     never become malformed Telegram entities. Any unmatched ** remains harmless text.
     """
-    escaped = html.escape(text, quote=False)
-    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+    lines = []
+    for line in text.split("\n"):
+        line = line.replace("`", "").rstrip()
+        heading = re.match(r"\s*#{1,6}\s+(.+)", line)
+        if heading:
+            line = f"**{heading.group(1).strip('* ')}**"
+        lines.append(re.sub(r"^(\s*)\* ", r"\1• ", line))
+    escaped = html.escape("\n".join(lines), quote=False)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+
+
+def _split_for_telegram(text: str, limit: int = MAX_REPLY_CHARS) -> list[str]:
+    """Cuts a long answer into messages at the weakest boundary that fits: between
+    paragraphs, then between lines, then between words. Slicing every `limit` characters
+    used to cut through a word or a **bold** pair, leaving raw asterisks on both sides
+    of the break. A boundary in the first half of the window is passed over so no
+    message ends up a stub; only a single word longer than `limit` is ever hard-cut."""
+    chunks = []
+    rest = text.strip()
+    while len(rest) > limit:
+        window = rest[: limit + 1]
+        cut = next(
+            (pos for pos in (window.rfind(sep) for sep in ("\n\n", "\n")) if pos > limit // 2),
+            window.rfind(" "),
+        )
+        if cut <= 0:
+            cut = limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip()
+    if rest:
+        chunks.append(rest)
+    return chunks
 
 
 async def send_long_bot_message(api: TelegramBotAPI, chat_id, text: str, reply_to_message_id: int | None) -> list[int]:
     sent_ids = []
-    for i in range(0, len(text), MAX_REPLY_CHARS):
-        chunk = text[i : i + MAX_REPLY_CHARS]
+    for index, chunk in enumerate(_split_for_telegram(text)):
         sent = await api.send_message(
             chat_id,
             _telegram_html(chunk),
-            reply_to_message_id=reply_to_message_id if i == 0 else None,
+            reply_to_message_id=reply_to_message_id if index == 0 else None,
             parse_mode="HTML",
         )
         if sent and "message_id" in sent:
@@ -8662,9 +8698,10 @@ async def handle_bot_summary_request(
         await respond("Не удалось разобрать запрос.")
         return
 
+    lookback = routed["lookback_hours"] or default_lookback_hours(text, routed, request_dt, tz)
     try:
         start_date, end_date, window_start_dt, window_end_dt, lookback_hours = resolve_time_window(
-            routed["start_date"], routed["end_date"], routed["lookback_hours"], request_dt, tz, log
+            routed["start_date"], routed["end_date"], lookback, request_dt, tz, log
         )
     except DayLimitExceeded:
         await respond(DAY_LIMIT_MESSAGE, delete_after=ERROR_DELETE_AFTER, record=False)
