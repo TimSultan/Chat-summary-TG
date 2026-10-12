@@ -688,6 +688,32 @@ class DailyChatterPrizeTests(unittest.TestCase):
         first = [row["user_id"] for row in economy.daily_chatter_prizes("chat", self.day, WPP)]
         self.assertEqual(first, ["3", "5", "7"])
 
+    def test_two_members_on_the_daily_ceiling_are_ordered_by_who_talked_more(self):
+        """Both hit every XP cap, so their XP is identical; the extra talking the caps
+        cut off -- not the lower user id -- decides who takes first place."""
+        start = datetime(2026, 8, 1, 9, tzinfo=timezone.utc)
+        long_text = "[Photo] " + "слово " * 40
+        messages, index = [], 0
+        # "1" sorts before "9", so a user-id tie-break would wrongly crown member 1.
+        for sender_id, count in ((1, stats.XP_DAILY_REPLY_CAP + 10),
+                                 (9, stats.XP_DAILY_REPLY_CAP + 60)):
+            for _ in range(count):
+                index += 1
+                messages.append(SimpleNamespace(
+                    sender_id=sender_id, sender_name=f"U{sender_id}",
+                    sender_username=f"u{sender_id}", text=long_text,
+                    dt_local=start + timedelta(minutes=index), message_id=index,
+                    is_reply=True,
+                ))
+        stats.record_day("chat", self.day, messages)
+
+        ranked = stats.day_xp_ranking("chat", self.day, WPP)
+        self.assertEqual(ranked[0][2], ranked[1][2])
+        self.assertEqual([user_id for user_id, _, _ in ranked], ["9", "1"])
+
+        paid = economy.daily_chatter_prizes("chat", self.day, WPP)
+        self.assertEqual([row["user_id"] for row in paid], ["9", "1"])
+
     def test_a_quiet_day_pays_only_the_people_who_actually_talked(self):
         self._record({1: 4})
         paid = economy.daily_chatter_prizes("chat", self.day, WPP)

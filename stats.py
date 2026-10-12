@@ -2553,16 +2553,20 @@ def day_xp_ranking(entry: str, day: date, words_per_point: float) -> list[tuple[
     morning digest and the daily chatter prize so the two can never rank the same day
     differently. Deleted figurines are subtracted first, exactly as the tree expects.
 
-    Ties break on user id so two runs of the same day agree -- the prize pays real coins
-    off this order, and a coin flip between two people on equal XP is not something a
-    restart should be able to re-decide.
+    Equal XP is common at the top, not rare: the XP_DAILY_*_CAP ceilings put every
+    member who maxes all three counters on the same figure (about 388 XP in the live
+    chat). Ties therefore break on what the caps cut off -- the uncapped message count,
+    then the uncapped character count -- so the member who actually talked more wins
+    the shared ceiling. Only a full match falls through to user id, which keeps two runs
+    of the same day in agreement: the prize pays real coins off this order, and a restart
+    must not be able to re-decide it.
     """
     users = aggregate(entry, day, day)
     _apply_deleted_figurines(entry, users)
     ranked = [
         (str(user_id), user, user.xp(words_per_point)) for user_id, user in users.items()
     ]
-    ranked.sort(key=lambda row: (-row[2], row[0]))
+    ranked.sort(key=lambda row: (-row[2], -row[1].messages, -row[1].chars, row[0]))
     return ranked
 
 
