@@ -85,6 +85,7 @@ import quests
 import post_stats_web
 import preview
 import stats
+import tripo
 import via_cleaner
 import vote_image
 import vote_web
@@ -3210,6 +3211,549 @@ async def handle_via_cleaner_callback(
         await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
         return
     await _edit_via_cleaner_screen(api, chat_id, message_id, entry, "menu", log=log)
+
+
+# --------------------------------------------------------------------------- /tripo
+#
+# Photos in, a 3D model out, through image generator web's Tripo endpoint (see tripo.py).
+# The panel and the photos live in tripo_flows, keyed by user id. A restart loses them,
+# which costs a re-sent photo. It does not lose a model: a running generation's message
+# carries its Tripo task id on a button that fetches the result from any process.
+#
+# Each generation costs the owner real Tripo credits, so everybody else spends a bot credit
+# on it: taken when "Отправить" is pressed, given back if no model came of it. Only the owner
+# grants credits (/tripocredits); the owner never needs any.
+
+TRIPO_NO_CREDITS = (
+    "У тебя нет кредитов Tripo: одна генерация 3D-модели стоит один кредит. "
+    "Их начисляет владелец бота."
+)
+TRIPO_OWNER_ONLY = "Начислять кредиты Tripo может только владелец бота."
+TRIPO_NOT_CONFIGURED = "Не настроен адрес image generator web: задай переменную TRIPO_WEB_URL."
+# Tasks a "Проверить результат" / "Новая ссылка" press is already working on, so a
+# double-tap does not download and send the same model twice.
+_TRIPO_CHECKING: set[str] = set()
+
+
+def _tripo_is_owner(user: dict | None) -> bool:
+    """The owner generates for free and is the only one who grants credits. A username
+    check, not a chat-administrator one: being a chat admin spends nobody's Tripo money,
+    and nothing here should wait on the Telethon session."""
+    return _is_privileged_username(user)
+
+
+def _tripo_credits(flow: dict) -> int | None:
+    """What the panel shows: the balance, or None for the owner, who needs none."""
+    return None if flow["unlimited"] else tripo.balance(flow["user_id"])
+
+
+def _tripo_live_flow(tripo_flows: dict, user_id) -> dict | None:
+    flow = tripo_flows.get(user_id)
+    if flow is not None and tripo.is_expired(flow, time.monotonic()):
+        flow["closed"] = True
+        tripo_flows.pop(user_id, None)
+        return None
+    return flow
+
+
+async def _tripo_post_panel(api: TelegramBotAPI, flow: dict, log=print) -> None:
+    """Put the panel at the bottom of the DM, below the photos just sent, and remove the
+    one above them. Locked so two refreshes can never leave two panels behind."""
+    async with flow["lock"]:
+        if flow.get("closed"):
+            return
+        if flow["panel_id"]:
+            await api.delete_message(flow["chat_id"], flow["panel_id"])
+            flow["panel_id"] = None
+        credits = _tripo_credits(flow)
+        try:
+            sent = await api.send_message(
+                flow["chat_id"], tripo.panel_text(flow, credits),
+                parse_mode="HTML", reply_markup=tripo.panel_keyboard(flow, credits),
+            )
+        except Exception:
+            log(f"[bot_listener] failed to post the /tripo panel:\n{traceback.format_exc()}")
+            return
+        flow["panel_id"] = (sent or {}).get("message_id")
+
+
+async def _tripo_redraw_panel(api: TelegramBotAPI, flow: dict, log=print) -> None:
+    if not flow["panel_id"]:
+        return
+    credits = _tripo_credits(flow)
+    try:
+        await api.edit_message_text(
+            flow["chat_id"], flow["panel_id"], tripo.panel_text(flow, credits),
+            reply_markup=tripo.panel_keyboard(flow, credits), parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[bot_listener] failed to redraw the /tripo panel:\n{traceback.format_exc()}")
+
+
+def _tripo_spawn(coro, background_tasks: set) -> None:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def _tripo_refresh_later(api: TelegramBotAPI, flow: dict, background_tasks: set, log=print) -> None:
+    """Move the panel below the photos once they stop arriving. An album reaches the bot
+    as one message per photo; this posts one panel after the last, not one per photo."""
+    flow["photo_seq"] += 1
+    seq = flow["photo_seq"]
+
+    async def refresh() -> None:
+        await asyncio.sleep(tripo.PANEL_REFRESH_DELAY_SECONDS)
+        if flow["photo_seq"] == seq:
+            await _tripo_post_panel(api, flow, log=log)
+
+    _tripo_spawn(refresh(), background_tasks)
+
+
+async def handle_tripo_command(
+    api: TelegramBotAPI,
+    message: dict,
+    tripo_flows: dict,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """/tripo -- opens the panel. DM-only. Starting again forgets the previous photos but
+    leaves a generation that is already running to finish and deliver.
+
+    Anybody but the owner needs a credit to open it. Opening it is also when the bot learns
+    their id, so credits granted to their @username before then are handed over here.
+    """
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    owner = _tripo_is_owner(actor)
+
+    async def reply(text: str) -> None:
+        try:
+            await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to answer /tripo:\n{traceback.format_exc()}")
+
+    if not actor.get("id"):
+        return
+    if not owner and tripo.remember_user(actor)["credits"] < 1:
+        await reply(TRIPO_NO_CREDITS)
+        return
+    if not tripo.web_endpoint():
+        await reply(TRIPO_NOT_CONFIGURED)
+        return
+
+    previous = tripo_flows.pop(actor["id"], None)
+    if previous is not None:
+        previous["closed"] = True
+        if previous["panel_id"]:
+            await api.delete_message(previous["chat_id"], previous["panel_id"])
+    flow = tripo.new_flow(actor["id"], chat_id, time.monotonic(), unlimited=owner)
+    flow["lock"] = asyncio.Lock()
+    tripo_flows[actor["id"]] = flow
+    # "/tripo" typed as a photo's caption: that photo is the front view.
+    file_id, problem = tripo.image_from_message(message)
+    if file_id:
+        tripo.accept_photo(flow, file_id)
+    await _tripo_post_panel(api, flow, log=log)
+    if problem:
+        await reply(problem)
+
+
+async def maybe_handle_tripo_photo(
+    api: TelegramBotAPI,
+    message: dict,
+    tripo_flows: dict,
+    background_tasks: set,
+    log=print,
+) -> bool:
+    """A picture sent to the DM while the /tripo panel is open fills the selected view.
+    Returns whether the message was taken."""
+    if (message.get("chat") or {}).get("type") != "private":
+        return False
+    flow = _tripo_live_flow(tripo_flows, (message.get("from") or {}).get("id"))
+    if flow is None:
+        return False
+    file_id, problem = tripo.image_from_message(message)
+    if problem:
+        try:
+            await api.send_message(
+                flow["chat_id"], problem, reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to refuse a /tripo file:\n{traceback.format_exc()}")
+        return True
+    if not file_id:
+        return False
+    tripo.accept_photo(flow, file_id)
+    flow["touched"] = time.monotonic()
+    _tripo_refresh_later(api, flow, background_tasks, log=log)
+    return True
+
+
+async def handle_tripo_callback(
+    api: TelegramBotAPI,
+    callback: dict,
+    tripo_flows: dict,
+    background_tasks: set,
+    log=print,
+) -> None:
+    """The panel's buttons, and the task buttons on a generation's messages.
+
+    Every branch decides its toast from memory alone and answers before anything that
+    touches the network, so no button is ever left spinning.
+    """
+    callback_id = callback["id"]
+    parsed = tripo.parse_callback(callback.get("data") or "")
+    message = callback.get("message") or {}
+    chat_id = (message.get("chat") or {}).get("id")
+    message_id = message.get("message_id")
+    presser = callback.get("from") or {}
+    if parsed is None or chat_id is None or message_id is None:
+        await api.answer_callback_query(callback_id)
+        return
+    action, argument = parsed
+
+    if action in ("task", "link"):
+        # These buttons only ever sit on somebody's own generation, but a stranger must not
+        # be able to make the bot download models on their behalf either.
+        if not argument or not (_tripo_is_owner(presser) or tripo.is_known(presser.get("id"))):
+            await api.answer_callback_query(callback_id)
+            return
+        running = next(
+            (f for f in tripo_flows.values() if f["running"] and f["task_id"] == argument), None,
+        )
+        if running is not None:
+            await api.answer_callback_query(callback_id, f"Ещё генерируется: {running['progress']}%")
+            return
+        if argument in _TRIPO_CHECKING:
+            await api.answer_callback_query(callback_id, "Уже проверяю.")
+            return
+        await api.answer_callback_query(callback_id, "Проверяю…")
+        _TRIPO_CHECKING.add(argument)
+        _tripo_spawn(
+            _tripo_check_task(api, chat_id, argument, links_only=action == "link", log=log),
+            background_tasks,
+        )
+        return
+
+    user_id = presser.get("id")
+    flow = _tripo_live_flow(tripo_flows, user_id)
+    if flow is None or flow["panel_id"] != message_id:
+        await api.answer_callback_query(callback_id, "Эта панель устарела. Набери /tripo.")
+        try:
+            await api.edit_message_reply_markup(chat_id, message_id)
+        except Exception:
+            pass
+        return
+    flow["touched"] = time.monotonic()
+
+    if action == "go":
+        if "front" not in flow["views"]:
+            await api.answer_callback_query(callback_id, "Сначала пришли фото спереди.")
+            return
+        if flow["running"]:
+            await api.answer_callback_query(callback_id, "Генерация уже идёт.")
+            return
+        # Taken before anything is sent, so two panels cannot spend one credit twice; given
+        # back by _tripo_run if no model comes of it.
+        charged = not flow["unlimited"]
+        if charged and not tripo.spend_credit(user_id):
+            await api.answer_callback_query(callback_id, "Кредиты закончились. Их начисляет владелец бота.")
+            await _tripo_redraw_panel(api, flow, log=log)
+            return
+        await api.answer_callback_query(callback_id)
+        # Set before the task exists, so a double-tap lands on the check above.
+        flow["running"] = True
+        _tripo_spawn(_tripo_run(api, flow, tripo_flows, charged=charged, log=log), background_tasks)
+        return
+
+    await api.answer_callback_query(callback_id)
+    if action == "view" and argument in tripo.VIEWS:
+        flow["target"] = argument
+    elif action == "faces" and argument and argument.isdigit() and int(argument) in tripo.FACE_LIMITS:
+        flow["faces"] = int(argument)
+    elif action == "clear":
+        flow["views"] = {}
+        flow["target"] = "front"
+    elif action == "cancel":
+        flow["closed"] = True
+        tripo_flows.pop(user_id, None)
+        try:
+            await api.edit_message_text(chat_id, message_id, "Tripo закрыт.", parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to close the /tripo panel:\n{traceback.format_exc()}")
+        return
+    await _tripo_redraw_panel(api, flow, log=log)
+
+
+async def _tripo_run(
+    api: TelegramBotAPI, flow: dict, tripo_flows: dict, charged: bool = False, log=print,
+) -> None:
+    """One generation, in the background: Telegram photos → image generator web → Tripo,
+    then the model back into the DM.
+
+    The panel message becomes the progress report. Afterwards a fresh panel is posted
+    with the photos kept, so the same views at another polygon budget are one press away.
+
+    A `charged` run gives its credit back when no model came of it: the task never started,
+    or Tripo reported it failed. Not when it timed out (Tripo may still finish it, and the
+    check button will fetch it) and not when only the delivery failed.
+    """
+    chat_id = flow["chat_id"]
+    views = dict(flow["views"])
+    faces = flow["faces"]
+    status_id = flow["panel_id"]
+    flow["panel_id"] = None
+    flow["task_id"] = None
+    flow["progress"] = 0
+    shown = None
+
+    async def show(line: str, keyboard: dict | None = None) -> None:
+        nonlocal status_id, shown
+        text = tripo.progress_text(views, faces, flow["task_id"], line)
+        if (text, keyboard) == shown:
+            return
+        shown = (text, keyboard)
+        try:
+            if status_id:
+                await api.edit_message_text(
+                    chat_id, status_id, text,
+                    reply_markup=keyboard or {"inline_keyboard": []}, parse_mode="HTML",
+                )
+            else:
+                sent = await api.send_message(chat_id, text, parse_mode="HTML", reply_markup=keyboard)
+                status_id = (sent or {}).get("message_id")
+        except Exception:
+            log(f"[bot_listener] failed to report /tripo progress:\n{traceback.format_exc()}")
+
+    def task_buttons() -> dict | None:
+        return tripo.task_keyboard(flow["task_id"]) if flow["task_id"] else None
+
+    def refund(error: Exception | None = None) -> str:
+        if not charged or not (flow["task_id"] is None or isinstance(error, tripo.TripoTaskFailed)):
+            return ""
+        try:
+            left = tripo.refund_credit(flow["user_id"], flow["task_id"])
+        except Exception:
+            log(f"[bot_listener] /tripo could not refund a credit:\n{traceback.format_exc()}")
+            return ""
+        return f" Кредит возвращён, осталось {left}."
+
+    try:
+        endpoint = tripo.web_endpoint()
+        if not endpoint:
+            raise tripo.TripoWebError(TRIPO_NOT_CONFIGURED)
+        await show("Готовлю фото…")
+        images = {view: await api.download_file(file_id) for view, file_id in views.items()}
+        encoded = await asyncio.to_thread(tripo.prepare_images, images)
+        async with aiohttp.ClientSession() as session:
+            client = tripo.TripoWebClient(session, endpoint, tripo.api_key())
+            await show("Отправляю в Tripo…")
+            flow["task_id"] = await client.submit(
+                tripo.submit_payload(encoded, faces),
+                on_wait=lambda: show("Tripo занят, жду свободного места…"),
+            )
+            log(
+                f"[bot_listener] /tripo task {flow['task_id']} started: "
+                f"{', '.join(views)} at {tripo.format_faces(faces)}"
+            )
+            await show("Генерация: 0%", task_buttons())
+            result = await _tripo_poll(client, flow, lambda: show(
+                f"Генерация: {flow['progress']}%", task_buttons(),
+            ))
+            if result.get("status") != "success":
+                raise tripo.TripoTaskFailed(
+                    result.get("errorMessage") or f"задача завершилась со статусом {result.get('status')}"
+                )
+            await show("Готово, загружаю модель…", task_buttons())
+            await _tripo_deliver(api, client, chat_id, flow["task_id"], result, faces, views, log=log)
+        await show("Готово.")
+    except tripo.TripoWebError as e:
+        await show(f"Не получилось: {html.escape(str(e).rstrip('.'))}.{refund(e)}", task_buttons())
+    except ChatSummaryError as e:
+        log(f"[bot_listener] /tripo failed on a Telegram call: {e}")
+        await show(f"Не получилось: Telegram не отдал фото или не принял файл.{refund(e)}", task_buttons())
+    except Exception as e:
+        log(f"[bot_listener] /tripo generation failed:\n{traceback.format_exc()}")
+        await show(f"Не получилось: внутренняя ошибка, подробности в логе.{refund(e)}", task_buttons())
+    finally:
+        flow["running"] = False
+        if tripo_flows.get(flow["user_id"]) is flow and not flow.get("closed"):
+            flow["touched"] = time.monotonic()
+            await _tripo_post_panel(api, flow, log=log)
+
+
+async def _tripo_poll(client, flow: dict, on_progress) -> dict:
+    """Ask for the task's status until Tripo reports it finished. A failed status read is
+    asked again on the next tick; the task keeps running on Tripo's side regardless."""
+    for _ in range(tripo.POLL_LIMIT):
+        await asyncio.sleep(tripo.POLL_INTERVAL_SECONDS)
+        try:
+            result = await client.status(flow["task_id"])
+        except tripo.TripoWebError as e:
+            if e.status is None or e.status == 429 or e.status >= 500:
+                continue
+            raise
+        flow["progress"] = int(result.get("progress") or 0)
+        if result.get("done"):
+            return result
+        await on_progress()
+    raise tripo.TripoWebError("Tripo не закончил за 20 минут. Проверь результат кнопкой позже.")
+
+
+async def _tripo_deliver(
+    api: TelegramBotAPI, client, chat_id, task_id: str, result: dict,
+    faces: int | None, views, log=print,
+) -> None:
+    """Send a finished task's model to the DM, with Tripo's render above it.
+
+    Tripo's links expire minutes after a task ends, so the model is fetched at once, and a
+    failed fetch asks the task for a fresh link once. A GLB over Telegram's 50 MB upload
+    limit is zipped; one that is still too big goes out as a link.
+    """
+    files = result.get("files") or []
+    model = tripo.model_file(files)
+    if model is None:
+        raise tripo.TripoWebError("Tripo не вернул файл модели.")
+    caption = "Tripo 3D"
+    if faces:
+        caption += f" · {tripo.format_faces(faces)}"
+    if views:
+        caption += f" · виды: {tripo.view_names(views)}"
+
+    with tempfile.TemporaryDirectory(prefix="tripo-") as folder:
+        folder = Path(folder)
+        render = tripo.preview_file(files)
+        if render is not None:
+            try:
+                raw = folder / "render.img"
+                await client.download(render["Url"], raw, limit=tripo.TELEGRAM_DOWNLOAD_LIMIT)
+                data = await asyncio.to_thread(raw.read_bytes)
+                photo = await asyncio.to_thread(tripo.preview_to_jpeg, data, folder / "render.jpg")
+                await api.send_photo_file(chat_id, photo, caption=caption)
+            except Exception:
+                # The model is what was paid for; a missing picture of it is not worth failing over.
+                log(f"[bot_listener] /tripo render not sent:\n{traceback.format_exc()}")
+
+        path = folder / tripo.model_name(task_id, faces, model.get("Type") or "glb")
+        try:
+            size = await client.download(model["Url"], path)
+        except tripo.TripoWebError:
+            fresh = tripo.model_file((await client.status(task_id)).get("files") or [])
+            if fresh is None:
+                raise
+            model = fresh
+            size = await client.download(model["Url"], path)
+        if size > tripo.TELEGRAM_UPLOAD_LIMIT:
+            path = await asyncio.to_thread(tripo.zip_model, path)
+            size = await asyncio.to_thread(lambda: path.stat().st_size)
+        if size <= tripo.TELEGRAM_UPLOAD_LIMIT:
+            await api.send_document_file(chat_id, path, caption=caption)
+            return
+    await _tripo_send_link(api, chat_id, task_id, model, caption)
+
+
+async def _tripo_send_link(api: TelegramBotAPI, chat_id, task_id: str, model: dict, caption: str) -> None:
+    kind = (model.get("Type") or "GLB").upper()
+    await api.send_message(
+        chat_id,
+        f"{html.escape(caption)}\n\nМодель больше 50 МБ даже в архиве, а это предел Telegram "
+        f"для ботов. Ссылка живёт несколько минут, кнопка ниже выдаёт новую.\n"
+        f'<a href="{html.escape(model["Url"], quote=True)}">Скачать {kind}</a>',
+        parse_mode="HTML",
+        reply_markup=tripo.link_keyboard(task_id),
+    )
+
+
+async def _tripo_check_task(api: TelegramBotAPI, chat_id, task_id: str, links_only: bool, log=print) -> None:
+    """The "Проверить результат" and "Новая ссылка" buttons: one status read, then the
+    model, or only a fresh link to it. This is what recovers a model whose generation was
+    running when the bot restarted: Tripo finished it, and charged for it, regardless."""
+    try:
+        endpoint = tripo.web_endpoint()
+        if not endpoint:
+            raise tripo.TripoWebError(TRIPO_NOT_CONFIGURED)
+        async with aiohttp.ClientSession() as session:
+            client = tripo.TripoWebClient(session, endpoint, tripo.api_key())
+            result = await client.status(task_id)
+            model = tripo.model_file(result.get("files") or [])
+            if not result.get("done"):
+                text = f"Tripo ещё генерирует: {int(result.get('progress') or 0)}%."
+            elif result.get("status") != "success":
+                text = f"Задача не удалась: {result.get('errorMessage') or result.get('status')}"
+            elif model is None:
+                text = "Tripo не вернул файл модели."
+            elif links_only:
+                await _tripo_send_link(api, chat_id, task_id, model, "Tripo 3D")
+                return
+            else:
+                await _tripo_deliver(api, client, chat_id, task_id, result, None, {}, log=log)
+                return
+        await api.send_message(chat_id, text, parse_mode=None)
+    except tripo.TripoWebError as e:
+        try:
+            await api.send_message(chat_id, f"Не получилось: {e}", parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to report a /tripo check:\n{traceback.format_exc()}")
+    except Exception:
+        log(f"[bot_listener] /tripo check of {task_id} failed:\n{traceback.format_exc()}")
+    finally:
+        _TRIPO_CHECKING.discard(task_id)
+
+
+async def handle_tripo_credits_command(
+    api: TelegramBotAPI, message: dict, command_text: str, log=print,
+) -> None:
+    """/tripocredits -- the owner's ledger. With no argument it lists every balance;
+    "@username 5" grants, "@username -2" takes away. A person the bot already knows is told
+    about a grant in their DM; a username it has never seen keeps the credits waiting until
+    they open /tripo."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+
+    async def reply(text: str, parse_mode: str | None = None) -> None:
+        try:
+            await api.send_message(
+                chat_id, text, reply_to_message_id=message["message_id"], parse_mode=parse_mode,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to answer /tripocredits:\n{traceback.format_exc()}")
+
+    if not _tripo_is_owner(actor):
+        await reply(TRIPO_OWNER_ONLY)
+        return
+    argument = command_text[len(tripo.CREDITS_COMMAND):].strip()
+    if not argument:
+        await reply(tripo.credits_overview(), parse_mode="HTML")
+        return
+    parsed = tripo.parse_credit_change(argument)
+    if isinstance(parsed, str):
+        await reply(parsed)
+        return
+    target, change = parsed
+    result = tripo.change_credits(target, change, by=_display_name(actor))
+    log(f"[bot_listener] /tripocredits {change:+d} for {result['label']}, now {result['credits']}")
+    verb = f"Начислено {change}" if change > 0 else f"Списано {-change}"
+    text = f"{verb}. У {result['label']} теперь {result['credits']}."
+    if result["pending"]:
+        text += (
+            f" Бот ещё не знает {result['label']}: кредиты дождутся, когда этот человек "
+            "напишет боту /tripo."
+        )
+    elif change > 0:
+        try:
+            await api.send_message(
+                int(result["user_id"]),
+                f"Тебе начислено кредитов Tripo: {change}. Баланс: {result['credits']}. "
+                "Один кредит — одна 3D-модель из фото: открой /tripo.",
+                parse_mode=None,
+            )
+            text += " Уведомил в личке."
+        except Exception:
+            text += " Написать в личку не вышло: пусть сам откроет бота и наберёт /tripo."
+    await reply(text)
 
 
 async def handle_admin_command(
@@ -11063,6 +11607,7 @@ async def _dispatch_update(
     vote_chat_flows: dict[str, dict] | None = None,
     vote_result_flows: dict[str, dict] | None = None,
     pets_flows: dict[str, dict] | None = None,
+    tripo_flows: dict[int, dict] | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -11079,6 +11624,7 @@ async def _dispatch_update(
     vote_chat_flows = vote_chat_flows if vote_chat_flows is not None else {}
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     pets_flows = pets_flows if pets_flows is not None else {}
+    tripo_flows = tripo_flows if tripo_flows is not None else {}
     reaction = update.get("message_reaction")
     if reaction is not None:
         await handle_moderator_reaction(api, cfg, reaction, log=log)
@@ -11178,6 +11724,8 @@ async def _dispatch_update(
             # (resolved when the vote was closed), so pressing Отправить never waits on the
             # Telethon session.
             await handle_vote_result_callback(api, callback, vote_result_flows, log=log)
+        elif callback_data.startswith(f"{tripo.CALLBACK_PREFIX}:"):
+            await handle_tripo_callback(api, callback, tripo_flows, background_tasks, log=log)
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.
@@ -11420,6 +11968,18 @@ async def _dispatch_update(
         )
         await handle_via_cleaner_command(api, message, home_chat_ref, admin_chat_id, log=log)
         return
+    if re.match(rf"^{re.escape(tripo.CREDITS_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        if chat.get("type") != "private":
+            return
+        await handle_tripo_credits_command(api, message, command_text, log=log)
+        return
+    if re.match(rf"^{re.escape(tripo.COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
+        # DM-only: the panel collects photos, and those belong in a conversation with the
+        # bot, not in the chat. A photo captioned "/tripo" lands here too.
+        if chat.get("type") != "private":
+            return
+        await handle_tripo_command(api, message, tripo_flows, background_tasks, log=log)
+        return
     if re.match(rf"^{re.escape(BADGE_ADMIN_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):
         if chat.get("type") != "private":
             return
@@ -11533,6 +12093,11 @@ async def _dispatch_update(
         api, telethon_client, cfg, tz, message, home_chat_ref, bot_username,
         background_tasks, vote_chat_flows, log=log,
     ):
+        return
+
+    # A picture sent while the /tripo panel is open is one of its views. Ahead of the pet
+    # flows, which also take photos: the panel is open only while somebody is using it.
+    if await maybe_handle_tripo_photo(api, message, tripo_flows, background_tasks, log=log):
         return
 
     # Before any command match: a creature's name is free text and could easily be
@@ -12068,6 +12633,10 @@ async def run_bot_listener(
     # on disk (pets.py); only the half-finished "send me a photo, now send me a name"
     # conversation is here, so losing it on a restart costs one re-press.
     pets_flows: dict[str, dict] = {}
+    # Open /tripo panels by user id: the photos sent so far and the chosen polygon budget.
+    # A restart costs re-sending the photos; a running generation can still be fetched
+    # from its message's "Проверить результат" button.
+    tripo_flows: dict[int, dict] = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -12207,7 +12776,8 @@ async def run_bot_listener(
                             cabinet_flows, menu_last_sent,
                             button_builder_flows=button_builder_flows, admin_flows=admin_flows,
                             vote_chat_flows=vote_chat_flows,
-                            vote_result_flows=vote_result_flows, pets_flows=pets_flows, log=log,
+                            vote_result_flows=vote_result_flows, pets_flows=pets_flows,
+                            tripo_flows=tripo_flows, log=log,
                         ),
                         update.get("update_id"),
                         log=log,
