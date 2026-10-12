@@ -24,6 +24,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 import nominations
+import vote_audit
 import voting
 
 ROUTE_PREFIX = "/nominations"
@@ -203,6 +204,16 @@ async def handle_ballot(request: web.Request) -> web.Response:
     request.app[_LOG_KEY](
         f"[nominations] ballot from {voting.display_name(user)} in {nomination['name']!r}: "
         f"{len(nomination['my_vote'])} choice(s)"
+    )
+    # The administrators' audit log, shared with v1 so one report can read both. Membership
+    # is not computed on v3's page, so it is left unknown rather than guessed; the launch
+    # origin from initData is kept, which is the signal that matters for "where from".
+    vote_audit.record_vote_event(
+        entry, system="v3", poll_id=f"nom:{nomination_id}", voter_id=user["id"],
+        name=voting.display_name(user), username=user.get("username"),
+        choices=list(nomination.get("my_vote") or []), is_member=None, via="nomination",
+        source=vote_audit.parse_source(_init_data_from(request, body)),
+        log=request.app[_LOG_KEY],
     )
     return web.json_response({"ok": True, "nomination": nomination})
 

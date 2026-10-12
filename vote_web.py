@@ -30,6 +30,7 @@ from typing import Awaitable, Callable
 
 from aiohttp import web
 
+import vote_audit
 import vote_image
 import voting
 
@@ -282,7 +283,19 @@ async def handle_ballot(request: web.Request) -> web.Response:
 
         voting.record_vote(poll, user["id"], choices, subscriber=is_subscriber)
         voting.save_poll(poll)
+        recorded = list(poll.votes[str(user["id"])])
+        poll_id = poll.poll_id
     request.app[_LOG_KEY](f"[vote_web] ballot from {voting.display_name(user)}: {len(choices)} choice(s)")
+    # The audit log is a separate record for administrators -- how this vote was cast,
+    # not just that it was. Best-effort and after the save: it must never turn an accepted
+    # ballot into an error. See vote_audit for what it keeps and why.
+    vote_audit.record_vote_event(
+        entry_name, system="v1", poll_id=poll_id, voter_id=user["id"],
+        name=voting.display_name(user), username=user.get("username"),
+        choices=recorded, is_member=is_subscriber, via="miniapp",
+        source=vote_audit.parse_source(_init_data_from(request, body)),
+        log=request.app[_LOG_KEY],
+    )
     return web.json_response({
         "ok": True,
         "my_vote": poll.votes[str(user["id"])],

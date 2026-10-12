@@ -87,6 +87,7 @@ import preview
 import stats
 import tripo
 import via_cleaner
+import vote_audit
 import vote_image
 import vote_web
 import voting
@@ -5134,10 +5135,19 @@ async def handle_vote_link_ballot(
             return
         voting.record_vote(poll, user["id"], valid, subscriber=subscribed)
         voting.save_poll(poll)
+        recorded = list(poll.votes[voter_id])
+        poll_id = poll.poll_id
         by_id = {e.entry_id: e for e in poll.entries}
         chosen = [by_id[c] for c in valid]
         allow_revote = poll.allow_revote
     log(f"[bot_listener] link ballot from {user.get('username') or voter_id}: {len(valid)} choice(s)")
+    # A ballot cast through the forwarded link rather than the Mini App -- logged the same
+    # way, with via="link", so a run of link votes is distinguishable from in-app ones.
+    vote_audit.record_vote_event(
+        entry, system="v1", poll_id=poll_id, voter_id=user["id"],
+        name=voting.display_name(user), username=user.get("username"),
+        choices=recorded, is_member=subscribed, via="link", log=log,
+    )
 
     lines = ["Спасибо! Ваш голос учтён:"]
     lines += [f"{index}. {voting.who(work)}" for index, work in enumerate(chosen, start=1)]
@@ -7079,6 +7089,232 @@ async def handle_backup_command(api: TelegramBotAPI, telethon_client, message: d
     problem = await _send_history_backup(api, chat["id"], "по запросу", log=log)
     if problem:
         await reply(problem)
+
+
+# "/votelog" -- an administrators' read of the vote audit log (vote_audit.py): where the
+# current /vote poll's votes came from and who cast them, so a work pulling a suspicious
+# count can be checked against how organic those votes look. DM-only, and only for a real
+# chat administrator or the owner -- not a delegate -- the same gate as "/backup", since it
+# discloses who voted for whom. Kept out of the registered command menu on purpose, like
+# the other admin-only commands.
+VOTELOG_COMMANDS = ("/votelog", "/журналголосов")
+# How many voter lines the text report prints before deferring the rest to the CSV -- a
+# Telegram message is capped at 4096 characters and the full detail is in the file anyway.
+VOTELOG_TEXT_VOTERS = 40
+_VOTELOG_MEMBER_CONCURRENCY = 8
+
+
+def _votelog_source_label(source: dict | None) -> str:
+    """The launch origin as one short field for a report line: where the Mini App was
+    opened (chat_type) and the start parameter it carried, whichever are present."""
+    source = source or {}
+    parts = []
+    chat_type = source.get("chat_type")
+    if chat_type:
+        parts.append(str(chat_type))
+    start_param = source.get("start_param")
+    if start_param:
+        parts.append(f"sp={start_param}")
+    return "/".join(parts) if parts else "—"
+
+
+def _votelog_via_label(via: str | None) -> str:
+    return {"miniapp": "мини-апп", "link": "ссылка", "nomination": "номинация"}.get(via or "", via or "—")
+
+
+def _votelog_first_active(user) -> str:
+    """The earliest day this voter was seen active in the chat -- the closest the stats
+    cache comes to "how long they have been around", honestly labelled as first activity
+    rather than a join date the Bot API does not expose."""
+    if user is None:
+        return "—"
+    dates = getattr(user, "active_day_dates", None)
+    return min(dates) if dates else "—"
+
+
+async def handle_votelog_command(api: TelegramBotAPI, telethon_client, message: dict,
+                                 entry: str | None, command_text: str = "", log=print) -> None:
+    """The report. Loads the current poll's logged submissions, cross-checks them against
+    the stats cache (chat activity) and a live membership lookup, and sends an overview
+    plus a CSV of every (work, voter) pair. A bare "/votelog" covers the whole poll; a
+    query ("/votelog имя") narrows it to the works whose author matches.
+
+    `command_text` is the message's text with any "@bot" command mention already stripped
+    by the dispatcher, so the query is whatever follows the command word."""
+    chat = message["chat"]
+    user = message.get("from") or {}
+    query = command_text or (message.get("text") or "")
+    for spelling in VOTELOG_COMMANDS:
+        if query.lower().startswith(spelling):
+            query = query[len(spelling):].strip()
+            break
+
+    async def reply(body: str, document: Path | None = None):
+        try:
+            if document is not None:
+                await api.send_document_file(chat["id"], document, caption=body[:CAPTION_LIMIT])
+            else:
+                await api.send_message(chat["id"], body, reply_to_message_id=message.get("message_id"),
+                                       parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] failed to send the votelog reply: {e}")
+
+    if chat.get("type") != "private":
+        await reply("Журнал голосов — только в личке с ботом.")
+        return
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log) if entry else None
+    if admin_chat_id is None or not await _is_chat_admin_or_privileged(api, admin_chat_id, user):
+        await reply("Журнал голосов доступен только администраторам чата.")
+        return
+
+    poll = voting.latest_poll(entry)
+    if poll is None:
+        await reply("Голосование ещё не создано.")
+        return
+
+    events = vote_audit.read_events(entry, poll_id=poll.poll_id, system="v1")
+    rollup = vote_audit.voter_rollup(events)
+    users = stats.aggregate_all_time(entry)
+
+    standings = poll.tally()
+    matched = standings
+    if query:
+        needle = query.lstrip("@").lower()
+        matched = [
+            (e, c) for e, c in standings
+            if needle in (e.author_name or "").lower()
+            or needle in (e.author_username or "").lower()
+        ]
+        if not matched:
+            await reply(f"Работ по запросу «{query}» не нашлось. Без запроса — весь список.")
+            return
+
+    # The voters we will describe: everyone whose current ballot names a work in scope.
+    scope_entry_ids = {e.entry_id for e, _ in matched}
+    voter_ids = sorted(
+        vid for vid, choices in poll.votes.items() if scope_entry_ids.intersection(choices)
+    )
+
+    # One live membership lookup per voter, bounded so a big poll cannot fan out into
+    # hundreds of simultaneous Bot API calls. A failed lookup stays None -- "unknown",
+    # never a wrong "not a member".
+    semaphore = asyncio.Semaphore(_VOTELOG_MEMBER_CONCURRENCY)
+
+    async def member_now(voter_id: str) -> tuple[str, bool | None]:
+        try:
+            async with semaphore:
+                return voter_id, await _is_chat_member(api, admin_chat_id, int(voter_id))
+        except Exception:
+            return voter_id, None
+
+    membership = dict(await asyncio.gather(*(member_now(vid) for vid in voter_ids)))
+
+    def voter_fields(voter_id: str) -> dict:
+        info = rollup.get(voter_id, {})
+        person = users.get(voter_id)
+        name = info.get("name") or (getattr(person, "display_name", None) if person else None) or f"id{voter_id}"
+        username = info.get("username") or (getattr(person, "username", None) if person else None)
+        return {
+            "id": voter_id,
+            "name": name,
+            "username": username,
+            "member_now": membership.get(voter_id),
+            "member_at_vote": info.get("is_member_at_vote"),
+            "submissions": info.get("submissions", 0),
+            "first_ts": info.get("first_ts", ""),
+            "last_ts": info.get("last_ts", ""),
+            "via": info.get("via"),
+            "source": info.get("source") or {},
+            "messages": getattr(person, "messages", 0) if person else 0,
+            "active_days": getattr(person, "active_days", 0) if person else 0,
+            "first_active": _votelog_first_active(person),
+        }
+
+    def yes_no_unknown(value) -> str:
+        return "да" if value is True else ("нет" if value is False else "?")
+
+    # ---- the CSV: one row per (work, voter), the whole thing regardless of the text cap
+    header = [
+        "работа", "работа_автор_id", "голосующий", "@", "id",
+        "в_чате_сейчас", "в_чате_при_голосе", "подач_голоса",
+        "первый_голос", "последний_голос", "как", "откуда_тип", "откуда_параметр",
+        "сообщений_всего", "активных_дней", "первая_активность",
+    ]
+    rows: list[list] = []
+    for work, _count in matched:
+        work_voters = [vid for vid in voter_ids if work.entry_id in poll.votes.get(vid, [])]
+        for vid in work_voters:
+            f = voter_fields(vid)
+            rows.append([
+                work.author_name, work.author_id, f["name"], f["username"] or "", f["id"],
+                yes_no_unknown(f["member_now"]), yes_no_unknown(f["member_at_vote"]),
+                f["submissions"], f["first_ts"], f["last_ts"], _votelog_via_label(f["via"]),
+                (f["source"].get("chat_type") or ""), (f["source"].get("start_param") or ""),
+                f["messages"], f["active_days"], f["first_active"],
+            ])
+
+    # ---- the text overview
+    lines = [f"Журнал голосов — {poll.label()} ({poll.poll_id})"]
+    if query:
+        lines[0] += f" · по запросу «{query}»"
+    lines.append(f"Голосующих в охвате: {len(voter_ids)} чел.")
+    if voter_ids:
+        members = sum(1 for v in voter_ids if membership.get(v) is True)
+        outsiders = sum(1 for v in voter_ids if membership.get(v) is False)
+        unknown = len(voter_ids) - members - outsiders
+        silent = sum(1 for v in voter_ids if voter_fields(v)["messages"] == 0)
+        by_link = sum(1 for v in voter_ids if (rollup.get(v, {}).get("via")) == "link")
+        rerolled = sum(1 for v in voter_ids if rollup.get(v, {}).get("submissions", 0) >= 3)
+        lines.append(
+            f"В чате сейчас: {members} · не в чате: {outsiders} · не проверено: {unknown}"
+        )
+        lines.append(f"Ни одного сообщения в чате: {silent} · по ссылке: {by_link} · переголосовывали ≥3 раз: {rerolled}")
+
+    lines.append("")
+    lines.append("Работы (в охвате):")
+    for place, (work, count) in enumerate(matched, start=1):
+        work_voters = [vid for vid in voter_ids if work.entry_id in poll.votes.get(vid, [])]
+        w_members = sum(1 for v in work_voters if membership.get(v) is True)
+        w_silent = sum(1 for v in work_voters if voter_fields(v)["messages"] == 0)
+        w_link = sum(1 for v in work_voters if (rollup.get(v, {}).get("via")) == "link")
+        lines.append(
+            f"{place}. {voting.who(work)} — {voting.votes_label(count)} "
+            f"[в чате {w_members} · молчуны {w_silent} · по ссылке {w_link}]"
+        )
+
+    if query:
+        lines.append("")
+        shown = 0
+        for work, count in matched:
+            work_voters = [vid for vid in voter_ids if work.entry_id in poll.votes.get(vid, [])]
+            lines.append(f"• {voting.who(work)} — {voting.votes_label(count)}:")
+            for vid in work_voters:
+                if shown >= VOTELOG_TEXT_VOTERS:
+                    break
+                f = voter_fields(vid)
+                handle = f" (@{f['username']})" if f["username"] else ""
+                lines.append(
+                    f"   {f['name']}{handle} id={f['id']} | в чате: {yes_no_unknown(f['member_now'])}"
+                    f" | сообщений: {f['messages']} | как: {_votelog_via_label(f['via'])}"
+                    f" | откуда: {_votelog_source_label(f['source'])} | {f['last_ts']}"
+                )
+                shown += 1
+            if shown >= VOTELOG_TEXT_VOTERS:
+                lines.append("   … остальные — в CSV")
+                break
+
+    if not rows:
+        lines.append("")
+        lines.append("Голосов в охвате пока нет — журнал заполнится по мере голосования.")
+        await reply("\n".join(lines))
+        return
+
+    path = vote_audit.write_csv(entry, f"{poll.poll_id}{('_' + query) if query else ''}", header, rows)
+    body = "\n".join(lines)
+    if len(body) > 3500:
+        body = body[:3500] + "\n…(полный текст урезан; детали — в CSV)"
+    await reply(body)
+    await reply("Детали по каждому голосу — в CSV.", document=path)
 
 
 async def handle_vote_command(
@@ -12274,6 +12510,22 @@ async def _dispatch_update(
             return
         task = asyncio.create_task(
             handle_hall_command(api, telethon_client, cfg, message, hall_entry, bot_username, log=log)
+        )
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+        return
+
+    # "/votelog" -- the administrators' vote audit report. Ahead of VOTE_COMMANDS, which
+    # would otherwise match it by prefix ("/votelog".startswith("/vote")) and open the
+    # ballot. A whole-word match, DM-only and admin-gated inside the handler.
+    if any(re.match(rf"^{re.escape(c)}(?:\s|$)", command_text, re.IGNORECASE) for c in VOTELOG_COMMANDS):
+        votelog_entry = _stats_entry_for(chat, matched_entry, home_chat_ref)
+        if votelog_entry is None:
+            return
+        task = asyncio.create_task(
+            handle_votelog_command(
+                api, telethon_client, message, votelog_entry, command_text=command_text, log=log,
+            )
         )
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)

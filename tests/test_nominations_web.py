@@ -117,8 +117,16 @@ class NominationsApiTests(AsyncTestCase):
         return path
 
     def _v1_files(self):
+        # v1's own records: the polls, results, media and themes. The "audit/" subtree is
+        # the shared, cross-system vote log (vote_audit.py) that both v1 and v3 append to
+        # on purpose -- it is not a v1 contest file, so it is outside what this isolation
+        # check guards (that v3 never mutates v1's actual ballots/photos).
         root = voting._voting_dir()
-        return {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        return {
+            str(p.relative_to(root)): p.read_bytes()
+            for p in root.rglob("*")
+            if p.is_file() and not p.relative_to(root).parts[:1] == ("audit",)
+        }
 
     def _seed(self):
         """The pool synced from /vote (works 4, 3, 2, 1); "Аниме" plays 1 and 2, "Фэнтези"
