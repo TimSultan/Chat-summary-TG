@@ -274,5 +274,96 @@ class LinkBallotWritesAuditTests(_Storage, unittest.TestCase):
         self.assertEqual(events[0]["source"], {})  # a link has no Mini App launch data
 
 
+# ------------------------------------------------------------------ the /votelog report
+
+class VoteLogReportTests(_Storage, unittest.TestCase):
+    """The report names a voter even when we stored nothing about them. Someone who voted
+    before the audit log existed (no logged event) and never wrote a tracked message (no
+    stats row) is known to us only by id -- but the membership check that finds them also
+    returns their current name and @username, and the report uses it."""
+
+    def setUp(self):
+        self._storage()
+        self._stats = tempfile.TemporaryDirectory()
+        self._stats_patch = patch("stats._stats_dir", return_value=Path(self._stats.name))
+        self._stats_patch.start()
+
+    def tearDown(self):
+        self._stats_patch.stop()
+        self._stats.cleanup()
+        self._unstorage()
+
+    class _Api:
+        def __init__(self, members):
+            self.sent, self.docs, self._members = [], [], members
+
+        async def send_message(self, chat_id, text, reply_to_message_id=None, parse_mode=None):
+            self.sent.append(text)
+            return {"message_id": len(self.sent)}
+
+        async def send_document_file(self, chat_id, path, caption=None):
+            self.docs.append(Path(path).read_text(encoding="utf-8-sig"))
+            return {"message_id": 1}
+
+        async def get_chat_administrators(self, chat_id):
+            return [{"user": {"id": 42}}]
+
+        async def get_chat_member(self, chat_id, user_id):
+            return self._members[user_id]
+
+    def _run(self, api, text="/votelog"):
+        import bot_listener
+        message = {"message_id": 1, "chat": {"id": 555, "type": "private"},
+                   "from": {"id": 42, "username": "admin"}, "text": text}
+
+        async def resolve(*a, **k):
+            return -100500
+
+        with patch.object(bot_listener, "_resolve_chat_id", resolve):
+            asyncio.run(bot_listener.handle_votelog_command(
+                api, None, message, CHAT, command_text=text, log=lambda *_: None))
+        return api
+
+    def test_an_unknown_voter_is_named_from_the_membership_check(self):
+        poll = voting.Poll(poll_id="2026-W41", entry=CHAT, created_at="2026-10-05T00:00:00+00:00",
+                           entries=[_entry("a")])
+        voting.set_approved(poll, ["a"])
+        poll.votes = {"555": ["a"]}  # voted before logging began; no event, no stats row
+        voting.save_poll(poll)
+
+        members = {
+            42: {"status": "administrator", "user": {"id": 42, "username": "admin"}},
+            555: {"status": "member",
+                  "user": {"id": 555, "first_name": "Марат", "last_name": "К", "username": "marat"}},
+        }
+        api = self._run(self._Api(members), text="/votelog Author")
+        report = "\n".join(api.sent)
+        self.assertIn("Марат К", report)
+        self.assertIn("marat", report)
+        csv = api.docs[0]
+        self.assertIn("Марат К", csv)
+        self.assertIn("marat", csv)
+        # The membership column reflects the live lookup, not stored data.
+        self.assertIn("да", report)
+
+    def test_a_logged_name_is_kept_over_the_live_one(self):
+        poll = voting.Poll(poll_id="2026-W41", entry=CHAT, created_at="2026-10-05T00:00:00+00:00",
+                           entries=[_entry("a")])
+        voting.set_approved(poll, ["a"])
+        poll.votes = {"555": ["a"]}
+        voting.save_poll(poll)
+        vote_audit.record_vote_event(CHAT, system="v1", poll_id="2026-W41", voter_id=555,
+                                     name="Имя При Голосе", username="atvote", choices=["a"],
+                                     is_member=True, via="miniapp")
+        members = {
+            42: {"status": "administrator", "user": {"id": 42, "username": "admin"}},
+            555: {"status": "member", "user": {"id": 555, "first_name": "Live", "username": "live"}},
+        }
+        api = self._run(self._Api(members), text="/votelog Author")
+        csv = api.docs[0]
+        self.assertIn("Имя При Голосе", csv)
+        self.assertIn("atvote", csv)
+
+
 if __name__ == "__main__":
     unittest.main()

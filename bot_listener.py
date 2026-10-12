@@ -7195,25 +7195,57 @@ async def handle_votelog_command(api: TelegramBotAPI, telethon_client, message: 
         vid for vid, choices in poll.votes.items() if scope_entry_ids.intersection(choices)
     )
 
-    # One live membership lookup per voter, bounded so a big poll cannot fan out into
-    # hundreds of simultaneous Bot API calls. A failed lookup stays None -- "unknown",
-    # never a wrong "not a member".
+    # One getChatMember per voter, bounded so a big poll cannot fan out into hundreds of
+    # simultaneous Bot API calls. The SAME call that confirms membership also carries the
+    # person's current name and @username -- so a voter we have no stored identity for
+    # (they voted before this log existed, or never wrote a tracked message, so neither the
+    # audit log nor the stats cache knows their name) is still named here from the check
+    # that found them, instead of showing a bare id. A failed lookup stays None --
+    # "unknown", never a wrong "not a member".
     semaphore = asyncio.Semaphore(_VOTELOG_MEMBER_CONCURRENCY)
 
-    async def member_now(voter_id: str) -> tuple[str, bool | None]:
+    async def look_up(voter_id: str) -> tuple[str, bool | None, dict | None]:
         try:
             async with semaphore:
-                return voter_id, await _is_chat_member(api, admin_chat_id, int(voter_id))
+                member = await api.get_chat_member(admin_chat_id, int(voter_id))
         except Exception:
-            return voter_id, None
+            return voter_id, None, None
+        if not isinstance(member, dict):
+            return voter_id, None, None
+        status = member.get("status")
+        # "restricted" is the one status Telegram reuses for both a restricted member and
+        # someone who was restricted and then left -- only is_member tells them apart.
+        is_member = bool(member.get("is_member")) if status == "restricted" else status in _CHAT_MEMBER_STATUSES
+        return voter_id, is_member, (member.get("user") if isinstance(member.get("user"), dict) else None)
 
-    membership = dict(await asyncio.gather(*(member_now(vid) for vid in voter_ids)))
+    looked_up = await asyncio.gather(*(look_up(vid) for vid in voter_ids))
+    membership = {vid: is_member for vid, is_member, _ in looked_up}
+    profiles = {vid: profile for vid, _, profile in looked_up if profile}
+
+    def _real(value) -> str:
+        """A stored name/handle worth showing, or "" -- an empty string, the "Unknown"
+        placeholder stats uses, and the bare "id12345" fallback all mean "we don't really
+        know", so they yield to the live profile below rather than masking it."""
+        value = (value or "").strip()
+        return "" if not value or value == "Unknown" or re.fullmatch(r"id\d+", value) else value
 
     def voter_fields(voter_id: str) -> dict:
         info = rollup.get(voter_id, {})
         person = users.get(voter_id)
-        name = info.get("name") or (getattr(person, "display_name", None) if person else None) or f"id{voter_id}"
-        username = info.get("username") or (getattr(person, "username", None) if person else None)
+        profile = profiles.get(voter_id) or {}
+        profile_name = " ".join(p for p in (profile.get("first_name"), profile.get("last_name")) if p)
+        name = (
+            _real(info.get("name"))
+            or _real(profile_name)
+            or _real(getattr(person, "display_name", None) if person else None)
+            or f"id{voter_id}"
+        )
+        username = (
+            _real(info.get("username"))
+            or _real(profile.get("username"))
+            or _real(getattr(person, "username", None) if person else None)
+            or None
+        )
         return {
             "id": voter_id,
             "name": name,
