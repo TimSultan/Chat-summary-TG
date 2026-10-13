@@ -393,8 +393,15 @@ class TelegramBotAPI:
             # exactly like this, silently, with no other symptom at all.
             log(f"[bot_api] setMessageReaction({emoji!r}) failed for chat {chat_id}, message {message_id}: {e}")
 
-    async def answer_callback_query(self, callback_query_id: str, text: str | None = None) -> None:
+    async def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None, url: str | None = None,
+    ) -> None:
+        """`url` may be a t.me/<bot>?start=<payload> link: Telegram then opens the bot's
+        DM with a Start button, which is the only way to reach somebody who has never
+        started the bot -- it cannot write to them first."""
         try:
-            await self._call("answerCallbackQuery", callback_query_id=callback_query_id, text=text)
+            await self._call(
+                "answerCallbackQuery", callback_query_id=callback_query_id, text=text, url=url,
+            )
         except ChatSummaryError:
             pass  # best-effort: just stops the client-side loading spinner

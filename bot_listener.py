@@ -23,8 +23,10 @@ With zero or multiple entries there's no unambiguous default, and a DM request g
 to ask in the group instead of guessing which one you meant.
 
 The DM is also where every summary ANSWER goes, including for a request typed in a group
--- the group only gets a short receipt, which takes the request down with it ten seconds
-later (see handle_bot_summary_request and SUMMARY_RECEIPT_DELETE_AFTER). Since
+-- the group only gets a receipt with an "Отправить мне тоже" button that sends the same
+answer to whoever presses it (see summary_share.py). Short notices -- a request that
+could not be parsed, say -- still sweep themselves and the request after ten seconds
+(SUMMARY_RECEIPT_DELETE_AFTER). Since
 Telegram forbids a bot from writing first, somebody who has never opened the DM has
 nowhere to receive an answer, and is told to open it instead of being answered.
 
@@ -85,6 +87,7 @@ import quests
 import post_stats_web
 import preview
 import stats
+import summary_share
 import tripo
 import via_cleaner
 import vote_audit
@@ -334,6 +337,7 @@ from listener import (
     extract_mentioned_usernames,
     is_summary_command,
     resolve_time_window,
+    strip_summary_command,
 )
 from main import period_label, resolve_tz
 from responder_v2 import answer_request
@@ -348,10 +352,10 @@ from telegram_fetch import (
 MAX_REPLY_CHARS = 4000
 POLL_TIMEOUT_SECONDS = 30
 
-# A summary asked for in a group is now ANSWERED IN THE REQUESTER'S DM with the bot; the
-# group itself keeps only a short receipt pointing there. Both that receipt and the
-# request that prompted it are swept after this long -- everything left in the group is
-# bookkeeping, and bookkeeping shouldn't outlive being read. The same 10s
+# A summary asked for in a group is ANSWERED IN THE REQUESTER'S DM with the bot. A real
+# answer leaves a lasting receipt with a "send me too" button (summary_share.py); the
+# short notices below -- and the request that prompted them -- are swept after this long,
+# since they are bookkeeping and bookkeeping shouldn't outlive being read. The same 10s
 # ERROR_DELETE_AFTER gives its notices: long enough to read one line and tap a link.
 SUMMARY_RECEIPT_DELETE_AFTER = 10
 SUMMARY_RECEIPT_TEXT = "Сообщение отправлено 👍"
@@ -4328,6 +4332,131 @@ async def _post_summary_receipt(
         SUMMARY_RECEIPT_DELETE_AFTER, log, background_tasks,
         trigger_message_id=trigger_message_id,
     )
+
+
+def _shared_summary_text(requester: str, request_text: str, answer: str) -> str:
+    """What an "Отправить мне тоже" press delivers: the answer under one line saying
+    whose request it was and what it asked -- without it, a summary that turns up in
+    somebody's DM unannounced does not say what it is a summary of."""
+    question = strip_summary_command(request_text)
+    header = f"Саммари по запросу {requester}" + (f": «{question}»" if question else "")
+    return f"{header}\n\n{answer}"
+
+
+async def _post_summary_share_receipt(
+    api: TelegramBotAPI, chat_id, trigger_message_id: int, shared_text: str, requester_id,
+    log=print,
+) -> None:
+    """The group's half of a summary answered in the DM: one line replying to the
+    request, with an "Отправить мне тоже" button and a counter of how many people took it.
+
+    Unlike the notices _post_summary_receipt leaves, nothing here is swept: not the
+    receipt, which is useful to whoever reads the chat later, and not the request it
+    replies to, which is what tells them what the summary is about.
+    """
+    try:
+        token = summary_share.create(shared_text, requester_id)
+        sent = await api.send_message(
+            chat_id, summary_share.receipt_text(0), reply_to_message_id=trigger_message_id,
+            parse_mode=None, reply_markup=summary_share.receipt_keyboard(token),
+        )
+        if sent and "message_id" in sent:
+            summary_share.attach_message(token, chat_id, sent["message_id"])
+    except Exception:
+        log(f"[bot_listener] failed to post the summary share receipt:\n{traceback.format_exc()}")
+
+
+async def _refresh_share_receipt(api: TelegramBotAPI, token: str, entry: dict, log=print) -> None:
+    """Edit the receipt's counter in place after somebody new took the summary."""
+    if entry.get("chat_id") is None or entry.get("message_id") is None:
+        return
+    try:
+        await api.edit_message_text(
+            entry["chat_id"], entry["message_id"], summary_share.receipt_text(entry["count"]),
+            reply_markup=summary_share.receipt_keyboard(token),
+        )
+    except Exception as e:
+        log(f"[bot_listener] could not update the summary receipt counter: {e}")
+
+
+async def _send_shared_summary(
+    api: TelegramBotAPI, token: str, user_id, resend: bool = False, log=print,
+) -> tuple[str, dict | None]:
+    """Deliver a shared summary to `user_id`'s DM.
+
+    Returns ("sent", entry) for a new reader, ("resent", entry) when somebody already
+    counted comes back through the deep link with `resend`, ("already", entry) for a
+    repeat press, ("expired", None) past summary_share.SHARE_TTL, and ("closed", None)
+    when the DM cannot be written to -- in which case their claim is released, so the
+    counter only ever counts people who actually received the text.
+    """
+    status, entry = summary_share.claim(token, user_id)
+    if status == "expired" or (status == "already" and not resend):
+        return status, entry
+    try:
+        await send_long_bot_message(api, int(user_id), entry["text"], None)
+    except Exception as e:
+        log(f"[bot_listener] could not DM a shared summary to {user_id}: {e}")
+        if status == "claimed":
+            summary_share.release(token, user_id)
+        return "closed", None
+    return ("sent" if status == "claimed" else "resent"), entry
+
+
+async def handle_summary_share_callback(
+    api: TelegramBotAPI, callback: dict, bot_username: str | None, log=print,
+) -> None:
+    """The "Отправить мне тоже" button under a group summary receipt.
+
+    The DM is written BEFORE the spinner stops, the way _poker_join does it, because
+    whether that worked decides what the press is answered with. Everything before the
+    answer is a Bot API call, never Telethon, so the button cannot hang on a stalled
+    session.
+    """
+    callback_id = callback["id"]
+    token = (callback.get("data") or "").split(":", 1)[-1]
+    presser = callback.get("from") or {}
+    receipt = callback.get("message") or {}
+    status, entry = await _send_shared_summary(api, token, presser.get("id"), log=log)
+    if status == "expired":
+        await api.answer_callback_query(callback_id, summary_share.STALE_TEXT)
+        # The receipt and its count stay; only the button that can no longer do
+        # anything goes.
+        if receipt.get("chat") and receipt.get("message_id"):
+            try:
+                await api.edit_message_reply_markup(receipt["chat"]["id"], receipt["message_id"])
+            except Exception as e:
+                log(f"[bot_listener] could not remove a stale summary button: {e}")
+        return
+    if status == "already":
+        await api.answer_callback_query(callback_id, "Уже лежит у тебя в личке.")
+        return
+    if status == "closed":
+        # A bot cannot write first. This url opens the bot's DM with a Start button, and
+        # Start brings the token back as /start sum-<token> (handle_summary_share_start).
+        if bot_username:
+            await api.answer_callback_query(
+                callback_id, url=summary_share.start_link(bot_username, token),
+            )
+        else:
+            await api.answer_callback_query(callback_id, "Сначала открой личку с ботом и нажми Start.")
+        return
+    await api.answer_callback_query(callback_id, "Отправил в личку.")
+    await _refresh_share_receipt(api, token, entry, log=log)
+
+
+async def handle_summary_share_start(api: TelegramBotAPI, message: dict, token: str, log=print) -> None:
+    """/start sum-<token>: the second half of a press by somebody whose DM was closed.
+    They asked for it explicitly, so an earlier copy does not stop this one."""
+    user_id = (message.get("from") or {}).get("id")
+    status, entry = await _send_shared_summary(api, token, user_id, resend=True, log=log)
+    if status == "sent":
+        await _refresh_share_receipt(api, token, entry, log=log)
+    elif status == "expired":
+        try:
+            await api.send_message(message["chat"]["id"], summary_share.STALE_TEXT, parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] could not send the stale-summary notice: {e}")
 
 
 async def _deliver_shop_item(
@@ -8597,9 +8726,9 @@ async def handle_bot_summary_request(
 
     A summary is long, it is for the person who asked, and a group that produces a dozen a
     day drowns in them. So a request made in a group is answered in that person's DM and
-    the group gets only a receipt (see _post_summary_receipt), which takes the request
-    down with it ten seconds later. A request already made in a DM is simply answered
-    where it was asked -- same destination, no receipt, nothing to clean up.
+    the group gets one line saying so, with a button that sends the same answer to anyone
+    else who wants it (see _post_summary_share_receipt). A request already made in a DM
+    is simply answered where it was asked -- same destination, no receipt.
 
     That makes an unopened DM a hard blocker rather than a degraded case: Telegram won't
     let a bot write first, so there is nowhere to deliver to. It's checked BEFORE any
@@ -8619,7 +8748,9 @@ async def handle_bot_summary_request(
     # requester's own DM, whose chat_id for a private chat IS their user id.
     answer_chat_id = chat_id if is_private else sender.get("id")
 
-    async def respond(answer: str, delete_after: int | None = None, record: bool = True) -> list[int]:
+    async def respond(
+        answer: str, delete_after: int | None = None, record: bool = True, shareable: bool = False,
+    ) -> list[int]:
         try:
             sent_ids = await send_long_bot_message(
                 api, answer_chat_id, answer,
@@ -8643,7 +8774,14 @@ async def handle_bot_summary_request(
                 history.record(chat_title_for_history, requester, text, answer)
             except Exception as e:
                 log(f"[bot_listener] failed to record history: {e}")
-        if not is_private:
+        if not is_private and shareable:
+            await _post_summary_share_receipt(
+                api, chat_id, message_id, _shared_summary_text(requester, text, answer),
+                sender.get("id"), log=log,
+            )
+        elif not is_private:
+            # Only the short notices (a parse failure, nobody by that name) come here:
+            # there is nothing in them worth a "send me too" button.
             await _post_summary_receipt(
                 api, chat_id, message_id, SUMMARY_RECEIPT_TEXT, bot_username,
                 background_tasks, log=log,
@@ -8803,7 +8941,7 @@ async def handle_bot_summary_request(
         requester_name=requester,
     )
 
-    await respond(f"{answer}\n\n{COMMANDS_FOOTER}")
+    await respond(f"{answer}\n\n{COMMANDS_FOOTER}", shareable=True)
 
 
 def _message_content(message: dict | None) -> str:
@@ -12028,6 +12166,8 @@ async def _dispatch_update(
             await handle_vote_result_callback(api, callback, vote_result_flows, log=log)
         elif callback_data.startswith(f"{tripo.CALLBACK_PREFIX}:"):
             await handle_tripo_callback(api, callback, tripo_flows, background_tasks, log=log)
+        elif callback_data.startswith(f"{summary_share.CALLBACK_PREFIX}:"):
+            await handle_summary_share_callback(api, callback, bot_username, log=log)
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.
@@ -12094,6 +12234,11 @@ async def _dispatch_update(
         if chat.get("type") != "private":
             return
         start_payload = (start_match.group(1) or "").lower()
+        if start_payload.startswith(summary_share.START_PREFIX):
+            await handle_summary_share_start(
+                api, message, start_payload[len(summary_share.START_PREFIX):], log=log,
+            )
+            return
         # The arena's own deep link, from the url button a group /vote2 leaves behind
         # (a web_app button is private-chat only, exactly as for v1). "arena" is still
         # accepted because announcements posted before the command was renamed are still
