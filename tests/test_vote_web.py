@@ -3,10 +3,12 @@ voters only ever see admitted entries, and only an admin can admit or see counts
 
 import hashlib
 import hmac
+import asyncio
 import json
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from urllib.parse import urlencode
 
 from aiohttp.test_utils import TestClient, TestServer
 
+import vote_eligibility
 import vote_web
 import voting
 from tests.async_case import AsyncTestCase
@@ -240,7 +243,9 @@ class VoteApiTests(AsyncTestCase):
         data = await response.json()
         self.assertTrue(data["is_subscriber"])
 
-    async def test_a_non_subscriber_can_vote_and_is_recorded_as_such(self):
+    async def test_without_an_eligibility_check_a_non_member_is_still_refused(self):
+        """Standalone (no bot_listener), `is_member` alone decides -- the membership half
+        of the rule, since this module cannot read join dates."""
         async def is_admin(user: dict) -> bool:
             return user.get("id") == self.admin_id
 
@@ -257,12 +262,135 @@ class VoteApiTests(AsyncTestCase):
             )
             data = await response.json()
 
+        self.assertEqual(response.status, 403)
+        self.assertEqual(data["reason"], vote_eligibility.NOT_A_MEMBER)
+        self.assertNotIn(str(self.voter_id), voting.load_poll(CHAT, "2026-08-02").votes)
+
+    # ---- the one-day rule (vote_eligibility) -----------------------------------------------
+
+    def _eligibility_app(self, verdicts: dict, calls: list | None = None, gate=None):
+        """An app whose eligibility check answers from `verdicts` by user id (ALLOWED for
+        anybody not named), recording each question in `calls`. `gate`, if given, is an
+        awaitable factory the check waits on first -- a stalled Telegram lookup."""
+        async def is_admin(user: dict) -> bool:
+            return user.get("id") == self.admin_id
+
+        async def is_member(user: dict) -> bool:
+            raise AssertionError("a ballot must take membership from its verdict")
+
+        async def eligibility(user: dict):
+            if calls is not None:
+                calls.append(user["id"])
+            if gate is not None:
+                await gate(user)
+            return verdicts.get(user["id"], vote_eligibility.ALLOWED)
+
+        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+        return vote_web.create_app(
+            cfg, CHAT, is_admin, is_member=is_member, eligibility=eligibility,
+            log=lambda *_: None,
+        )
+
+    async def test_a_member_of_less_than_a_day_is_refused_and_nothing_is_recorded(self):
+        too_new = vote_eligibility.Verdict(
+            is_member=True, reason=vote_eligibility.TOO_NEW,
+            eligible_at=datetime.now(timezone.utc) + timedelta(hours=3),
+        )
+        calls = []
+        app = self._eligibility_app({self.voter_id: too_new}, calls)
+        poll = self._seed_poll(approved=("a",))
+        voting.record_vote(poll, 9, ["a"], subscriber=True)
+        voting.save_poll(poll)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/ballot",
+                json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+            )
+            data = await response.json()
+
+        self.assertEqual(response.status, 403)
+        self.assertEqual(data["reason"], vote_eligibility.TOO_NEW)
+        self.assertIn("через сутки после вступления", data["error"])
+        self.assertIn("примерно через 3 ч", data["error"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").votes, {"9": ["a"]})
+        self.assertEqual(calls, [self.voter_id])
+
+    async def test_an_eligible_ballot_asks_once_and_records_the_membership_it_was_given(self):
+        calls = []
+        app = self._eligibility_app({}, calls)
+        self._seed_poll(approved=("a",))
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/ballot",
+                json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+            )
+            data = await response.json()
+
         self.assertEqual(response.status, 200)
-        self.assertTrue(data["ok"])
-        self.assertFalse(data["is_subscriber"])
+        self.assertTrue(data["is_subscriber"])
         poll = voting.load_poll(CHAT, "2026-08-02")
         self.assertEqual(poll.votes[str(self.voter_id)], ["a"])
-        self.assertFalse(poll.subscriber_votes[str(self.voter_id)])
+        self.assertTrue(poll.subscriber_votes[str(self.voter_id)])
+        self.assertEqual(calls, [self.voter_id])
+
+    async def test_the_poll_payload_says_up_front_who_cannot_vote_yet(self):
+        not_member = vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.NOT_A_MEMBER)
+        app = self._eligibility_app({self.voter_id: not_member})
+        self._seed_poll(approved=("a",))
+        async with TestClient(TestServer(app)) as client:
+            refused = await (await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/poll",
+                headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+            )).json()
+            allowed = await (await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/poll",
+                headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+            )).json()
+
+        self.assertFalse(refused["can_vote"])
+        self.assertFalse(refused["is_subscriber"])
+        self.assertIn("не меньше суток", refused["vote_block"])
+        # Still shown the works: the rule withholds the ballot, not the contest.
+        self.assertEqual([e["id"] for e in refused["entries"]], ["a"])
+        self.assertTrue(allowed["can_vote"])
+        self.assertIsNone(allowed["vote_block"])
+
+    async def test_a_stalled_eligibility_check_does_not_hold_up_another_ballot(self):
+        """The check is a Telegram round trip (sometimes a whole member-list read); it runs
+        outside the poll lock, so one stuck voter cannot make everybody else's ballot wait."""
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def gate(user):
+            if user["id"] == self.voter_id:
+                entered.set()
+                await release.wait()
+
+        app = self._eligibility_app({}, gate=gate)
+        self._seed_poll(approved=("a", "b"))
+        async with TestClient(TestServer(app)) as client:
+            stalled = asyncio.create_task(client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/ballot",
+                json={"init_data": _init_data(self.voter_id), "choices": ["a"]},
+            ))
+            await entered.wait()
+            other = await asyncio.wait_for(client.post(
+                f"{vote_web.ROUTE_PREFIX}/api/ballot",
+                json={"init_data": _init_data(self.admin_id), "choices": ["b"]},
+            ), timeout=5)
+            self.assertEqual(other.status, 200)
+            self.assertFalse(stalled.done())
+            release.set()
+            self.assertEqual((await stalled).status, 200)
+
+        self.assertEqual(
+            voting.load_poll(CHAT, "2026-08-02").votes,
+            {str(self.admin_id): ["b"], str(self.voter_id): ["a"]},
+        )
+
+    async def test_the_page_tells_a_voter_who_cannot_vote_why_instead_of_letting_them_pick(self):
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertIn("function cannotVote()", page)
+        self.assertIn("poll.vote_block", page)
 
     async def test_the_poll_payload_reports_subscription_status(self):
         self._seed_poll(approved=("a",))

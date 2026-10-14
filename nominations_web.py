@@ -25,6 +25,7 @@ from aiohttp import web
 
 import nominations
 import vote_audit
+import vote_eligibility
 import voting
 
 ROUTE_PREFIX = "/nominations"
@@ -38,6 +39,10 @@ _IS_ADMIN_KEY = web.AppKey("nominations_is_admin", Callable[[dict], Awaitable[bo
 # arrives as a callable, as v1's does. Its own cache: v3 must not lean on v1's app state.
 _AVATAR_KEY = web.AppKey("nominations_avatar", Callable[[int], Awaitable[bytes | None]])
 _AVATAR_CACHE_KEY = web.AppKey("nominations_avatar_cache", dict)
+# Whether this voter's ballot counts: in the chat for at least a day (vote_eligibility).
+_ELIGIBILITY_KEY = web.AppKey(
+    "nominations_eligibility", Callable[[dict], Awaitable[vote_eligibility.Verdict]]
+)
 _PREFIX_KEY = web.AppKey("nominations_prefix", str)
 _LOG_KEY = web.AppKey("nominations_log", Callable[..., None])
 
@@ -182,11 +187,15 @@ async def handle_state(request: web.Request) -> web.Response:
 
 async def handle_ballot(request: web.Request) -> web.Response:
     """Records this voter's choices in ONE nomination, replacing their earlier ballot
-    there and leaving every other nomination's alone."""
+    there and leaving every other nomination's alone -- if they have been in the chat for
+    a day (vote_eligibility); anybody else is refused with the reason."""
     body = await _body(request)
     if body is None:
         return _json_error("malformed request body")
     user = await _authenticate(request, body)
+    verdict = await request.app[_ELIGIBILITY_KEY](user)
+    if not verdict.can_vote:
+        return _json_error(verdict.message(), status=403)
     entry = request.app[_ENTRY_KEY]
     nomination_id = body.get("nomination_id")
     choices = body.get("choices")
@@ -205,13 +214,14 @@ async def handle_ballot(request: web.Request) -> web.Response:
         f"[nominations] ballot from {voting.display_name(user)} in {nomination['name']!r}: "
         f"{len(nomination['my_vote'])} choice(s)"
     )
-    # The administrators' audit log, shared with v1 so one report can read both. Membership
-    # is not computed on v3's page, so it is left unknown rather than guessed; the launch
-    # origin from initData is kept, which is the signal that matters for "where from".
+    # The administrators' audit log, shared with v1 so one report can read both: the
+    # membership the eligibility check just read, and the launch origin from initData,
+    # which is the signal that matters for "where from".
     vote_audit.record_vote_event(
         entry, system="v3", poll_id=f"nom:{nomination_id}", voter_id=user["id"],
         name=voting.display_name(user), username=user.get("username"),
-        choices=list(nomination.get("my_vote") or []), is_member=None, via="nomination",
+        choices=list(nomination.get("my_vote") or []), is_member=verdict.is_member,
+        via="nomination",
         source=vote_audit.parse_source(_init_data_from(request, body)),
         log=request.app[_LOG_KEY],
     )
@@ -324,13 +334,18 @@ async def handle_page(request: web.Request) -> web.Response:
 
 
 def attach(app: web.Application, cfg, entry: str, is_admin, log=print,
-           route_prefix: str = ROUTE_PREFIX, avatar=None) -> web.Application:
+           route_prefix: str = ROUTE_PREFIX, avatar=None, eligibility=None) -> web.Application:
     """Adds v3 to the application vote_web.create_app builds. Its own AppKeys throughout
     (nominations_*), so nothing it stores can collide with v1's or the arena's. `avatar`
     takes an author id and returns their profile photo bytes or None; without it every
-    card shows the author's initial instead."""
+    card shows the author's initial instead. `eligibility` decides whose ballot counts
+    (bot_listener's: in the chat for a day); without one, everybody's does, membership
+    unchecked."""
     async def _no_avatar(user_id):
         return None
+
+    async def _anyone(user):
+        return vote_eligibility.Verdict(is_member=None)
 
     prefix = route_prefix.rstrip("/")
     app[_CFG_KEY] = cfg
@@ -338,6 +353,7 @@ def attach(app: web.Application, cfg, entry: str, is_admin, log=print,
     app[_IS_ADMIN_KEY] = is_admin
     app[_AVATAR_KEY] = avatar or _no_avatar
     app[_AVATAR_CACHE_KEY] = {}
+    app[_ELIGIBILITY_KEY] = eligibility or _anyone
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
     app.add_routes([

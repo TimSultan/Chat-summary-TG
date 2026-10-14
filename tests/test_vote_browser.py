@@ -22,6 +22,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +32,7 @@ from aiohttp.test_utils import TestClient, TestServer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot_listener
+import vote_eligibility
 import vote_web
 import voting
 from tests.async_case import AsyncTestCase
@@ -296,7 +298,8 @@ def _buttons(item):
 class LinkBallotTests(_Storage, unittest.TestCase):
     def setUp(self):
         self._storage()
-        self.subscribed = True
+        self.verdict = vote_eligibility.ALLOWED
+        self.verdict_calls = 0
 
     def tearDown(self):
         self._unstorage()
@@ -305,15 +308,13 @@ class LinkBallotTests(_Storage, unittest.TestCase):
         api = FakeApi()
         message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": user}
 
-        async def resolve(*args, **kwargs):
-            return MAIN_CHAT_ID
-
-        async def member(api_, chat_id, user_id):
-            return self.subscribed
+        async def verdict(api_, telethon_client, entry, user_id, known_chat_ids, log=print):
+            self.verdict_calls += 1
+            self.assertEqual((entry, user_id), (CHAT, user["id"]))
+            return self.verdict
 
         payload = voting.encode_ballot_link(ids) if isinstance(ids, list) else ids
-        with patch.object(bot_listener, "_resolve_chat_id", resolve), \
-                patch.object(bot_listener, "_is_chat_member", member):
+        with patch.object(bot_listener, "_vote_verdict", verdict):
             asyncio.run(bot_listener.handle_vote_link_ballot(
                 api, None, message, CHAT, payload, log=lambda *_: None))
         return api.sent[-1]
@@ -337,12 +338,54 @@ class LinkBallotTests(_Storage, unittest.TestCase):
         self._send(["202"])
         self.assertEqual(self._poll().votes, {str(VOTER["id"]): ["202"]})
 
-    def test_a_non_subscriber_is_counted_and_invited(self):
+    def test_the_eligibility_check_is_asked_once(self):
         _seed()
-        self.subscribed = False
+        self._send(["101"])
+        self.assertEqual(self.verdict_calls, 1)
+
+    def test_a_non_member_is_refused_and_invited_to_join(self):
+        poll = _seed()
+        voting.record_vote(poll, 5, ["202"], subscriber=True)
+        voting.save_poll(poll)
+        self.verdict = vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.NOT_A_MEMBER)
         reply = self._send(["101"])
-        self.assertEqual(self._poll().subscriber_votes, {str(VOTER["id"]): False})
+        self.assertEqual(self._poll().votes, {"5": ["202"]})
+        self.assertIn("не меньше суток", reply["text"])
+        self.assertIn("Голос не записан", reply["text"])
         self.assertEqual(_buttons(reply)[0]["url"], vote_web.SUBSCRIBE_URL)
+
+    def test_a_member_of_less_than_a_day_is_refused(self):
+        _seed()
+        self.verdict = vote_eligibility.Verdict(
+            is_member=True, reason=vote_eligibility.TOO_NEW,
+            eligible_at=datetime.now(timezone.utc) + timedelta(hours=6),
+        )
+        reply = self._send(["101"])
+        self.assertEqual(self._poll().votes, {})
+        self.assertIn("через сутки после вступления", reply["text"])
+        self.assertIn("примерно через 6 ч", reply["text"])
+        self.assertIsNone(reply["reply_markup"])
+
+    def test_a_member_who_cannot_be_checked_is_refused(self):
+        _seed()
+        self.verdict = vote_eligibility.Verdict(is_member=True, reason=vote_eligibility.UNVERIFIED)
+        reply = self._send(["101"])
+        self.assertEqual(self._poll().votes, {})
+        self.assertIn("Не получилось проверить", reply["text"])
+
+    def test_a_failing_check_refuses_rather_than_allows(self):
+        _seed()
+
+        async def broken(*args, **kwargs):
+            raise RuntimeError("telethon fell over")
+
+        api = FakeApi()
+        message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": VOTER}
+        with patch.object(bot_listener, "_vote_verdict", broken):
+            asyncio.run(bot_listener.handle_vote_link_ballot(
+                api, None, message, CHAT, voting.encode_ballot_link(["101"]), log=lambda *_: None))
+        self.assertEqual(self._poll().votes, {})
+        self.assertIn("Голос не записан", api.sent[-1]["text"])
 
     def test_a_closed_vote_takes_nothing(self):
         _seed(open_=False)

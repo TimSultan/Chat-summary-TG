@@ -31,6 +31,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 import vote_audit
+import vote_eligibility
 import vote_image
 import voting
 
@@ -51,8 +52,14 @@ _IS_ADMIN_KEY = web.AppKey("is_admin", Callable[[dict], Awaitable[bool]])
 # is restricted to actual chat administrators and the owner (Sultan), excluding delegates.
 _IS_STATS_ADMIN_KEY = web.AppKey("is_stats_admin", Callable[[dict], Awaitable[bool]])
 # Same shape as _IS_ADMIN_KEY: whether this Telegram user currently subscribes to the
-# artists' channel. It is a prompt/statistic attribute, never a ballot permission.
+# artists' channel -- for the statistics' "joined since" recheck.
 _IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
+# Whether this Telegram user's ballot counts at all: in the chat for at least a day (see
+# vote_eligibility). Its `is_member` is the subscription snapshot a ballot records, so a
+# ballot asks this one question, not two.
+_ELIGIBILITY_KEY = web.AppKey(
+    "eligibility", Callable[[dict], Awaitable[vote_eligibility.Verdict]]
+)
 # Delivers the results of a closed vote. Takes the admin's user dict, the poll, and the
 # FULL standings -- every admitted entry as an (Entry, votes) pair, ranked highest-first,
 # element 0 being the recorded winner. Full, not the top 3: the results message
@@ -201,7 +208,7 @@ async def handle_poll(request: web.Request) -> web.Response:
     can_moderate = await request.app[_IS_ADMIN_KEY](user)
     admin_mode = can_moderate and request.query.get("mode") == "admin"
     can_view_vote_stats = admin_mode and await request.app[_IS_STATS_ADMIN_KEY](user)
-    is_subscriber = await request.app[_IS_MEMBER_KEY](user)
+    verdict = await request.app[_ELIGIBILITY_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
     visible = poll.entries if admin_mode else poll.approved_entries()
     winner = poll.winner()
@@ -217,7 +224,10 @@ async def handle_poll(request: web.Request) -> web.Response:
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
         "can_view_vote_stats": can_view_vote_stats,
-        "is_subscriber": is_subscriber,
+        "is_subscriber": verdict.is_member,
+        # Told up front, so a voter who cannot vote yet is not left to pick works first.
+        "can_vote": verdict.can_vote,
+        "vote_block": verdict.message(),
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
         "voter_count": len(poll.votes),
@@ -247,8 +257,9 @@ async def handle_ballot(request: web.Request) -> web.Response:
     than silently truncated in voting.record_vote -- a voter should know their ballot
     didn't count as sent, not have it quietly reshaped.
 
-    The membership check is deliberately a snapshot rather than a gate: everybody's
-    ballot counts, while non-subscribers receive an invitation after it is saved."""
+    Only somebody who has been in the chat for a day may vote (vote_eligibility); anybody
+    else is refused with the reason before the poll is touched. The same verdict's
+    membership half is recorded with the ballot as its subscription snapshot."""
     try:
         body = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -256,9 +267,14 @@ async def handle_ballot(request: web.Request) -> web.Response:
 
     user = await _authenticate(request, body)
     entry_name = request.app[_ENTRY_KEY]
-    # A Telegram failure simply means we cannot confirm a subscription right now; the
-    # ballot must still be accepted, and the client may invite the voter to join.
-    is_subscriber = await request.app[_IS_MEMBER_KEY](user)
+    # Outside the poll lock: it is a Telegram round trip (and now and then a read of the
+    # chat's member list), and nobody else's ballot should wait behind it.
+    verdict = await request.app[_ELIGIBILITY_KEY](user)
+    if not verdict.can_vote:
+        return web.json_response(
+            {"error": verdict.message(), "reason": verdict.reason}, status=403,
+        )
+    is_subscriber = verdict.is_member
     # Everything from here to save_poll is under voting.poll_lock so two ballots cannot
     # interleave between the load and the save and erase one another.
     async with voting.poll_lock:
@@ -745,6 +761,7 @@ async def handle_health(request: web.Request) -> web.Response:
 def create_app(
     cfg, entry: str, is_admin, announce=None, route_prefix: str = ROUTE_PREFIX, log=print,
     is_member=None, is_stats_admin=None, export=None, avatar=None, attach=None,
+    eligibility=None,
     bot_username: str | None = None,
 ) -> web.Application:
     """`is_admin` is an async callable taking the verified Telegram user dict and
@@ -758,8 +775,11 @@ def create_app(
     don't exercise closing a vote) without a bot_listener.py running alongside it.
 
     `is_member` is an async callable, same shape as `is_admin`, answering whether the
-    voter currently subscribes. Its result is stored with a ballot and may prompt them to
-    join; it never denies a vote. `is_stats_admin` is the narrower owner/chat-admin gate
+    voter currently subscribes -- the statistics' "joined since" recheck asks it.
+    `eligibility` answers whether their ballot counts at all, with a
+    vote_eligibility.Verdict: bot_listener.py's checks the chat membership AND that it is
+    at least a day old. Without one, `is_member` decides alone (membership only -- this
+    module cannot read join dates). `is_stats_admin` is the narrower owner/chat-admin gate
     for the subscription breakdown and defaults to `is_admin` for standalone callers.
 
     `export` is an async callable taking (user, poll, path) that delivers a rendered board
@@ -798,6 +818,7 @@ def create_app(
     app[_IS_ADMIN_KEY] = is_admin
     app[_IS_STATS_ADMIN_KEY] = is_stats_admin or is_admin
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
+    app[_ELIGIBILITY_KEY] = eligibility or vote_eligibility.membership_only(app[_IS_MEMBER_KEY])
     app[_ANNOUNCE_KEY] = announce or _default_announce
     app[_EXPORT_KEY] = export or _default_export
     app[_AVATAR_KEY] = avatar or _default_avatar
@@ -840,11 +861,12 @@ def create_app(
 async def run_web_server(
     cfg, entry: str, is_admin, port: int, announce=None, log=print, is_member=None,
     is_stats_admin=None, export=None, avatar=None, attach=None, bot_username=None,
+    eligibility=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
     app = create_app(
         cfg, entry, is_admin, announce=announce, log=log, is_member=is_member,
-        is_stats_admin=is_stats_admin, export=export,
+        eligibility=eligibility, is_stats_admin=is_stats_admin, export=export,
         avatar=avatar, attach=attach, bot_username=bot_username,
     )
     runner = web.AppRunner(app)
@@ -1038,8 +1060,8 @@ PAGE_HTML = """<!doctype html>
               border: 1px solid rgba(128,128,128,.4); background: var(--bg);
               color: var(--fg); padding: 4px; font-size: 13px; }
   .settings input[type="checkbox"] { width: 18px; height: 18px; }
-  /* Stands in when the vote controls are replaced with a sentence: a locked ballot or a
-     closed poll. */
+  /* Stands in when the vote controls are replaced with a sentence: a locked ballot, a
+     closed poll, or a voter who may not vote (yet) -- see can_vote. */
   .notice { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
             background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
   /* The acceptance confirmation for an immediate (allow_revote) vote -- fades on its own
@@ -1151,11 +1173,11 @@ PAGE_HTML = """<!doctype html>
 
 <div class="modal" id="subscribePrompt" hidden>
   <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="subscribeTitle">
-    <h2 id="subscribeTitle">Подпишитесь, чтобы подтвердить голос</h2>
-    <p>С нами уже 500 художников по миниатюрам и не только</p>
+    <h2 id="subscribeTitle">Голосуют участники чата</h2>
+    <p id="subscribeText">Вступите в чат — голосовать можно через сутки после вступления. С нами уже 500 художников по миниатюрам и не только</p>
     <div class="modalActions">
       <button class="cancel" id="subscribeClose">Позже</button>
-      <a id="subscribeLink" href="https://t.me/papkahudojnicov">Подписаться</a>
+      <a id="subscribeLink" href="https://t.me/papkahudojnicov">Вступить</a>
     </div>
   </div>
 </div>
@@ -1387,6 +1409,12 @@ function ballotLocked() {
   return !poll.allow_revote && poll.my_vote && poll.my_vote.length > 0;
 }
 
+// Only somebody who has been in the chat for a day may vote; the server says so up front
+// (can_vote/vote_block) and refuses the ballot anyway, this just spares the picking.
+function cannotVote() {
+  return !poll.is_admin && poll.open && poll.can_vote === false;
+}
+
 // Whether `id`'s card currently reads as chosen, and what its button should say. In
 // allow_revote mode `picked` IS the server-confirmed vote (submitBallot keeps it in sync
 // on every tap), so "chosen" there already means "accepted" -- hence "Голос учтён ✓"
@@ -1592,6 +1620,12 @@ function updateButton() {
     notice.textContent = poll.open ? "Голос зафиксирован — менять нельзя." : "Голосование закрыто.";
     return;
   }
+  if (cannotVote()) {
+    go.hidden = true;
+    notice.hidden = false;
+    notice.textContent = poll.vote_block || "Голосовать пока нельзя.";
+    return;
+  }
   notice.hidden = true;
   if (poll.allow_revote) {
     // Voting IS the tap on a card in this mode -- there is nothing left for a bottom-bar
@@ -1637,7 +1671,6 @@ async function submitBallot(choices) {
   poll.is_subscriber = data.is_subscriber;
   if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
   showConfirmBanner();
-  if (data.is_subscriber === false && data.my_vote.length) showSubscribePrompt();
 }
 
 // Opens the reel at the tapped work. Every entry is in it, so from here the rest of the
@@ -2017,6 +2050,11 @@ async function onPickTap(id) {
   if (poll.is_admin) { toggleAdmitted(id); return; }
   if (ballotLocked()) {
     alert(poll.open ? "Голос уже зафиксирован, менять нельзя." : "Голосование закрыто.");
+    return;
+  }
+  if (cannotVote()) {
+    if (poll.is_subscriber === false) showSubscribePrompt();
+    else alert(poll.vote_block || "Голосовать пока нельзя.");
     return;
   }
   if (poll.allow_revote) {

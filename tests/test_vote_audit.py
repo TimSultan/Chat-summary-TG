@@ -27,6 +27,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 import bot_listener
 import vote_audit
+import vote_eligibility
 import vote_web
 import voting
 from tests.async_case import AsyncTestCase
@@ -199,11 +200,11 @@ class MiniAppBallotWritesAuditTests(AsyncTestCase):
         self._patcher.stop()
         self._temporary.cleanup()
 
-    async def _ballot(self, user_id, choices, **source):
+    async def _ballot(self, user_id, choices, status=200, **source):
         resp = await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/ballot", json={
             "init_data": _init_data(user_id, **source), "choices": choices,
         })
-        self.assertEqual(resp.status, 200, await resp.text())
+        self.assertEqual(resp.status, status, await resp.text())
 
     async def test_a_miniapp_ballot_writes_one_event(self):
         await self._ballot(7, ["a"], chat_type="sender", start_param="vote")
@@ -216,10 +217,10 @@ class MiniAppBallotWritesAuditTests(AsyncTestCase):
         self.assertEqual(event["choices"], ["a"])
         self.assertEqual(event["source"], {"chat_type": "sender", "start_param": "vote"})
 
-    async def test_a_non_member_is_recorded_as_such(self):
-        await self._ballot(8, ["a"])
-        event = vote_audit.read_events(CHAT, system="v1")[0]
-        self.assertEqual(event["is_member"], False)
+    async def test_a_refused_non_member_leaves_no_event(self):
+        """Only somebody who may vote reaches the log: a refused ballot was never cast."""
+        await self._ballot(8, ["a"], status=403)
+        self.assertEqual(vote_audit.read_events(CHAT, system="v1"), [])
 
     async def test_revotes_each_leave_a_line(self):
         await self._ballot(7, ["a"])
@@ -253,15 +254,11 @@ class LinkBallotWritesAuditTests(_Storage, unittest.TestCase):
         message = {"message_id": 1, "chat": {"id": 555, "type": "private"},
                    "from": {"id": 9, "username": "linkvoter", "first_name": "L"}}
 
-        async def resolve(*a, **k):
-            return -1001234567890
-
-        async def member(api_, chat_id, user_id):
-            return True
+        async def verdict(*a, **k):
+            return vote_eligibility.ALLOWED
 
         payload = voting.encode_ballot_link(["101"])
-        with patch.object(bot_listener, "_resolve_chat_id", resolve), \
-                patch.object(bot_listener, "_is_chat_member", member):
+        with patch.object(bot_listener, "_vote_verdict", verdict):
             asyncio.run(bot_listener.handle_vote_link_ballot(
                 FakeApi(), None, message, CHAT, payload, log=lambda *_: None))
 

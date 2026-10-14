@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import nominations
 import nominations_web
+import vote_audit
+import vote_eligibility
 import vote_web
 import voting
 from tests.async_case import AsyncTestCase
@@ -81,10 +84,17 @@ class NominationsApiTests(AsyncTestCase):
             self.avatar_requests.append(user_id)
             return b"face" if user_id != 3 else None  # author 3 has no profile photo
 
+        # Who may vote, by user id; anybody not named may.
+        self.verdicts = {}
+
+        async def eligibility(user):
+            return self.verdicts.get(user["id"], vote_eligibility.ALLOWED)
+
         app = vote_web.create_app(
             cfg, CHAT, is_admin, log=lambda *_: None,
             attach=lambda a: nominations_web.attach(
                 a, cfg, CHAT, is_admin, log=lambda *_: None, avatar=avatar,
+                eligibility=eligibility,
             ),
         )
         self.client = TestClient(TestServer(app))
@@ -226,6 +236,29 @@ class NominationsApiTests(AsyncTestCase):
         response = await self._post("ballot", VOTER, nomination_id=ids["Аниме"], choices=["1"])
         self.assertEqual(response.status, 409)
         self.assertEqual(nominations.load_contest(CHAT).nomination(ids["Аниме"]).votes, {})
+
+    async def test_only_a_member_of_a_day_or_more_may_vote(self):
+        ids = self._seed()
+        self.verdicts[VOTER] = vote_eligibility.Verdict(
+            is_member=True, reason=vote_eligibility.TOO_NEW,
+            eligible_at=datetime.now(timezone.utc) + timedelta(hours=10),
+        )
+        self.verdicts[OTHER] = vote_eligibility.Verdict(
+            is_member=False, reason=vote_eligibility.NOT_A_MEMBER,
+        )
+        too_new = await self._post("ballot", VOTER, nomination_id=ids["Аниме"], choices=["1"])
+        stranger = await self._post("ballot", OTHER, nomination_id=ids["Аниме"], choices=["1"])
+        self.assertEqual((too_new.status, stranger.status), (403, 403))
+        self.assertIn("примерно через 10 ч", (await too_new.json())["error"])
+        self.assertIn("не меньше суток", (await stranger.json())["error"])
+        self.assertEqual(nominations.load_contest(CHAT).nomination(ids["Аниме"]).votes, {})
+        self.assertEqual(vote_audit.read_events(CHAT, system="v3"), [])
+
+    async def test_the_audit_log_keeps_the_membership_the_check_read(self):
+        ids = self._seed()
+        await self._post("ballot", VOTER, nomination_id=ids["Аниме"], choices=["1"])
+        [event] = vote_audit.read_events(CHAT, system="v3")
+        self.assertIs(event["is_member"], True)
 
     async def test_a_ballot_for_a_deleted_nomination_is_a_404(self):
         self._seed()

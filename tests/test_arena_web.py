@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -23,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import arena
 import arena_web
+import vote_eligibility
 import voting
 import vote_web
 from tests.async_case import AsyncTestCase
@@ -265,6 +267,44 @@ class ArenaApiTests(AsyncTestCase):
             arena_web.ROUTE_PREFIX + "/api/session", json={"init_data": _init_data(99)}
         )
         self.assertEqual(response.status, 403)
+        self.assertEqual((await response.json())["error"], "NOT_A_MEMBER")
+
+    async def test_a_member_of_less_than_a_day_cannot_start_and_is_told_so_up_front(self):
+        too_new = vote_eligibility.Verdict(
+            is_member=True, reason=vote_eligibility.TOO_NEW,
+            eligible_at=datetime.now(timezone.utc) + timedelta(hours=4),
+        )
+        cfg = SimpleNamespace(telegram_bot_token=BOT_TOKEN)
+
+        async def is_admin(user):
+            return False
+
+        async def eligibility(user):
+            return too_new if user["id"] == self.voter_id else vote_eligibility.ALLOWED
+
+        app = vote_web.create_app(
+            cfg, CHAT, is_admin, log=lambda *_: None,
+            attach=lambda a: arena_web.attach(
+                a, cfg, CHAT, is_admin, eligibility=eligibility, log=lambda *_: None,
+            ),
+        )
+        self._seed()
+        async with TestClient(TestServer(app)) as client:
+            state = await (await client.get(
+                arena_web.ROUTE_PREFIX + "/api/state", headers=self._auth(self.voter_id)
+            )).json()
+            response = await client.post(
+                arena_web.ROUTE_PREFIX + "/api/session",
+                json={"init_data": _init_data(self.voter_id)},
+            )
+            data = await response.json()
+
+        self.assertFalse(state["can_vote"])
+        self.assertTrue(state["is_member"])
+        self.assertIn("примерно через 4 ч", state["vote_block"])
+        self.assertEqual(response.status, 403)
+        self.assertEqual(data["error"], "TOO_NEW")
+        self.assertEqual(arena.latest_tournament(CHAT).ballots, {})
 
     async def test_a_closed_arena_refuses_new_sessions(self):
         self._seed(open=False)

@@ -21,6 +21,7 @@ from typing import Awaitable, Callable
 from aiohttp import web
 
 import arena
+import vote_eligibility
 import voting
 from arena_core import TIE
 
@@ -36,6 +37,10 @@ _CFG_KEY = web.AppKey("arena_cfg")
 _ENTRY_KEY = web.AppKey("arena_entry", str)
 _IS_ADMIN_KEY = web.AppKey("arena_is_admin", Callable[[dict], Awaitable[bool]])
 _IS_MEMBER_KEY = web.AppKey("arena_is_member", Callable[[dict], Awaitable[bool]])
+# Whether this voter's ballot counts: in the chat for at least a day (vote_eligibility).
+_ELIGIBILITY_KEY = web.AppKey(
+    "arena_eligibility", Callable[[dict], Awaitable[vote_eligibility.Verdict]]
+)
 _PREFIX_KEY = web.AppKey("arena_prefix", str)
 _LOG_KEY = web.AppKey("arena_log", Callable[..., None])
 
@@ -152,13 +157,16 @@ async def handle_state(request: web.Request) -> web.Response:
     can_moderate = await request.app[_IS_ADMIN_KEY](user)
     admin_mode = can_moderate and request.query.get("mode") == "admin"
     ballot = tournament.ballots.get(str(user["id"]))
+    verdict = await request.app[_ELIGIBILITY_KEY](user)
 
     payload = {
         "tournament_id": tournament.tournament_id,
         "open": tournament.open,
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
-        "is_member": await request.app[_IS_MEMBER_KEY](user),
+        "is_member": verdict.is_member,
+        "can_vote": verdict.can_vote,
+        "vote_block": verdict.message(),
         "me": voting.display_name(user),
         "works": len(tournament.approved),
         "pairs_per_voter": tournament.pairs_per_voter,
@@ -185,14 +193,17 @@ async def handle_session(request: web.Request) -> web.Response:
     entry_name = request.app[_ENTRY_KEY]
     base = request.app[_PREFIX_KEY]
 
+    # Outside the lock: a Telegram round trip nobody else's pick should wait behind.
+    verdict = await request.app[_ELIGIBILITY_KEY](user)
     async with arena.arena_lock:
         tournament = arena.latest_tournament(entry_name)
         if tournament is None:
             return _json_error("арена ещё не создана", status=404, code="NO_TOURNAMENT")
-        if not await request.app[_IS_MEMBER_KEY](user):
-            return _json_error(
-                "голосовать могут только участники чата", status=403, code="NOT_A_MEMBER"
+        if not verdict.can_vote:
+            code = "NOT_A_MEMBER" if verdict.reason == vote_eligibility.NOT_A_MEMBER else (
+                "TOO_NEW" if verdict.reason == vote_eligibility.TOO_NEW else "UNVERIFIED"
             )
+            return _json_error(verdict.message(), status=403, code=code)
         try:
             ballot = arena.start_session(tournament, user["id"], voting.display_name(user))
         except arena.ArenaError as e:
@@ -408,13 +419,15 @@ async def handle_page(request: web.Request) -> web.Response:
 
 
 def attach(app: web.Application, cfg, entry: str, is_admin, is_member=None, log=print,
-           route_prefix: str = ROUTE_PREFIX) -> web.Application:
+           route_prefix: str = ROUTE_PREFIX, eligibility=None) -> web.Application:
     """Adds the arena to an existing aiohttp application -- the one vote_web.create_app
     builds, so both systems answer on one port without either owning the other.
 
     Its own AppKeys throughout (arena_*), so nothing it stores can collide with v1's, and
     its own copies of `is_admin`/`is_member`: the two systems ask the same questions of
     Telegram but must be able to answer them differently later without touching each other.
+    `eligibility` decides whether a ballot may start (bot_listener's: in the chat for a
+    day); without one, `is_member` alone does.
     """
     async def _default_is_member(user):
         return True
@@ -424,6 +437,7 @@ def attach(app: web.Application, cfg, entry: str, is_admin, is_member=None, log=
     app[_ENTRY_KEY] = entry
     app[_IS_ADMIN_KEY] = is_admin
     app[_IS_MEMBER_KEY] = is_member or _default_is_member
+    app[_ELIGIBILITY_KEY] = eligibility or vote_eligibility.membership_only(app[_IS_MEMBER_KEY])
     app[_PREFIX_KEY] = prefix
     app[_LOG_KEY] = log
 
@@ -1258,10 +1272,10 @@ async function load() {
       return;
     }
 
-    if (state.is_member === false) {
+    if (state.can_vote === false) {
       $("sub").textContent = "";
       $("msg").hidden = false;
-      $("msg").textContent = "Голосовать могут только участники чата.";
+      $("msg").textContent = state.vote_block || "Голосовать могут только участники чата.";
       $("go").hidden = true;
       return;
     }
