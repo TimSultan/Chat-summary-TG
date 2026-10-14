@@ -54,7 +54,7 @@ _IS_STATS_ADMIN_KEY = web.AppKey("is_stats_admin", Callable[[dict], Awaitable[bo
 # Same shape as _IS_ADMIN_KEY: whether this Telegram user currently subscribes to the
 # artists' channel -- for the statistics' "joined since" recheck.
 _IS_MEMBER_KEY = web.AppKey("is_member", Callable[[dict], Awaitable[bool]])
-# Whether this Telegram user's ballot counts at all: in the chat for at least a day (see
+# Whether this Telegram user's ballot counts at all: in Папка художников for at least a day (see
 # vote_eligibility). Its `is_member` is the subscription snapshot a ballot records, so a
 # ballot asks this one question, not two.
 _ELIGIBILITY_KEY = web.AppKey(
@@ -257,7 +257,7 @@ async def handle_ballot(request: web.Request) -> web.Response:
     than silently truncated in voting.record_vote -- a voter should know their ballot
     didn't count as sent, not have it quietly reshaped.
 
-    Only somebody who has been in the chat for a day may vote (vote_eligibility); anybody
+    Only somebody who has been in Папка художников for a day may vote (vote_eligibility); anybody
     else is refused with the reason before the poll is touched. The same verdict's
     membership half is recorded with the ballot as its subscription snapshot."""
     try:
@@ -777,7 +777,7 @@ def create_app(
     `is_member` is an async callable, same shape as `is_admin`, answering whether the
     voter currently subscribes -- the statistics' "joined since" recheck asks it.
     `eligibility` answers whether their ballot counts at all, with a
-    vote_eligibility.Verdict: bot_listener.py's checks the chat membership AND that it is
+    vote_eligibility.Verdict: bot_listener.py's checks Папка художников membership AND that it is
     at least a day old. Without one, `is_member` decides alone (membership only -- this
     module cannot read join dates). `is_stats_admin` is the narrower owner/chat-admin gate
     for the subscription breakdown and defaults to `is_admin` for standalone callers.
@@ -1173,8 +1173,8 @@ PAGE_HTML = """<!doctype html>
 
 <div class="modal" id="subscribePrompt" hidden>
   <div class="modalCard" role="dialog" aria-modal="true" aria-labelledby="subscribeTitle">
-    <h2 id="subscribeTitle">Голосуют участники чата</h2>
-    <p id="subscribeText">Вступите в чат — голосовать можно через сутки после вступления. С нами уже 500 художников по миниатюрам и не только</p>
+    <h2 id="subscribeTitle">Голосуют участники Папки художников</h2>
+    <p id="subscribeText">Вступите в Папку художников — голосовать можно через сутки после вступления. С нами уже 500 художников по миниатюрам и не только</p>
     <div class="modalActions">
       <button class="cancel" id="subscribeClose">Позже</button>
       <a id="subscribeLink" href="https://t.me/papkahudojnicov">Вступить</a>
@@ -1409,7 +1409,7 @@ function ballotLocked() {
   return !poll.allow_revote && poll.my_vote && poll.my_vote.length > 0;
 }
 
-// Only somebody who has been in the chat for a day may vote; the server says so up front
+// Only somebody who has been in Папка художников for a day may vote; the server says so up front
 // (can_vote/vote_block) and refuses the ballot anyway, this just spares the picking.
 function cannotVote() {
   return !poll.is_admin && poll.open && poll.can_vote === false;

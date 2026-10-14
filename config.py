@@ -62,6 +62,21 @@ class Config:
     # Where a zip of the voting history is posted after every closed vote (see backup.py):
     # a chat id or @username. None keeps backups to "/backup", on demand.
     backup_chat_id: str | None = None
+    # Whose members may vote, and only a day after joining (vote_eligibility.py): an
+    # @username or chat id. None falls back to the tracked chat itself.
+    vote_member_chat: str | None = None
+
+
+def _chat_handle(raw: str | None) -> str | None:
+    """An @username or numeric chat id as the Bot API takes it, or None when blank. A bare
+    username gets its @: without one it is the spelling Telegram rejects, and the one
+    people naturally type."""
+    value = (raw or "").strip()
+    if not value:
+        return None
+    if not value.startswith("@") and not value.lstrip("-").isdigit():
+        value = f"@{value}"
+    return value
 
 
 def build_session(cfg: "Config"):
@@ -137,10 +152,12 @@ def load_config() -> Config:
     # spelling sendMessage rejects, and it's the spelling people naturally type. Blank
     # removes the choice altogether: the announcement then only offers the main chat,
     # rather than offering a destination that could never work.
-    vote_announce_extra_chat = os.getenv("VOTE_ANNOUNCE_EXTRA_CHAT", "@papkahudojnicov").strip() or None
-    if vote_announce_extra_chat and not vote_announce_extra_chat.startswith("@") \
-            and not vote_announce_extra_chat.lstrip("-").isdigit():
-        vote_announce_extra_chat = f"@{vote_announce_extra_chat}"
+    vote_announce_extra_chat = _chat_handle(os.getenv("VOTE_ANNOUNCE_EXTRA_CHAT", "@papkahudojnicov"))
+
+    # Whose members may vote: Папка художников, not the tracked chat the works come from.
+    # Same spelling rules as above, since the Bot API's getChatMember takes the @username
+    # as the chat id just as sendMessage does. Blank falls back to the tracked chat.
+    vote_member_chat = _chat_handle(os.getenv("VOTE_MEMBER_CHAT", "@papkahudojnicov"))
 
     # BotFather's Direct Link Mini App short name (/newapp), which lets the vote button in
     # a GROUP be "https://t.me/<bot>/<short name>?startapp=vote" and open the Mini App
@@ -234,6 +251,7 @@ def load_config() -> Config:
         webapp_public_url=webapp_public_url,
         webapp_port=webapp_port,
         vote_announce_extra_chat=vote_announce_extra_chat,
+        vote_member_chat=vote_member_chat,
         vote_miniapp_short_name=vote_miniapp_short_name,
         save_trigger_keyword=save_trigger_keyword,
         save_channel=save_channel,

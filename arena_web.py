@@ -37,7 +37,7 @@ _CFG_KEY = web.AppKey("arena_cfg")
 _ENTRY_KEY = web.AppKey("arena_entry", str)
 _IS_ADMIN_KEY = web.AppKey("arena_is_admin", Callable[[dict], Awaitable[bool]])
 _IS_MEMBER_KEY = web.AppKey("arena_is_member", Callable[[dict], Awaitable[bool]])
-# Whether this voter's ballot counts: in the chat for at least a day (vote_eligibility).
+# Whether this voter's ballot counts: in Папка художников for at least a day (vote_eligibility).
 _ELIGIBILITY_KEY = web.AppKey(
     "arena_eligibility", Callable[[dict], Awaitable[vote_eligibility.Verdict]]
 )
@@ -426,7 +426,7 @@ def attach(app: web.Application, cfg, entry: str, is_admin, is_member=None, log=
     Its own AppKeys throughout (arena_*), so nothing it stores can collide with v1's, and
     its own copies of `is_admin`/`is_member`: the two systems ask the same questions of
     Telegram but must be able to answer them differently later without touching each other.
-    `eligibility` decides whether a ballot may start (bot_listener's: in the chat for a
+    `eligibility` decides whether a ballot may start (bot_listener's: in Папка художников for a
     day); without one, `is_member` alone does.
     """
     async def _default_is_member(user):
@@ -1275,7 +1275,7 @@ async function load() {
     if (state.can_vote === false) {
       $("sub").textContent = "";
       $("msg").hidden = false;
-      $("msg").textContent = state.vote_block || "Голосовать могут только участники чата.";
+      $("msg").textContent = state.vote_block || "Голосовать могут только участники Папки художников.";
       $("go").hidden = true;
       return;
     }

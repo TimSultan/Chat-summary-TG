@@ -39,7 +39,7 @@ _IS_ADMIN_KEY = web.AppKey("nominations_is_admin", Callable[[dict], Awaitable[bo
 # arrives as a callable, as v1's does. Its own cache: v3 must not lean on v1's app state.
 _AVATAR_KEY = web.AppKey("nominations_avatar", Callable[[int], Awaitable[bytes | None]])
 _AVATAR_CACHE_KEY = web.AppKey("nominations_avatar_cache", dict)
-# Whether this voter's ballot counts: in the chat for at least a day (vote_eligibility).
+# Whether this voter's ballot counts: in Папка художников for at least a day (vote_eligibility).
 _ELIGIBILITY_KEY = web.AppKey(
     "nominations_eligibility", Callable[[dict], Awaitable[vote_eligibility.Verdict]]
 )
@@ -187,7 +187,7 @@ async def handle_state(request: web.Request) -> web.Response:
 
 async def handle_ballot(request: web.Request) -> web.Response:
     """Records this voter's choices in ONE nomination, replacing their earlier ballot
-    there and leaving every other nomination's alone -- if they have been in the chat for
+    there and leaving every other nomination's alone -- if they have been in Папка художников for
     a day (vote_eligibility); anybody else is refused with the reason."""
     body = await _body(request)
     if body is None:
@@ -339,7 +339,7 @@ def attach(app: web.Application, cfg, entry: str, is_admin, log=print,
     (nominations_*), so nothing it stores can collide with v1's or the arena's. `avatar`
     takes an author id and returns their profile photo bytes or None; without it every
     card shows the author's initial instead. `eligibility` decides whose ballot counts
-    (bot_listener's: in the chat for a day); without one, everybody's does, membership
+    (bot_listener's: in Папка художников for a day); without one, everybody's does, membership
     unchecked."""
     async def _no_avatar(user_id):
         return None

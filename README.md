@@ -841,14 +841,18 @@ App via a Direct Link (`VOTE_MINIAPP_SHORT_NAME`, see `/vote chat` below) or int
 bot's DM, where the real Mini App button is waiting. Either way it is opening the page
 inside Telegram that gets a signed identity to vote with.
 
-**Who may vote:** only a member of the chat who joined it **at least 24 hours ago**
-(`vote_eligibility.py`), in every vote the bot runs — `/vote` in the Mini App and through
-its browser link, the arena and the nominations. Current membership comes from the Bot
-API; the join date from the userbot's read of the chat's member list (the Bot API has
-none), kept in memory and re-read only for somebody it does not list yet. Chat
-administrators skip the join-date half. A check that cannot finish refuses the ballot
-with "попробуйте позже" rather than letting it through. The page says up front why
-somebody cannot vote yet, and roughly how many hours are left.
+**Who may vote:** only a member of **Папка художников** (`VOTE_MEMBER_CHAT`,
+`@papkahudojnicov` by default — not the tracked chat) who joined it **at least 24 hours
+ago** (`vote_eligibility.py`), in every vote the bot runs — `/vote` in the Mini App and
+through its browser link, the arena and the nominations. Current membership comes from the
+Bot API's `getChatMember`, so the bot has to be in Папка художников (an admin, if it is a
+channel). The join date comes from the userbot's read of its member list (the Bot API has
+none), kept in memory and re-read only for somebody it does not list yet; when Telegram
+hands out only part of the list (a channel's), somebody missing from it is looked up by
+name. So the Telethon account has to be in Папка художников too (again an admin, if it is
+a channel). Administrators skip the join-date half. A check that cannot finish refuses
+the ballot with "попробуйте позже" rather than letting it through, and logs why. The page
+says up front why somebody cannot vote yet, and roughly how many hours are left.
 
 Six distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:

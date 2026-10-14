@@ -299,24 +299,24 @@ class LinkBallotTests(_Storage, unittest.TestCase):
     def setUp(self):
         self._storage()
         self.verdict = vote_eligibility.ALLOWED
-        self.verdict_calls = 0
+        self.verdict_calls = []
 
     def tearDown(self):
         self._unstorage()
 
-    def _send(self, ids, user=VOTER):
+    def _send(self, ids, user=VOTER, member_chat="@papkahudojnicov"):
         api = FakeApi()
         message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": user}
 
-        async def verdict(api_, telethon_client, entry, user_id, known_chat_ids, log=print):
-            self.verdict_calls += 1
-            self.assertEqual((entry, user_id), (CHAT, user["id"]))
+        async def verdict(api_, telethon_client, chat_ref, voter, known_chat_ids, log=print):
+            self.verdict_calls.append((chat_ref, voter["id"]))
             return self.verdict
 
         payload = voting.encode_ballot_link(ids) if isinstance(ids, list) else ids
         with patch.object(bot_listener, "_vote_verdict", verdict):
             asyncio.run(bot_listener.handle_vote_link_ballot(
-                api, None, message, CHAT, payload, log=lambda *_: None))
+                api, None, message, CHAT, payload, log=lambda *_: None,
+                member_chat=member_chat))
         return api.sent[-1]
 
     def _poll(self):
@@ -338,10 +338,15 @@ class LinkBallotTests(_Storage, unittest.TestCase):
         self._send(["202"])
         self.assertEqual(self._poll().votes, {str(VOTER["id"]): ["202"]})
 
-    def test_the_eligibility_check_is_asked_once(self):
+    def test_the_eligibility_check_is_asked_once_about_papka(self):
         _seed()
         self._send(["101"])
-        self.assertEqual(self.verdict_calls, 1)
+        self.assertEqual(self.verdict_calls, [("@papkahudojnicov", VOTER["id"])])
+
+    def test_without_a_member_chat_it_asks_about_the_tracked_chat(self):
+        _seed()
+        self._send(["101"], member_chat=None)
+        self.assertEqual(self.verdict_calls, [(CHAT, VOTER["id"])])
 
     def test_a_non_member_is_refused_and_invited_to_join(self):
         poll = _seed()

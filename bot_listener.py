@@ -906,58 +906,98 @@ async def _is_chat_member(api: TelegramBotAPI, chat_id: int, user_id: int) -> bo
 
 
 # One kept member list per chat (vote_eligibility.JoinDates), for the life of the process:
-# reading a chat's whole list is the expensive half of the voting rule, and one read
-# answers it for everybody already in the chat.
+# reading a whole member list is the expensive half of the voting rule, and one read
+# answers it for everybody in it.
 _VOTE_JOIN_DATES: dict[str, "vote_eligibility.JoinDates"] = {}
 
+# How many members one search by name may bring back. A common first name matches a lot
+# of people, and the one being looked for is among the first few either way.
+_VOTE_SEARCH_LIMIT = 200
 
-async def _fetch_vote_join_dates(telethon_client, entry: str) -> dict:
-    """Every current member of `entry` and when they joined, read by the userbot -- the
-    Bot API has no join date anywhere, while every Telethon member record carries one."""
-    if telethon_client is None:
-        raise ChatSummaryError("no Telethon session to read the member list with")
-    chat = await resolve_chat(telethon_client, entry)
+# getChatMember's errors that mean "no such member" rather than "could not ask".
+_NO_SUCH_MEMBER = re.compile(r"user not found|member not found|participant_id_invalid", re.I)
+
+
+def _join_dates_of(people) -> dict:
     dates = {}
-    async for person in telethon_client.iter_participants(chat):
+    for person in people:
         joined = vote_eligibility.join_date_of(getattr(person, "participant", None))
         if joined is not None:
             dates[person.id] = joined
     return dates
 
 
-def _vote_join_dates(telethon_client, entry: str, log=print) -> "vote_eligibility.JoinDates":
-    dates = _VOTE_JOIN_DATES.get(entry)
+async def _fetch_vote_join_dates(telethon_client, chat_ref: str) -> "vote_eligibility.MemberList":
+    """Every member of `chat_ref` the userbot is shown, and when they joined -- the Bot
+    API has no join date anywhere, while every Telethon member record carries one. A
+    group's list comes whole; Telegram hands out only part of a channel's, and the total
+    it reports beside the list says which one this read was."""
+    if telethon_client is None:
+        raise ChatSummaryError("no Telethon session to read the member list with")
+    chat = await resolve_chat(telethon_client, chat_ref)
+    people = await telethon_client.get_participants(chat)
+    total = getattr(people, "total", None)
+    return vote_eligibility.MemberList(
+        dates=_join_dates_of(people), complete=not total or len(people) >= total,
+    )
+
+
+async def _search_vote_join_dates(telethon_client, chat_ref: str, query: str) -> dict:
+    """The members of `chat_ref` whose name or @username matches `query`, with their join
+    dates -- for somebody a cut-short member list does not hold."""
+    if telethon_client is None:
+        raise ChatSummaryError("no Telethon session to search the member list with")
+    chat = await resolve_chat(telethon_client, chat_ref)
+    return _join_dates_of(
+        await telethon_client.get_participants(chat, search=query, limit=_VOTE_SEARCH_LIMIT)
+    )
+
+
+def _vote_join_dates(telethon_client, chat_ref: str, log=print) -> "vote_eligibility.JoinDates":
+    dates = _VOTE_JOIN_DATES.get(chat_ref)
     if dates is None:
         async def fetch():
-            return await _fetch_vote_join_dates(telethon_client, entry)
+            return await _fetch_vote_join_dates(telethon_client, chat_ref)
 
-        dates = _VOTE_JOIN_DATES[entry] = vote_eligibility.JoinDates(fetch, log=log)
+        async def search(query):
+            return await _search_vote_join_dates(telethon_client, chat_ref, query)
+
+        dates = _VOTE_JOIN_DATES[chat_ref] = vote_eligibility.JoinDates(fetch, search, log=log)
     return dates
 
 
 async def _vote_verdict(
-    api: TelegramBotAPI, telethon_client, entry: str | None, user_id, known_chat_ids: dict,
-    log=print,
+    api: TelegramBotAPI, telethon_client, chat_ref: str | None, user: dict,
+    known_chat_ids: dict, log=print,
 ) -> "vote_eligibility.Verdict":
-    """Whether this person may cast a ballot in any of the votes -- in the home chat for
-    at least vote_eligibility.MIN_MEMBERSHIP -- and, as part of the same answer, whether
-    they are in it at all (the subscription snapshot a ballot records). Fails closed: a
-    chat that cannot be resolved refuses the ballot as unverified."""
-    chat_id = (
-        await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
-        if entry and user_id is not None else None
-    )
-    if chat_id is None:
-        log("[bot_listener] vote eligibility: could not resolve the home chat.")
+    """Whether this person may cast a ballot in any of the votes -- a member of `chat_ref`
+    (Папка художников, cfg.vote_member_chat) for at least vote_eligibility.MIN_MEMBERSHIP
+    -- and, as part of the same answer, whether they are a member at all (the snapshot a
+    ballot records). Fails closed: a chat that cannot be asked refuses the ballot as
+    unverified rather than letting it through."""
+    user_id = user.get("id")
+    if not chat_ref or user_id is None:
         return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
+    # An @username or a numeric id is a chat id the Bot API takes as it is; anything else
+    # (the home chat's own reference, when no member chat is configured) is resolved.
+    if chat_ref.startswith("@") or chat_ref.lstrip("-").isdigit():
+        bot_chat_id = chat_ref
+    else:
+        bot_chat_id = await _resolve_chat_id(telethon_client, chat_ref, known_chat_ids, log=log)
+        if bot_chat_id is None:
+            log(f"[bot_listener] vote eligibility: could not resolve '{chat_ref}'.")
+            return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
     try:
-        member = await api.get_chat_member(chat_id, user_id)
-    except ChatSummaryError:
-        # The Bot API errors for somebody who never joined -- the same "not a member"
-        # _is_chat_member reads it as.
+        member = await api.get_chat_member(bot_chat_id, user_id)
+    except ChatSummaryError as e:
+        if not _NO_SUCH_MEMBER.search(str(e)):
+            # The bot cannot ask at all (not in that chat, say): telling everybody "join
+            # first" would be wrong, and the log is where the owner finds out why.
+            log(f"[bot_listener] vote eligibility: getChatMember in {chat_ref} failed: {e}")
+            return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
         member = None
     return await vote_eligibility.judge(
-        member, user_id, _vote_join_dates(telethon_client, entry, log=log), log=log,
+        member, user, _vote_join_dates(telethon_client, chat_ref, log=log), log=log,
     )
 
 
@@ -5289,6 +5329,7 @@ async def handle_vote_link_ballot(
     entry: str | None,
     payload: str,
     log=print,
+    member_chat: str | None = None,
 ) -> None:
     """A ballot cast from the browser page: "/start vote-<ids>" arriving in the DM, from
     the page's link or pasted by hand. The sender's Telegram account is the voter -- the
@@ -5297,7 +5338,7 @@ async def handle_vote_link_ballot(
     cast the last one.
 
     Every rule handle_ballot keeps is kept here, under the same voting.poll_lock: the
-    voter must have been in the chat for a day (vote_eligibility), the poll must be open, a
+    voter must have been in Папка художников for a day (vote_eligibility), the poll must be open, a
     locked ballot (allow_revote off) stays locked, and going over max_choices is refused
     rather than trimmed. A choice that is no longer admitted (the page was opened before
     moderation changed) is dropped and said so; a link with nothing valid left in it
@@ -5319,16 +5360,21 @@ async def handle_vote_link_ballot(
         return
 
     # The same rule the Mini App applies (vote_web.handle_ballot): only somebody who has
-    # been in the chat for a day. Its membership half is the snapshot the ballot records.
+    # been in Папка художников (`member_chat`) for a day. Its membership half is the
+    # snapshot the ballot records.
     try:
-        verdict = await _vote_verdict(api, telethon_client, entry, user["id"], {}, log=log)
+        verdict = await _vote_verdict(
+            api, telethon_client, member_chat or entry, user, {}, log=log,
+        )
     except Exception as e:
         log(f"[bot_listener] link ballot: eligibility check failed: {e}")
         verdict = vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
     if not verdict.can_vote:
         markup = None
         if verdict.reason == vote_eligibility.NOT_A_MEMBER:
-            markup = {"inline_keyboard": [[{"text": "Вступить в чат", "url": vote_web.SUBSCRIBE_URL}]]}
+            markup = {"inline_keyboard": [[
+                {"text": "Вступить в Папку художников", "url": vote_web.SUBSCRIBE_URL},
+            ]]}
         await reply(verdict.message() + "\nГолос не записан.", reply_markup=markup)
         return
     subscribed = verdict.is_member
@@ -12325,6 +12371,7 @@ async def _dispatch_update(
             await handle_vote_link_ballot(
                 api, telethon_client, message,
                 _stats_entry_for(chat, matched_entry, home_chat_ref), start_payload, log=log,
+                member_chat=getattr(cfg, "vote_member_chat", None),
             )
             return
         if start_payload == "hall":
@@ -13631,15 +13678,17 @@ async def run_bot_listener(
                 return False
             return await _is_chat_member(api, admin_chat_id, user_id)
 
+        # Whose members may vote: Папка художников (VOTE_MEMBER_CHAT), or the home chat
+        # itself when that setting is blank.
+        vote_member_ref = getattr(cfg, "vote_member_chat", None) or home_chat_ref
+
         async def _vote_eligibility(user: dict) -> vote_eligibility.Verdict:
             """Who may cast a ballot -- in /vote, the arena and the nominations alike: a
-            member of the home chat for at least a day (see vote_eligibility). Its
+            member of Папка художников for at least a day (see vote_eligibility). Its
             membership half is the snapshot a ballot records, so the ballot itself needs
             no second lookup."""
-            if not home_chat_ref:
-                return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
             return await _vote_verdict(
-                api, telethon_client, home_chat_ref, user.get("id"), known_chat_ids, log=log,
+                api, telethon_client, vote_member_ref, user, known_chat_ids, log=log,
             )
 
         async def _announce_vote_winner(user: dict, poll, standings: list) -> None:
