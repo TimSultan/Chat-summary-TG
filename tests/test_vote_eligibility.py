@@ -93,6 +93,11 @@ class InChatTests(unittest.TestCase):
         self.assertTrue(vote_eligibility.in_chat({"status": "restricted", "is_member": True}))
         self.assertFalse(vote_eligibility.in_chat({"status": "restricted", "is_member": False}))
 
+    def test_an_owner_or_admin_marked_as_not_a_member_is_not(self):
+        """An owner who left Папка художников keeps the ownership; voting needs membership."""
+        self.assertFalse(vote_eligibility.in_chat({"status": "creator", "is_member": False}))
+        self.assertFalse(vote_eligibility.in_chat({"status": "administrator", "is_member": False}))
+
     def test_left_kicked_and_a_failed_lookup_are_not(self):
         self.assertFalse(vote_eligibility.in_chat({"status": "left"}))
         self.assertFalse(vote_eligibility.in_chat({"status": "kicked"}))

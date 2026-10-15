@@ -71,8 +71,11 @@ def in_chat(member: dict | None) -> bool:
     """Whether a getChatMember answer says this person is in the chat. "restricted" is
     special-cased because Telegram uses that one status for two situations: a member under
     restrictions (still in the chat) and somebody who was restricted and then left. Only
-    the payload's is_member tells them apart."""
+    the payload's is_member tells them apart. Wherever is_member is given as false it wins
+    over the status: an owner who leaves stays the owner, and must not vote as a member."""
     if not isinstance(member, dict):
+        return False
+    if member.get("is_member") is False:
         return False
     status = member.get("status")
     if status == "restricted":
