@@ -845,14 +845,18 @@ inside Telegram that gets a signed identity to vote with.
 `@papkahudojnicov` by default — not the tracked chat) who joined it **at least 24 hours
 ago** (`vote_eligibility.py`), in every vote the bot runs — `/vote` in the Mini App and
 through its browser link, the arena and the nominations. Current membership comes from the
-Bot API's `getChatMember`, so the bot has to be in Папка художников (an admin, if it is a
-channel). The join date comes from the userbot's read of its member list (the Bot API has
-none), kept in memory and re-read only for somebody it does not list yet; when Telegram
-hands out only part of the list (a channel's), somebody missing from it is looked up by
-name. So the Telethon account has to be in Папка художников too (again an admin, if it is
-a channel). Administrators skip the join-date half. A check that cannot finish refuses
-the ballot with "попробуйте позже" rather than letting it through, and logs why. The page
-says up front why somebody cannot vote yet, and roughly how many hours are left.
+Bot API's `getChatMember`. The join date comes from the bot itself: Telegram tells an
+administrator bot about every join and leave (`chat_member` updates), and the bot writes
+the recent joins down (`voting/joins/`, kept two days). Somebody with no join written down
+was a member before the bot started watching, and may vote. So the bot has to be an
+**administrator** of Папка художников — it already is, if it posts the vote announcements
+to a channel; the startup log says either "watching who joins … the 24-hour voting rule is
+on" or a ⚠️ that only membership is being checked. Administrators skip the join-date half.
+A membership that cannot be checked refuses the ballot with "попробуйте позже" rather than
+letting it through, and logs why. The page says up front why somebody cannot vote yet, and
+roughly how many hours are left. (Reading the member list through the Telethon account was
+the first version: a channel shows its subscribers to its administrators only, so every
+member came back unverifiable.)
 
 Somebody who is not a member gets a **"Вступить в Папку художников"** button right under
 that notice (and Telegram's own popup with the same button when they tap a work). No API

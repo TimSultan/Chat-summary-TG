@@ -905,65 +905,57 @@ async def _is_chat_member(api: TelegramBotAPI, chat_id: int, user_id: int) -> bo
     return vote_eligibility.in_chat(member)
 
 
-# One kept member list per chat (vote_eligibility.JoinDates), for the life of the process:
-# reading a whole member list is the expensive half of the voting rule, and one read
-# answers it for everybody in it.
-_VOTE_JOIN_DATES: dict[str, "vote_eligibility.JoinDates"] = {}
-
-# How many members one search by name may bring back. A common first name matches a lot
-# of people, and the one being looked for is among the first few either way.
-_VOTE_SEARCH_LIMIT = 200
-
 # getChatMember's errors that mean "no such member" rather than "could not ask".
 _NO_SUCH_MEMBER = re.compile(r"user not found|member not found|participant_id_invalid", re.I)
 
-
-def _join_dates_of(people) -> dict:
-    dates = {}
-    for person in people:
-        joined = vote_eligibility.join_date_of(getattr(person, "participant", None))
-        if joined is not None:
-            dates[person.id] = joined
-    return dates
+# One JoinLog per voting member chat and storage place, for the life of the process: it
+# reads its file once and answers from memory after that.
+_VOTE_JOIN_LOGS: dict[Path, "vote_eligibility.JoinLog"] = {}
 
 
-async def _fetch_vote_join_dates(telethon_client, chat_ref: str) -> "vote_eligibility.MemberList":
-    """Every member of `chat_ref` the userbot is shown, and when they joined -- the Bot
-    API has no join date anywhere, while every Telethon member record carries one. A
-    group's list comes whole; Telegram hands out only part of a channel's, and the total
-    it reports beside the list says which one this read was."""
-    if telethon_client is None:
-        raise ChatSummaryError("no Telethon session to read the member list with")
-    chat = await resolve_chat(telethon_client, chat_ref)
-    people = await telethon_client.get_participants(chat)
-    total = getattr(people, "total", None)
-    return vote_eligibility.MemberList(
-        dates=_join_dates_of(people), complete=not total or len(people) >= total,
-    )
+def _vote_join_log(chat_ref: str) -> "vote_eligibility.JoinLog":
+    """The recent joins of `chat_ref` (Папка художников), as the bot saw them happen --
+    beside the polls, one level down so voting.latest_poll's glob never meets it."""
+    path = voting._voting_dir() / "joins" / f"{voting._poll_key(chat_ref)}.json"
+    log = _VOTE_JOIN_LOGS.get(path)
+    if log is None:
+        log = _VOTE_JOIN_LOGS[path] = vote_eligibility.JoinLog(path)
+    return log
 
 
-async def _search_vote_join_dates(telethon_client, chat_ref: str, query: str) -> dict:
-    """The members of `chat_ref` whose name or @username matches `query`, with their join
-    dates -- for somebody a cut-short member list does not hold."""
-    if telethon_client is None:
-        raise ChatSummaryError("no Telethon session to search the member list with")
-    chat = await resolve_chat(telethon_client, chat_ref)
-    return _join_dates_of(
-        await telethon_client.get_participants(chat, search=query, limit=_VOTE_SEARCH_LIMIT)
-    )
+async def _note_vote_member_update(
+    cfg, update: dict, home_chat_ref: str | None, known_chat_ids: dict, log=print,
+) -> None:
+    """One chat_member update: if it is Папка художников gaining or losing somebody, the
+    JoinLog writes it down -- the join date the voting rule needs and the Bot API
+    otherwise never gives. Every other chat's updates are of no interest here."""
+    chat_ref = getattr(cfg, "vote_member_chat", None) or home_chat_ref
+    chat = update.get("chat")
+    if not vote_eligibility.matches_chat(chat, chat_ref, known_chat_ids.get(chat_ref or "")):
+        return
+    change = await asyncio.to_thread(_vote_join_log(chat_ref).note, update)
+    if change:
+        user = (update.get("new_chat_member") or {}).get("user") or {}
+        log(f"[vote] {user.get('username') or user.get('id')} {change} {chat_ref}")
 
 
-def _vote_join_dates(telethon_client, chat_ref: str, log=print) -> "vote_eligibility.JoinDates":
-    dates = _VOTE_JOIN_DATES.get(chat_ref)
-    if dates is None:
-        async def fetch():
-            return await _fetch_vote_join_dates(telethon_client, chat_ref)
-
-        async def search(query):
-            return await _search_vote_join_dates(telethon_client, chat_ref, query)
-
-        dates = _VOTE_JOIN_DATES[chat_ref] = vote_eligibility.JoinDates(fetch, search, log=log)
-    return dates
+async def _check_vote_join_watch(api: TelegramBotAPI, chat_ref: str | None, bot_id, log=print) -> None:
+    """Says once, at startup, whether the bot can see who joins `chat_ref`: Telegram sends
+    joins and leaves only to an administrator bot. Without that, voting still requires
+    membership, but the day's wait has nothing to measure from -- worth a line in the
+    log rather than a silent gap."""
+    if not chat_ref or not (chat_ref.startswith("@") or chat_ref.lstrip("-").isdigit()):
+        return
+    try:
+        me = await api.get_chat_member(chat_ref, bot_id)
+    except Exception as e:  # noqa: BLE001 -- a startup note, never a startup failure
+        log(f"[vote] could not check the bot's rights in {chat_ref}: {e}")
+        return
+    if (me or {}).get("status") in ("administrator", "creator"):
+        log(f"[vote] watching who joins {chat_ref}: the 24-hour voting rule is on")
+    else:
+        log(f"[vote] ⚠️ the bot is not an administrator of {chat_ref}, so Telegram does not "
+            f"tell it who joins: voting checks membership only, not the 24 hours")
 
 
 async def _vote_verdict(
@@ -973,8 +965,9 @@ async def _vote_verdict(
     """Whether this person may cast a ballot in any of the votes -- a member of `chat_ref`
     (Папка художников, cfg.vote_member_chat) for at least vote_eligibility.MIN_MEMBERSHIP
     -- and, as part of the same answer, whether they are a member at all (the snapshot a
-    ballot records). Fails closed: a chat that cannot be asked refuses the ballot as
-    unverified rather than letting it through."""
+    ballot records). Membership is getChatMember's; the join date is the JoinLog's, and
+    no join written down means a member from before the bot was watching. Fails closed
+    on membership: a chat that cannot be asked refuses the ballot as unverified."""
     user_id = user.get("id")
     if not chat_ref or user_id is None:
         return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
@@ -996,9 +989,13 @@ async def _vote_verdict(
             log(f"[bot_listener] vote eligibility: getChatMember in {chat_ref} failed: {e}")
             return vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.UNVERIFIED)
         member = None
-    return await vote_eligibility.judge(
-        member, user, _vote_join_dates(telethon_client, chat_ref, log=log), log=log,
-    )
+    joined_at = None
+    if vote_eligibility.in_chat(member):
+        try:
+            joined_at = await asyncio.to_thread(_vote_join_log(chat_ref).joined_at, user_id)
+        except Exception as e:  # noqa: BLE001 -- an unreadable log is "no join written down"
+            log(f"[vote] could not read the join log for {chat_ref}: {e}")
+    return vote_eligibility.judge(member, joined_at)
 
 
 async def _can_manage_chat(
@@ -12169,6 +12166,10 @@ async def _dispatch_update(
     if reaction is not None:
         await handle_moderator_reaction(api, cfg, reaction, log=log)
         return
+    member_update = update.get("chat_member")
+    if member_update is not None:
+        await _note_vote_member_update(cfg, member_update, home_chat_ref, known_chat_ids, log=log)
+        return
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
@@ -13316,6 +13317,13 @@ async def run_bot_listener(
             f"STARTING WITH '{SUMMARY_COMMAND}' (summary) and every other command. FIFO queue delay: "
             f"{cfg.summary_queue_delay_seconds}s. Timezone: {tz}."
         )
+        # Whether the 24-hour voting rule can see who joins Папка художников -- in the
+        # background, so a slow answer never holds up the polling loop.
+        join_watch = asyncio.create_task(_check_vote_join_watch(
+            api, getattr(cfg, "vote_member_chat", None), me["id"], log=log,
+        ))
+        background_tasks.add(join_watch)
+        join_watch.add_done_callback(background_tasks.discard)
 
         async def _poll_loop():
             offset = None

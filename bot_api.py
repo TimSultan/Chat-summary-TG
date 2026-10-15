@@ -112,8 +112,10 @@ class TelegramBotAPI:
             timeout=timeout,
             # message_reaction is never delivered unless asked for by name, and only in a
             # chat where the bot is an administrator -- it carries the moderator's ✍️
-            # delete (see bot_listener.handle_moderator_reaction).
-            allowed_updates=["message", "callback_query", "message_reaction"],
+            # delete (see bot_listener.handle_moderator_reaction). chat_member is the same
+            # kind: joins and leaves, which the voting rule's 24 hours are measured from
+            # (see vote_eligibility.JoinLog).
+            allowed_updates=["message", "callback_query", "message_reaction", "chat_member"],
         )
 
     async def send_message(

@@ -5,50 +5,46 @@ leave is what a rigged contest looks like (see vote_audit), and a day's wait bet
 joining and voting takes the point out of it while costing a real member nothing. It
 applies to every vote the bot runs -- /vote in the Mini App and through its browser link,
 the arena, the nominations -- and each of them asks it through bot_listener, which owns
-the two Telegram clients the answer needs.
+the Bot API client the answer needs.
 
 The community is Папка художников (`VOTE_MEMBER_CHAT`, `@papkahudojnicov` by default),
 not the tracked chat the works are collected from: the people a contest is for are the
 ones who follow it there.
 
-Two questions, two sources:
+Two questions, two sources, both the bot's own:
 
 - Is this person in it NOW? The Bot API's getChatMember. Exact and current, but it carries
   no join date at all.
-- Since WHEN? The userbot (Telethon) can read the member list, and every record in it has
-  the date that member joined. One read covers everybody in it, so it is kept (JoinDates)
-  and read again only for somebody it does not list -- somebody who joined since -- and
-  then no more often than once per REFRESH_SECONDS. A list Telegram cuts short (a
-  channel's subscribers are not all handed out) cannot place somebody missing from it, so
-  that person is looked up by name instead.
+- Since WHEN? Telegram tells an administrator bot about every join and leave as it happens
+  (`chat_member` updates, each with its date), and the bot -- an administrator of Папка
+  художников, since it posts the vote announcements there -- writes the recent joins down
+  (JoinLog). Somebody with no join written down was a member before the bot started
+  watching, and may vote. Reading Telegram's member list instead was tried first: for a
+  channel only its administrators may read it, and a userbot that is not one left every
+  member unverifiable and nobody able to vote.
 
-A check that cannot be completed refuses the ballot ("unverified") rather than letting it
-through: a rule that quietly switches itself off whenever Telegram hiccups is not a rule.
-Administrators and the creator are trusted and skip the join-date half.
+A membership that cannot be checked refuses the ballot ("unverified") rather than letting
+it through. Administrators and the creator are trusted and skip the join-date half.
 """
 
-import asyncio
+import json
 import math
-import time
-from dataclasses import dataclass, field
+import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 # How long somebody must have been a member before their ballot counts.
 MIN_MEMBERSHIP = timedelta(hours=24)
+
+# A written-down join older than this is dropped: past MIN_MEMBERSHIP it decides nothing
+# that "no join written down" would not, and the day on top only spares the edge.
+KEEP_JOINS = MIN_MEMBERSHIP + timedelta(days=1)
 
 # Where somebody who is not a member is sent to join: every vote page's "Вступить" button
 # and the browser link's reply. Opened inside Telegram, it is the chat's own screen with
 # its own one-tap join -- no API joins a chat on a user's behalf.
 JOIN_URL = "https://t.me/papkahudojnicov"
-
-# The member list is read again at most this often, however many people it does not list
-# ask in that time -- a wave of fresh joiners opening the page costs one read, not one each.
-REFRESH_SECONDS = 30.0
-# A userbot that cannot connect does not raise, it waits; a voter must not wait with it.
-FETCH_TIMEOUT_SECONDS = 20.0
-# Lookups by name run side by side up to this many: a crowd opening the page at once must
-# not wait in single file, nor fire enough requests at once to earn a flood wait.
-SEARCH_CONCURRENCY = 4
 
 # Why a ballot is refused. None means it is not.
 NOT_A_MEMBER = "not_member"
@@ -59,20 +55,18 @@ UNVERIFIED = "unverified"
 _IN_CHAT_STATUSES = frozenset({"creator", "administrator", "member"})
 _TRUSTED_STATUSES = frozenset({"creator", "administrator"})
 
-# The join date given to a member record that has none -- only the creator's lacks one.
-FOUNDING = datetime.min.replace(tzinfo=timezone.utc)
-
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def in_chat(member: dict | None) -> bool:
-    """Whether a getChatMember answer says this person is in the chat. "restricted" is
-    special-cased because Telegram uses that one status for two situations: a member under
-    restrictions (still in the chat) and somebody who was restricted and then left. Only
-    the payload's is_member tells them apart. Wherever is_member is given as false it wins
-    over the status: an owner who leaves stays the owner, and must not vote as a member."""
+    """Whether a getChatMember answer (or either side of a chat_member update) says this
+    person is in the chat. "restricted" is special-cased because Telegram uses that one
+    status for two situations: a member under restrictions (still in the chat) and
+    somebody who was restricted and then left. Only the payload's is_member tells them
+    apart. Wherever is_member is given as false it wins over the status: an owner who
+    leaves stays the owner, and must not vote as a member."""
     if not isinstance(member, dict):
         return False
     if member.get("is_member") is False:
@@ -117,7 +111,7 @@ class Verdict:
             if self.eligible_at is not None:
                 text += f" Ваш голос можно будет отдать {_hours_left(self.eligible_at, now or _utcnow())}."
             return text
-        return ("Не получилось проверить, как давно вы в Папке художников. "
+        return ("Не получилось проверить, состоите ли вы в Папке художников. "
                 "Попробуйте ещё раз чуть позже.")
 
 
@@ -127,7 +121,7 @@ ALLOWED = Verdict(is_member=True)
 def membership_only(is_member):
     """A verdict from a plain membership answer, without the join-date half -- what a
     page mounted without bot_listener (a test, a local run) falls back to, since only
-    bot_listener can read join dates."""
+    bot_listener sees who joins when."""
     async def verdict(user: dict) -> Verdict:
         if await is_member(user):
             return ALLOWED
@@ -135,152 +129,113 @@ def membership_only(is_member):
     return verdict
 
 
-def search_queries(user: dict) -> list[str]:
-    """What to look a voter up by in a member list Telegram will not hand over whole: the
-    @username first (it names one account), then the full name, then the first name."""
-    full_name = " ".join(p for p in (user.get("first_name"), user.get("last_name")) if p)
-    queries: list[str] = []
-    for query in (user.get("username"), full_name, user.get("first_name")):
-        query = (query or "").strip()
-        if query and query not in queries:
-            queries.append(query)
-    return queries
-
-
-@dataclass(frozen=True)
-class MemberList:
-    """One read of the member list: who was in it and since when. `complete` says the
-    read saw everybody, which is what lets somebody missing from it be read as having
-    joined since -- a group's list comes whole, a channel's is cut short by Telegram."""
-
-    dates: dict = field(default_factory=dict)
-    complete: bool = True
-
-
-class JoinDates:
-    """When each member joined, from the userbot's reads of the member list.
-
-    `fetch` is an async callable returning a MemberList for the chat as it is right now;
-    `search` takes a name and returns {user_id: joined_at} for the members it matches.
-    Somebody already known is answered from memory -- a join date does not change while
-    they stay, and whether they still do is getChatMember's question, not this one's.
-    Somebody unknown makes the list be read again (one read at a time, at most once per
-    `refresh_seconds`), then a search by their name. Missing from both: if the last read
-    was complete they joined after it, reported as the moment it was read; if it was cut
-    short there is no telling, and the lookup raises.
-
-    The one thing a kept answer cannot see is a member who left and came back: they keep
-    their first date. That is somebody who has already spent a day as a member once, which
-    is not the account this rule is for.
-    """
-
-    def __init__(self, fetch, search=None, *, refresh_seconds: float = REFRESH_SECONDS,
-                 timeout: float = FETCH_TIMEOUT_SECONDS, clock=time.monotonic, now=_utcnow,
-                 log=print):
-        self._fetch = fetch
-        self._search = search
-        self._refresh_seconds = refresh_seconds
-        self._timeout = timeout
-        self._clock = clock
-        self._now = now
-        self._log = log
-        self._dates: dict[int, datetime] = {}
-        # Answers a search found. Kept apart, so a fresh read of the list does not forget
-        # the people it does not hold.
-        self._found: dict[int, datetime] = {}
-        self._complete = True
-        self._read_at: float | None = None
-        self._read_wall: datetime | None = None
-        self._lock = asyncio.Lock()
-        self._search_slots = asyncio.Semaphore(SEARCH_CONCURRENCY)
-
-    def _known(self, user_id: int) -> datetime | None:
-        known = self._dates.get(user_id)
-        return known if known is not None else self._found.get(user_id)
-
-    async def joined_at(self, user_id: int, queries=()) -> datetime:
-        """This member's join date. `queries` are the names to search for them by (see
-        search_queries). Raises if the list cannot be read, or cannot place them."""
-        user_id = int(user_id)
-        known = self._known(user_id)
-        if known is not None:
-            return known
-        async with self._lock:
-            # Whoever held the lock may have just read a list that has them.
-            known = self._known(user_id)
-            if known is not None:
-                return known
-            if self._read_at is None or self._clock() - self._read_at >= self._refresh_seconds:
-                listing = await asyncio.wait_for(self._fetch(), timeout=self._timeout)
-                self._dates = {int(k): v for k, v in listing.dates.items()}
-                self._complete = listing.complete
-                self._read_at = self._clock()
-                self._read_wall = self._now()
-                known = self._dates.get(user_id)
-                if known is not None:
-                    return known
-            complete, read_wall = self._complete, self._read_wall
-        found = await self._search_by_name(user_id, queries)
-        if found is not None:
-            return found
-        if complete:
-            # Expected for somebody who has just joined; for a long-standing member it
-            # means the userbot cannot see the whole list (hidden members, say).
-            self._log(f"[vote] {user_id} is a member but not in the member list read at "
-                      f"{read_wall:%Y-%m-%d %H:%M} UTC -- counted as joined since")
-            return read_wall
-        raise LookupError(
-            f"{user_id} is not in the part of the member list Telegram hands out, "
-            f"and no search by name found them"
-        )
-
-    async def _search_by_name(self, user_id: int, queries) -> datetime | None:
-        if self._search is None:
-            return None
-        for query in queries:
-            try:
-                async with self._search_slots:
-                    found = await asyncio.wait_for(self._search(query), timeout=self._timeout)
-            except Exception as e:  # noqa: BLE001 -- a failed search is a search that missed
-                self._log(f"[vote] searching the member list for {query!r} failed: "
-                          f"{type(e).__name__}: {e}")
-                continue
-            # Everybody a search turns up is somebody whose date is now known.
-            self._found.update({int(k): v for k, v in found.items()})
-            if user_id in self._found:
-                return self._found[user_id]
-        return None
-
-
-async def judge(member: dict | None, user: dict, join_dates: JoinDates,
-                now: datetime | None = None, log=print) -> Verdict:
+def judge(member: dict | None, joined_at: datetime | None,
+          now: datetime | None = None) -> Verdict:
     """The verdict for one person, from their getChatMember answer (None when Telegram
-    said there is no such member) and the join dates."""
+    said there is no such member) and the join the JoinLog has for them (None when it has
+    none: they were a member before the bot started watching)."""
     if not in_chat(member):
         return Verdict(is_member=False, reason=NOT_A_MEMBER)
-    if member.get("status") in _TRUSTED_STATUSES:
+    if member.get("status") in _TRUSTED_STATUSES or joined_at is None:
         return ALLOWED
-    user_id = user["id"]
-    try:
-        joined = await join_dates.joined_at(user_id, search_queries(user))
-    except Exception as e:  # noqa: BLE001 -- any failure to place them is "unverified"
-        log(f"[vote] could not tell when {user_id} joined: {type(e).__name__}: {e}")
-        return Verdict(is_member=True, reason=UNVERIFIED)
-    if joined.tzinfo is None:
-        joined = joined.replace(tzinfo=timezone.utc)
-    eligible_at = joined + MIN_MEMBERSHIP
+    eligible_at = joined_at + MIN_MEMBERSHIP
     if eligible_at <= (now or _utcnow()):
         return ALLOWED
     return Verdict(is_member=True, reason=TOO_NEW, eligible_at=eligible_at)
 
 
-def join_date_of(participant) -> datetime | None:
-    """A Telethon member record's join date: `date` on every kind a member list yields but
-    the creator's, which has none and gets FOUNDING. A restricted record that has left is
-    not a member, so None."""
-    if participant is None or getattr(participant, "left", False):
-        return None
-    date = getattr(participant, "date", None)
-    if date is None:
-        return FOUNDING
-    return date if date.tzinfo is not None else date.replace(tzinfo=timezone.utc)
+def matches_chat(chat: dict | None, chat_ref: str | None, chat_id=None) -> bool:
+    """Whether an update's chat is the one `chat_ref` names: an @username, a numeric id,
+    or (for any other reference) the already-resolved `chat_id`."""
+    if not isinstance(chat, dict) or not chat_ref:
+        return False
+    if chat_ref.startswith("@"):
+        return (chat.get("username") or "").lower() == chat_ref[1:].lower()
+    if chat_ref.lstrip("-").isdigit():
+        return str(chat.get("id")) == chat_ref
+    return chat_id is not None and chat.get("id") == chat_id
+
+
+class JoinLog:
+    """The recent joins of one chat, as the bot saw them happen -- {user_id: joined_at},
+    kept on disk so a restart does not forget who joined an hour ago.
+
+    Fed by note() with each chat_member update: a join writes the person down with the
+    update's date, a leave rubs them out (so coming back starts the day afresh). Joins
+    older than KEEP_JOINS are dropped on the way. Read once from disk, then answered from
+    memory; written only when something changed. Thread-safe, since callers on the event
+    loop hand the disk work to a worker thread.
+    """
+
+    def __init__(self, path: Path, now=_utcnow):
+        self._path = Path(path)
+        self._now = now
+        self._lock = threading.Lock()
+        self._joins: dict[str, datetime] | None = None
+        self.reads = 0
+        self.writes = 0
+
+    def _loaded(self) -> dict[str, datetime]:
+        if self._joins is None:
+            self.reads += 1
+            joins: dict[str, datetime] = {}
+            try:
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw = {}
+            for user_id, stamp in (raw if isinstance(raw, dict) else {}).items():
+                try:
+                    joins[str(user_id)] = datetime.fromisoformat(stamp)
+                except (TypeError, ValueError):
+                    continue
+            self._joins = joins
+        return self._joins
+
+    def _prune(self, joins: dict[str, datetime]) -> bool:
+        cutoff = self._now() - KEEP_JOINS
+        stale = [user_id for user_id, joined in joins.items() if joined < cutoff]
+        for user_id in stale:
+            del joins[user_id]
+        return bool(stale)
+
+    def _save(self, joins: dict[str, datetime]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self._path.with_suffix(".json.tmp")
+        temporary.write_text(
+            json.dumps({k: v.isoformat() for k, v in joins.items()}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temporary.replace(self._path)
+        self.writes += 1
+
+    def joined_at(self, user_id) -> datetime | None:
+        """When this person joined, if that was recent enough to be written down."""
+        with self._lock:
+            joined = self._loaded().get(str(user_id))
+        if joined is None or joined < self._now() - KEEP_JOINS:
+            return None
+        return joined
+
+    def note(self, update: dict) -> str | None:
+        """Takes one chat_member update (ChatMemberUpdated). Returns "joined", "left", or
+        None when it changed nothing this log keeps (a promotion, a restriction)."""
+        old, new = update.get("old_chat_member"), update.get("new_chat_member")
+        user = (new or {}).get("user") or {}
+        if user.get("id") is None:
+            return None
+        was_in, is_in = in_chat(old), in_chat(new)
+        if was_in == is_in:
+            return None
+        user_id = str(user["id"])
+        stamp = update.get("date")
+        with self._lock:
+            joins = self._loaded()
+            if is_in:
+                joins[user_id] = (datetime.fromtimestamp(int(stamp), timezone.utc)
+                                  if stamp else self._now())
+                changed, change = True, "joined"
+            else:
+                changed, change = joins.pop(user_id, None) is not None, "left"
+            if self._prune(joins) or changed:
+                self._save(joins)
+        return change
