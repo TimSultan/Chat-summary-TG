@@ -96,8 +96,8 @@ BROWSER_PATH = "/web"
 # re-parsing every poll file per request. Ten seconds is invisible to a voter and bounds
 # what a refresh-happy crowd (or anybody hammering the URL) can cost.
 PUBLIC_CACHE_SECONDS = 10.0
-# Where v1 invites a voter who is not subscribed. Same link the Mini App's prompt uses.
-SUBSCRIBE_URL = "https://t.me/papkahudojnicov"
+# Where a voter who is not in Папка художников is sent to join it (vote_eligibility).
+SUBSCRIBE_URL = vote_eligibility.JOIN_URL
 
 
 def _json_error(message: str, status: int = 400) -> web.Response:
@@ -224,10 +224,8 @@ async def handle_poll(request: web.Request) -> web.Response:
         "is_admin": admin_mode,
         "can_moderate": can_moderate,
         "can_view_vote_stats": can_view_vote_stats,
-        "is_subscriber": verdict.is_member,
         # Told up front, so a voter who cannot vote yet is not left to pick works first.
-        "can_vote": verdict.can_vote,
-        "vote_block": verdict.message(),
+        **_eligibility_payload(verdict),
         "me": voting.display_name(user),
         "my_vote": poll.votes.get(str(user["id"]), []),
         "voter_count": len(poll.votes),
@@ -247,6 +245,23 @@ async def handle_poll(request: web.Request) -> web.Response:
         # thing that reads it -- a voter's ballot has no use for how the export is framed.
         payload["crops"] = poll.crops
     return web.json_response(payload)
+
+
+def _eligibility_payload(verdict: vote_eligibility.Verdict) -> dict:
+    return {
+        "is_subscriber": verdict.is_member,
+        "can_vote": verdict.can_vote,
+        "vote_block": verdict.message(),
+    }
+
+
+async def handle_eligibility(request: web.Request) -> web.Response:
+    """Whether this voter may vote now, and nothing else. The page asks again when the
+    voter comes back to it from Папка художников, where its "Вступить" button sent them,
+    so the notice catches up at once -- without a reload, and without downloading the
+    whole poll again for three fields."""
+    user = await _authenticate(request)
+    return web.json_response(_eligibility_payload(await request.app[_ELIGIBILITY_KEY](user)))
 
 
 async def handle_ballot(request: web.Request) -> web.Response:
@@ -689,7 +704,8 @@ async def handle_avatar(request: web.Request) -> web.Response:
 
 async def handle_page(request: web.Request) -> web.Response:
     return web.Response(
-        text=PAGE_HTML.replace("__PREFIX__", request.app[_ROUTE_PREFIX_KEY]),
+        text=PAGE_HTML.replace("__PREFIX__", request.app[_ROUTE_PREFIX_KEY])
+        .replace("__JOIN_URL__", SUBSCRIBE_URL),
         content_type="text/html",
     )
 
@@ -843,6 +859,7 @@ def create_app(
         web.get(f"{prefix}/api/public", handle_public_poll),
         web.get(f"{prefix}/api/poll", handle_poll),
         web.post(f"{prefix}/api/ballot", handle_ballot),
+        web.get(f"{prefix}/api/eligibility", handle_eligibility),
         web.get(f"{prefix}/api/stats", handle_vote_stats),
         web.post(f"{prefix}/api/moderate", handle_moderate),
         web.post(f"{prefix}/api/crops", handle_crops),
@@ -1064,6 +1081,10 @@ PAGE_HTML = """<!doctype html>
      closed poll, or a voter who may not vote (yet) -- see can_vote. */
   .notice { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
             background: var(--card); color: var(--muted); font-size: 13px; text-align: center; }
+  /* "Вступить в Папку художников", right under the reason somebody cannot vote yet. */
+  .notice .joinButton { display: block; width: 100%; margin-top: 10px; padding: 11px; border: 0;
+                        border-radius: 9px; font: inherit; font-size: 15px; font-weight: 600;
+                        background: var(--accent); color: var(--accent-fg); cursor: pointer; }
   /* The acceptance confirmation for an immediate (allow_revote) vote -- fades on its own
      rather than waiting to be dismissed, since nothing about it needs a decision. */
   .confirmBanner { margin: 8px 12px 0; padding: 8px 12px; border-radius: 8px;
@@ -1177,7 +1198,7 @@ PAGE_HTML = """<!doctype html>
     <p id="subscribeText">Вступите в Папку художников — голосовать можно через сутки после вступления. С нами уже 500 художников по миниатюрам и не только</p>
     <div class="modalActions">
       <button class="cancel" id="subscribeClose">Позже</button>
-      <a id="subscribeLink" href="https://t.me/papkahudojnicov">Вступить</a>
+      <a id="subscribeLink" href="__JOIN_URL__">Вступить</a>
     </div>
   </div>
 </div>
@@ -1207,6 +1228,7 @@ function paintChrome(tg) {
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
+const JOIN_URL = "__JOIN_URL__";
 
 let poll = null;
 let picked = new Set();     // entry ids the voter chose (server-confirmed when allow_revote)
@@ -1287,6 +1309,87 @@ function openAuthorProfile(url) {
 function showSubscribePrompt() {
   $("subscribePrompt").hidden = false;
 }
+
+// ---- joining Папка художников ---------------------------------------------------------
+// No Telegram API joins a chat on somebody's behalf, so the fastest way in is to open the
+// chat inside Telegram itself, where its own "Вступить" is one tap -- and the Mini App
+// stays open behind it (Bot API 7.0+), so the voter comes back to this same page. When
+// they do, the page asks the server again (recheckEligibility) instead of leaving a stale
+// "join first" on screen.
+let joinPending = false;   // sent off to join; the next return to the page re-checks
+let joinedNow = false;     // came back a member: the notice says so before the 24-hour wait
+
+function openJoin() {
+  joinPending = true;
+  if (tg && tg.openTelegramLink) {
+    try { tg.openTelegramLink(JOIN_URL); return; } catch (e) {}
+  }
+  window.location.href = JOIN_URL;
+}
+
+// Telegram's own popup where the client has one (6.2+) -- it reads as part of Telegram, not
+// as the page's -- and the page's modal otherwise.
+function offerJoin() {
+  if (tg && tg.showPopup && tg.isVersionAtLeast && tg.isVersionAtLeast("6.2")) {
+    try {
+      tg.showPopup({
+        title: "Голосуют участники Папки художников",
+        message: "Вступите — проголосовать можно будет через сутки после вступления.",
+        buttons: [{ id: "join", type: "default", text: "Вступить" }, { type: "cancel" }],
+      }, (id) => { if (id === "join") openJoin(); });
+      return;
+    } catch (e) {}
+  }
+  showSubscribePrompt();
+}
+
+function renderVoteBlock(box) {
+  const text = (joinedNow ? "Готово, вы в Папке художников! " : "") +
+    (poll.vote_block || "Голосовать пока нельзя.");
+  box.innerHTML = esc(text) + (poll.is_subscriber === false
+    ? '<button class="joinButton" id="joinButton">Вступить в Папку художников</button>'
+    : "");
+  const button = $("joinButton");
+  if (button) button.addEventListener("click", openJoin);
+}
+
+let recheckInFlight = false;
+let lastRecheck = 0;
+
+async function recheckEligibility() {
+  if (!poll || !poll.poll_id || poll.is_admin || recheckInFlight) return;
+  if (!joinPending && !cannotVote()) return;
+  // "activated" and visibilitychange can both announce the same return.
+  if (Date.now() - lastRecheck < 1500) return;
+  recheckInFlight = true;
+  lastRecheck = Date.now();
+  try {
+    const response = await api("/api/eligibility");
+    if (!response.ok) return;
+    const data = await response.json();
+    const wasMember = poll.is_subscriber;
+    poll.is_subscriber = data.is_subscriber;
+    poll.can_vote = data.can_vote;
+    poll.vote_block = data.vote_block;
+    if (wasMember === false && data.is_subscriber) {
+      joinedNow = true;
+      joinPending = false;
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    }
+    updateButton();
+  } catch (e) {
+    // Nothing to show for it: the notice already on screen is still the last answer.
+  } finally {
+    recheckInFlight = false;
+  }
+}
+
+// "activated" is Telegram's own word for the Mini App being shown again (Bot API 8.0);
+// visibilitychange covers older clients and a plain browser.
+if (tg && tg.onEvent) tg.onEvent("activated", recheckEligibility);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") recheckEligibility();
+});
 
 function renderVoteChart(title, className, weeks, field) {
   const max = Math.max(1, ...weeks.map((week) => week[field] || 0));
@@ -1623,7 +1726,7 @@ function updateButton() {
   if (cannotVote()) {
     go.hidden = true;
     notice.hidden = false;
-    notice.textContent = poll.vote_block || "Голосовать пока нельзя.";
+    renderVoteBlock(notice);
     return;
   }
   notice.hidden = true;
@@ -2053,7 +2156,7 @@ async function onPickTap(id) {
     return;
   }
   if (cannotVote()) {
-    if (poll.is_subscriber === false) showSubscribePrompt();
+    if (poll.is_subscriber === false) offerJoin();
     else alert(poll.vote_block || "Голосовать пока нельзя.");
     return;
   }
@@ -2134,9 +2237,8 @@ $("go").addEventListener("click", async () => {
 $("subscribeClose").addEventListener("click", () => { $("subscribePrompt").hidden = true; });
 $("subscribeLink").addEventListener("click", (event) => {
   event.preventDefault();
-  const url = event.currentTarget.href;
-  if (tg && tg.openTelegramLink) tg.openTelegramLink(url);
-  else window.location.href = url;
+  $("subscribePrompt").hidden = true;
+  openJoin();
 });
 $("voteStatsClose").addEventListener("click", () => { $("voteStats").hidden = true; });
 $("statsButton").addEventListener("click", async () => {

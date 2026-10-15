@@ -195,7 +195,8 @@ async def handle_ballot(request: web.Request) -> web.Response:
     user = await _authenticate(request, body)
     verdict = await request.app[_ELIGIBILITY_KEY](user)
     if not verdict.can_vote:
-        return _json_error(verdict.message(), status=403)
+        # The reason travels too, so the page can offer a non-member the way in.
+        return web.json_response({"error": verdict.message(), "reason": verdict.reason}, status=403)
     entry = request.app[_ENTRY_KEY]
     nomination_id = body.get("nomination_id")
     choices = body.get("choices")
@@ -328,7 +329,8 @@ async def handle_avatar(request: web.Request) -> web.Response:
 
 async def handle_page(request: web.Request) -> web.Response:
     return web.Response(
-        text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY]),
+        text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY])
+        .replace("__JOIN_URL__", vote_eligibility.JOIN_URL),
         content_type="text/html",
     )
 
@@ -777,8 +779,37 @@ async function call(path, body) {
   const response = await fetch(PREFIX + path, options);
   let data = {};
   try { data = await response.json(); } catch (e) {}
-  if (!response.ok) throw new Error(data.error || "Не получилось — попробуйте ещё раз");
+  if (!response.ok) {
+    const error = new Error(data.error || "Не получилось — попробуйте ещё раз");
+    error.reason = data.reason;
+    throw error;
+  }
   return data;
+}
+
+// A ballot refused because the voter is not in Папка художников offers the way in: the
+// chat opened inside Telegram, where joining is one tap (no API joins on their behalf).
+const JOIN_URL = "__JOIN_URL__";
+
+function openJoin() {
+  if (tg && tg.openTelegramLink) {
+    try { tg.openTelegramLink(JOIN_URL); return; } catch (e) {}
+  }
+  window.location.href = JOIN_URL;
+}
+
+function offerJoin(message) {
+  if (tg && tg.showPopup && tg.isVersionAtLeast && tg.isVersionAtLeast("6.2")) {
+    try {
+      tg.showPopup({
+        title: "Голосуют участники Папки художников",
+        message: "Вступите — проголосовать можно будет через сутки после вступления.",
+        buttons: [{ id: "join", type: "default", text: "Вступить" }, { type: "cancel" }],
+      }, (id) => { if (id === "join") openJoin(); });
+      return;
+    } catch (e) {}
+  }
+  if (confirm(message + "\\n\\nВступить в Папку художников?")) openJoin();
 }
 
 function nom(id) { return state.nominations.find((n) => n.id === id) || null; }
@@ -1172,7 +1203,8 @@ async function vote(id) {
     Object.assign(n, data.nomination);
   } catch (e) {
     ballotInFlight = false;
-    toast(String(e.message || e), true);
+    if (e.reason === "not_member") offerJoin(String(e.message || e));
+    else toast(String(e.message || e), true);
     // Most refusals mean the page is out of date (the vote closed, the nomination was
     // edited or deleted), so it is brought up to date rather than left showing a lie.
     await reload().catch(() => {});

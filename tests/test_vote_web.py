@@ -392,6 +392,47 @@ class VoteApiTests(AsyncTestCase):
         self.assertIn("function cannotVote()", page)
         self.assertIn("poll.vote_block", page)
 
+    async def test_the_page_offers_a_non_member_the_way_into_papka(self):
+        """A "Вступить" button under the reason, opening Папка художников inside Telegram
+        (the Mini App stays open behind it), Telegram's own popup on a tapped work, and a
+        fresh question to the server when the voter comes back."""
+        page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
+        self.assertNotIn("__JOIN_URL__", page)
+        self.assertIn(f'const JOIN_URL = "{vote_eligibility.JOIN_URL}";', page)
+        self.assertIn("tg.openTelegramLink(JOIN_URL)", page)
+        self.assertIn("Вступить в Папку художников", page)
+        self.assertIn("tg.showPopup(", page)
+        self.assertIn('tg.onEvent("activated", recheckEligibility)', page)
+        self.assertIn('api("/api/eligibility")', page)
+
+    async def test_the_eligibility_route_answers_the_three_fields_and_no_more(self):
+        not_member = vote_eligibility.Verdict(is_member=False, reason=vote_eligibility.NOT_A_MEMBER)
+        too_new = vote_eligibility.Verdict(
+            is_member=True, reason=vote_eligibility.TOO_NEW,
+            eligible_at=datetime.now(timezone.utc) + timedelta(hours=2),
+        )
+        calls = []
+        verdicts = {self.voter_id: not_member}
+        app = self._eligibility_app(verdicts, calls)
+        async with TestClient(TestServer(app)) as client:
+            unsigned = await client.get(f"{vote_web.ROUTE_PREFIX}/api/eligibility")
+            before = await (await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/eligibility",
+                headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+            )).json()
+            verdicts[self.voter_id] = too_new  # joined in the meantime
+            after = await (await client.get(
+                f"{vote_web.ROUTE_PREFIX}/api/eligibility",
+                headers={"X-Telegram-Init-Data": _init_data(self.voter_id)},
+            )).json()
+
+        self.assertEqual(unsigned.status, 401)
+        self.assertEqual(set(before), {"is_subscriber", "can_vote", "vote_block"})
+        self.assertEqual((before["is_subscriber"], before["can_vote"]), (False, False))
+        self.assertEqual((after["is_subscriber"], after["can_vote"]), (True, False))
+        self.assertIn("примерно через 2 ч", after["vote_block"])
+        self.assertEqual(calls, [self.voter_id, self.voter_id])
+
     async def test_the_poll_payload_reports_subscription_status(self):
         self._seed_poll(approved=("a",))
         response = await self.client.get(

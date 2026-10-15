@@ -8,6 +8,10 @@ prove the two systems coexist on one server without colliding.
 import hashlib
 import hmac
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -125,6 +129,13 @@ class ArenaApiTests(AsyncTestCase):
         response = await self.client.get(arena_web.ROUTE_PREFIX)
         self.assertEqual(response.status, 200)
         self.assertIn("telegram-web-app.js", await response.text())
+
+    async def test_the_page_offers_a_non_member_the_way_into_papka(self):
+        page = await (await self.client.get(arena_web.ROUTE_PREFIX)).text()
+        self.assertNotIn("__JOIN_URL__", page)
+        self.assertIn(f'const JOIN_URL = "{vote_eligibility.JOIN_URL}";', page)
+        self.assertIn("Вступить в Папку художников", page)
+        self.assertIn('tg.onEvent("activated", onReturn)', page)
 
     async def test_a_duel_offers_a_way_back_and_no_way_to_call_it_level(self):
         """A duel asks which is better; "Ничья" made not choosing the easiest answer on
@@ -462,6 +473,28 @@ class ArenaApiTests(AsyncTestCase):
     async def test_media_outside_the_arena_directory_is_not_reachable(self):
         response = await self.client.get(arena_web.ROUTE_PREFIX + f"/media/{TID}/../../secrets.txt")
         self.assertIn(response.status, (400, 403, 404))
+
+
+
+class PageScriptSyntaxTests(unittest.TestCase):
+    """One broken literal in the page's script and the arena opens blank while every route
+    still answers 200 -- parsed by node, as test_nominations_web does for v3's page."""
+
+    def test_the_page_is_valid_javascript(self):
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to parse the page")
+        page = arena_web.PAGE_HTML.replace("__PREFIX__", arena_web.ROUTE_PREFIX)
+        scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+        self.assertEqual(len(scripts), 1)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(scripts[0])
+            path = handle.name
+        try:
+            result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

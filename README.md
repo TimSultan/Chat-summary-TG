@@ -854,6 +854,15 @@ a channel). Administrators skip the join-date half. A check that cannot finish r
 the ballot with "попробуйте позже" rather than letting it through, and logs why. The page
 says up front why somebody cannot vote yet, and roughly how many hours are left.
 
+Somebody who is not a member gets a **"Вступить в Папку художников"** button right under
+that notice (and Telegram's own popup with the same button when they tap a work). No API
+joins a chat on a user's behalf, so the button opens Папка художников inside Telegram
+(`Telegram.WebApp.openTelegramLink`), where joining is its own one tap; the Mini App stays
+open behind it, and when the voter comes back (`activated`, or `visibilitychange` on older
+clients) the page asks `/vote/api/eligibility` again and says "Готово, вы в Папке
+художников!" with the hours left to wait. The arena and the nominations offer the same
+button; the browser link's DM reply carries it as an inline button.
+
 Six distinct things live behind `/vote` (or `/голосование`), kept apart rather than one
 page that changes shape depending on who opens it:
 

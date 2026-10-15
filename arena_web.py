@@ -413,7 +413,8 @@ async def handle_media(request: web.Request) -> web.Response:
 
 async def handle_page(request: web.Request) -> web.Response:
     return web.Response(
-        text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY]),
+        text=PAGE_HTML.replace("__PREFIX__", request.app[_PREFIX_KEY])
+        .replace("__JOIN_URL__", vote_eligibility.JOIN_URL),
         content_type="text/html",
     )
 
@@ -494,6 +495,10 @@ PAGE_HTML = """<!doctype html>
   h1 { font-size: 17px; margin: 0 0 2px; }
   .sub { color: var(--muted); font-size: 13px; }
   .msg { padding: 28px 16px; color: var(--muted); text-align: center; }
+  .msg .joinButton { display: block; width: 100%; max-width: 360px; margin: 14px auto 0;
+                     padding: 12px; border: 0; border-radius: 10px; font: inherit;
+                     font-size: 15px; font-weight: 600; background: var(--accent);
+                     color: var(--accent-fg); cursor: pointer; }
 
   /* The vote itself: two works, one tap. Stacked rather than side by side -- a phone is
      tall, and half a phone's width per picture is not enough to judge anything by. */
@@ -702,6 +707,7 @@ function paintChrome(tg) {
 const tg = window.Telegram && window.Telegram.WebApp;
 if (tg) { tg.ready(); tg.expand(); paintChrome(tg); }
 const initData = (tg && tg.initData) || "";
+const JOIN_URL = "__JOIN_URL__";
 
 let state = null;
 let ballot = null;
@@ -1231,6 +1237,52 @@ $("clear").addEventListener("click", async () => {
 
 /* -------------------------------- load -------------------------------- */
 
+/* --------------------------- joining Папка художников --------------------------- */
+// Same arrangement as the vote page: no API joins a chat for somebody, so the button opens
+// it inside Telegram, where joining is one tap, and the arena stays open behind it. Coming
+// back, the page loads its state again, so the notice catches up without a reload.
+let joinPending = false;
+let joinedNow = false;
+
+function openJoin() {
+  joinPending = true;
+  if (tg && tg.openTelegramLink) {
+    try { tg.openTelegramLink(JOIN_URL); return; } catch (e) {}
+  }
+  window.location.href = JOIN_URL;
+}
+
+function renderVoteBlock() {
+  const text = (joinedNow ? "Готово, вы в Папке художников! " : "") +
+    (state.vote_block || "Голосовать могут только участники Папки художников.");
+  $("msg").innerHTML = esc(text) + (state.is_member === false
+    ? '<button class="joinButton" id="joinButton">Вступить в Папку художников</button>'
+    : "");
+  const button = $("joinButton");
+  if (button) button.addEventListener("click", openJoin);
+}
+
+let lastReturn = 0;
+function onReturn() {
+  if (!state || state.is_admin) return;
+  if (!joinPending && state.can_vote !== false) return;
+  if (Date.now() - lastReturn < 1500) return;   // "activated" and visibilitychange both fire
+  lastReturn = Date.now();
+  const wasMember = state.is_member;
+  load().then(() => {
+    if (wasMember === false && state && state.is_member) {
+      joinPending = false;
+      joinedNow = true;
+      if (state.can_vote === false) renderVoteBlock();
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    }
+  });
+}
+if (tg && tg.onEvent) tg.onEvent("activated", onReturn);
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") onReturn();
+});
+
 async function load() {
   try {
     const mode = new URLSearchParams(location.search).get("mode");
@@ -1275,10 +1327,11 @@ async function load() {
     if (state.can_vote === false) {
       $("sub").textContent = "";
       $("msg").hidden = false;
-      $("msg").textContent = state.vote_block || "Голосовать могут только участники Папки художников.";
+      renderVoteBlock();
       $("go").hidden = true;
       return;
     }
+    joinedNow = false;
     $("go").hidden = true;
     if (state.can_moderate) $("sub").textContent = "модерация: /vote2 выбрать";
     // Somebody coming back to a ballot they already closed is told so, and shown the top of

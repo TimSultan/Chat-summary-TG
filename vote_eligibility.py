@@ -36,6 +36,11 @@ from datetime import datetime, timedelta, timezone
 # How long somebody must have been a member before their ballot counts.
 MIN_MEMBERSHIP = timedelta(hours=24)
 
+# Where somebody who is not a member is sent to join: every vote page's "Вступить" button
+# and the browser link's reply. Opened inside Telegram, it is the chat's own screen with
+# its own one-tap join -- no API joins a chat on a user's behalf.
+JOIN_URL = "https://t.me/papkahudojnicov"
+
 # The member list is read again at most this often, however many people it does not list
 # ask in that time -- a wave of fresh joiners opening the page costs one read, not one each.
 REFRESH_SECONDS = 30.0

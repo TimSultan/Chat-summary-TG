@@ -250,7 +250,10 @@ class NominationsApiTests(AsyncTestCase):
         stranger = await self._post("ballot", OTHER, nomination_id=ids["Аниме"], choices=["1"])
         self.assertEqual((too_new.status, stranger.status), (403, 403))
         self.assertIn("примерно через 10 ч", (await too_new.json())["error"])
-        self.assertIn("не меньше суток", (await stranger.json())["error"])
+        refused = await stranger.json()
+        self.assertIn("не меньше суток", refused["error"])
+        # The page tells a non-member apart, to offer them the way in.
+        self.assertEqual(refused["reason"], vote_eligibility.NOT_A_MEMBER)
         self.assertEqual(nominations.load_contest(CHAT).nomination(ids["Аниме"]).votes, {})
         self.assertEqual(vote_audit.read_events(CHAT, system="v3"), [])
 
