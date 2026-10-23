@@ -61,6 +61,8 @@ import voting
 # What the results records of imported weeks say they came from.
 SOURCE = "telegram_poll"
 
+CONTEST, PLAIN = "contest", "plain"   # see poll_kind
+
 READY = "ready"            # will be written
 KNOWN = "known"            # the hall or the results already have this week
 HIDDEN = "hidden"          # Telegram does not show this account the poll's results
@@ -78,6 +80,9 @@ POST_LOOKAHEAD = timedelta(days=2)
 # At most this many of a difference hash's 64 bits may differ for two pictures to be the
 # same work. Two unrelated photos differ in about 32.
 HASH_MATCH_BITS = 10
+# A poll that names no contest is still one when its author posted it this close to a
+# contest poll: the second half of a field too big for one poll.
+SPLIT_POLL_GAP = timedelta(hours=2)
 # Somebody who added this many options to one open poll is its organiser, not an author.
 ORGANISER_OPTIONS = 3
 # A poll posted Monday to Wednesday is about the week before it (the nearest Sunday is
@@ -145,6 +150,18 @@ def option_number(text: str) -> int | None:
     """The number of an option that is nothing but a number: "1", "№2", "3️⃣", "Работа 4"."""
     match = _NUMBERED.match(_plain(text))
     return int(match.group(1)) if match else None
+
+
+def album_offset(numbers: list[int], album_size: int) -> int:
+    """What to subtract from an option's number to find its photo in the album before the
+    poll. Nothing, normally; but the second part of a split poll may carry the numbering
+    on ("11".."15") under an album of its own five photos, and then its first number is
+    the album's first photo."""
+    if not numbers or max(numbers) <= album_size:
+        return 0
+    if max(numbers) - min(numbers) + 1 <= album_size:
+        return min(numbers) - 1
+    return 0
 
 
 def clean_option_text(text: str) -> str:
@@ -366,19 +383,48 @@ async def _presentation_album(client, entity, poll_message, directory: Path, log
     return album
 
 
-async def _read_poll(client, entity, message, tz, directory: Path, people: dict, log) -> dict | None:
-    """One poll as a plain dict, its pictures downloaded -- or None when it is not a
-    contest (a quiz, a single option, no pictures and a question that is about something
-    else)."""
-    media = getattr(message, "media", None)
-    poll = getattr(media, "poll", None)
+def poll_kind(message) -> str | None:
+    """CONTEST for a poll that is a contest on its own (pictures on its options, or a
+    question naming the contest); PLAIN for any other poll that could still be one part
+    of a split contest; None for what never is (a quiz, a single option)."""
+    poll = getattr(getattr(message, "media", None), "poll", None)
     if poll is None or getattr(poll, "quiz", False):
         return None
     answers = list(getattr(poll, "answers", None) or [])
+    if len(answers) < MIN_OPTIONS:
+        return None
     question = _text_of(getattr(poll, "question", ""))
     pictured = sum(1 for answer in answers if _is_picture(getattr(answer, "media", None)))
-    if len(answers) < MIN_OPTIONS or (pictured < MIN_PICTURED_OPTIONS and not CONTEST_QUESTION.search(question)):
-        return None
+    if pictured >= MIN_PICTURED_OPTIONS or CONTEST_QUESTION.search(question):
+        return CONTEST
+    return PLAIN
+
+
+def contest_polls(messages: list) -> list:
+    """The polls among `messages` that are contests: every one that is a contest on its
+    own, and every other poll its author posted within SPLIT_POLL_GAP of one -- the
+    second half of a field too big for one poll, whose question ("Часть 2") need not
+    name the contest. Oldest first."""
+    kinds = {message.id: poll_kind(message) for message in messages}
+    anchors = [m for m in messages if kinds[m.id] == CONTEST]
+    kept = []
+    for message in sorted(messages, key=lambda m: m.id):
+        kind = kinds[message.id]
+        if kind == CONTEST or (kind == PLAIN and any(
+            getattr(anchor, "sender_id", None) == getattr(message, "sender_id", None)
+            and abs(anchor.date - message.date) <= SPLIT_POLL_GAP
+            for anchor in anchors
+        )):
+            kept.append(message)
+    return kept
+
+
+async def _read_poll(client, entity, message, tz, directory: Path, people: dict, log) -> dict:
+    """One contest poll as a plain dict, its pictures downloaded."""
+    media = getattr(message, "media", None)
+    poll = media.poll
+    answers = list(getattr(poll, "answers", None) or [])
+    question = _text_of(getattr(poll, "question", ""))
 
     results = getattr(media, "results", None)
     counts = _counts(results)
@@ -416,12 +462,14 @@ async def _read_poll(client, entity, message, tz, directory: Path, people: dict,
         })
 
     # A numbered poll: its options are "1", "2", ... and the pictures are the album before it.
-    if any(o["photo"] is None and option_number(o["text"]) for o in options):
+    numbers = [option_number(o["text"]) for o in options if o["photo"] is None and option_number(o["text"])]
+    if numbers:
         album = await _presentation_album(client, entity, message, directory, log)
+        offset = album_offset(numbers, len(album))
         for option in options:
             number = option_number(option["text"])
-            if option["photo"] is None and number and 1 <= number <= len(album):
-                picture = album[number - 1]
+            if option["photo"] is None and number and 1 <= number - offset <= len(album):
+                picture = album[number - offset - 1]
                 option.update(photo=picture["photo"], caption=picture["caption"],
                               forwarded_from=picture["forwarded_from"])
 
@@ -473,19 +521,20 @@ async def scan_chat(
     if until is not None:
         listing["offset_date"] = until.astimezone(timezone.utc)
     people: dict[str, dict] = {}
-    polls, seen = [], 0
+    polls = []
     await say("Ищу опросы в чате…")
+    listed = []
     async for message in client.iter_messages(entity, **listing):
         if getattr(getattr(message, "media", None), "poll", None) is None:
             continue
         if until is not None and message.date >= until:
             continue
-        seen += 1
-        read = await _read_poll(client, entity, message, tz, directory, people, log)
-        if read is not None:
-            polls.append(read)
-            await say(f"Нашёл конкурсов-опросов: {len(polls)} (всего опросов: {seen}). Качаю картинки…")
-    polls.sort(key=lambda p: p["message_id"])
+        listed.append(message)
+    seen = len(listed)
+    chosen = contest_polls(listed)
+    for position, message in enumerate(chosen, start=1):
+        await say(f"Конкурсов-опросов: {len(chosen)} (всего опросов: {seen}). Качаю картинки: {position} из {len(chosen)}…")
+        polls.append(await _read_poll(client, entity, message, tz, directory, people, log))
 
     posts: list[voting.Entry] = []
     if polls:
@@ -872,6 +921,17 @@ def _short_date(text: str) -> str:
     return when.strftime("%d.%m.%Y") if when else ""
 
 
+def _count(number: int, one: str, few: str, many: str) -> str:
+    """"2 опроса", "5 работ", "21 работа" -- Russian plural, teens included."""
+    if 11 <= number % 100 <= 14 or number % 10 == 0 or number % 10 >= 5:
+        word = many
+    elif number % 10 == 1:
+        word = one
+    else:
+        word = few
+    return f"{number} {word}"
+
+
 def _who(entry: voting.Entry) -> str:
     return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
 
@@ -999,6 +1059,8 @@ def _weekly_winners(entry: str, written: list[str], giver_id, giver_name: str) -
     return {
         "status": "ok",
         "awarded": sorted(week for week, status in statuses.items() if status == "awarded"),
+        "numbers": {contest_id: number_of[contest_id] for contest_id in written
+                    if statuses.get(number_of.get(contest_id)) == "awarded"},
         "unnamed": unnamed,
         "next": len(weekly) + 1,
     }
@@ -1015,7 +1077,7 @@ def apply_plan(entry: str, *, giver_id=0, giver_name: str = "", log=print) -> di
         return {"error": "no plan"}
     known, _ = known_contests(entry)
     source = cache_dir(entry)
-    written, works = [], 0
+    written, works, summaries = [], 0, []
     now = datetime.now(timezone.utc).isoformat()
     for raw in plan.get("contests") or []:
         contest = PlannedContest.from_dict(raw)
@@ -1037,12 +1099,18 @@ def apply_plan(entry: str, *, giver_id=0, giver_name: str = "", log=print) -> di
         if path is not None:
             written.append(contest.poll_id)
             works += len(standings)
+            top = contest.works[0]
+            summaries.append({
+                "poll_id": contest.poll_id, "label": contest.label(), "date": contest.created_at,
+                "polls": len(contest.poll_message_ids), "works": len(standings),
+                "winner": _who(top.entry) if top.votes > 0 else None, "votes": top.votes,
+            })
     if not written:
-        return {"written": [], "works": 0, "hall": None, "winners": {"status": "none"}}
+        return {"written": [], "works": 0, "contests": [], "hall": None, "winners": {"status": "none"}}
     hall = hall_of_fame.import_history(entry)
     winners = _weekly_winners(entry, written, giver_id, giver_name)
     log(f"[legacy] wrote {len(written)} contest(s), {works} work(s); hall {hall}; winners {winners}")
-    return {"written": written, "works": works, "hall": hall, "winners": winners}
+    return {"written": written, "works": works, "contests": summaries, "hall": hall, "winners": winners}
 
 
 def apply_report(result: dict) -> str:
@@ -1052,8 +1120,21 @@ def apply_report(result: dict) -> str:
     written = result.get("written") or []
     if not written:
         return "Нечего записывать: все найденные конкурсы уже на Доске почёта."
-    lines = [f"Готово. Записано конкурсов: {len(written)} ({', '.join(written)}), работ: {result.get('works', 0)}."]
     winners = result.get("winners") or {}
+    numbers = winners.get("numbers") or {}
+    lines = [f"Готово. Записано конкурсов: {len(written)}, работ: {result.get('works', 0)}.", "", "Победители:"]
+    for contest in result.get("contests") or []:
+        head = f"{contest['poll_id']} · {_short_date(contest['date'])}"
+        if contest["label"] != voting.WEEKLY_CONTEST_TITLE:
+            head += f" · «{contest['label']}»"
+        if contest["polls"] > 1:
+            head += f" ({_count(contest['polls'], 'опрос', 'опроса', 'опросов')}, " \
+                    f"{_count(contest['works'], 'работа', 'работы', 'работ')})"
+        who = (f"🥇 {contest['winner']} — {voting.votes_label(contest['votes'])}"
+               if contest["winner"] else "голосов никто не набрал")
+        number = f" · №{numbers[contest['poll_id']]}" if contest["poll_id"] in numbers else ""
+        lines.append(f"• {head} — {who}{number}")
+    lines.append("")
     if winners.get("status") == "ok":
         awarded = winners.get("awarded") or []
         if awarded:

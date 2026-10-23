@@ -1177,12 +1177,15 @@ was best, the works' pictures on its options. `/hall опросы` (DM, administ
   week the bot ran itself — one cheap listing, not a read of the whole history. A poll is a
   contest when two or more of its options carry a picture, or when its question names the
   contest ("итоги", "конкурс", "голосование", "лучшая работа"); "что заказываем на стрим?"
-  is passed over. Polls of one week (a field split over two polls) are one contest; a poll
-  posted Monday to Wednesday counts for the week before. A question with its own hashtag is
-  that thematic contest.
+  is passed over. Polls of one week and hashtag are one contest — a field too big for one
+  poll, split in two, is ranked as one field — and a second part whose question names no
+  contest ("Часть 2") still counts when the same person posted it within two hours of the
+  first. A poll posted Monday to Wednesday counts for the week before. A question with its
+  own hashtag is that thematic contest.
 - **Loads the works.** Every option's picture, and every `#итогинедели` post of the two weeks
   before each poll (Telegram's search, the whole album of each). A numbered poll — options
-  "1", "2", "3" — takes its pictures from the album the organiser posted just before it.
+  "1", "2", "3" — takes its pictures from the album the organiser posted just before it; a
+  second part may restart its numbering or carry it on ("11".."15") under its own album.
 - **Matches them to people**, strongest evidence first: a mention or an `@tag` in the
   option; the option's picture being one of the week's posts (a 64-bit difference hash,
   which survives Telegram recompressing the same photo); whoever added the option to an
@@ -1201,7 +1204,8 @@ was best, the works' pictures on its options. `/hall опросы` (DM, administ
   go into `/weekwinner`'s numbered table too — reputation and the 🏆 in `/stat` — but only
   while that table's numbering agrees with the order of the weeks (its №1 is the hall's first
   week, and so on); otherwise the table is left alone and the reply says so. A week already
-  recorded is never overwritten, so a second run writes nothing.
+  recorded is never overwritten, so a second run writes nothing. The reply lists every week
+  it wrote with its winner, their votes and their `/weekwinner` number.
 
 A lost option picture comes back from the poll itself, as a post's photos come back from the
 post (`/hall импорт`).

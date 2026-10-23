@@ -269,6 +269,12 @@ class TextTests(unittest.TestCase):
         self.assertEqual(legacy.contest_week(datetime(2026, 7, 27, 9)), "2026-W30")    # Monday after
         self.assertEqual(legacy.contest_week(datetime(2026, 7, 30, 9)), "2026-W31")    # Thursday
 
+    def test_a_second_part_numbered_on_finds_its_photos_in_its_own_album(self):
+        self.assertEqual(legacy.album_offset([1, 2, 3], 3), 0)
+        self.assertEqual(legacy.album_offset([11, 12, 13, 14, 15], 5), 10)
+        self.assertEqual(legacy.album_offset([11, 12, 13], 15), 0)    # one album for both parts
+        self.assertEqual(legacy.album_offset([1, 9], 3), 0)           # does not fit either way
+
     def test_a_question_with_its_own_hashtag_is_a_thematic_contest(self):
         self.assertEqual(legacy.poll_hashtag("Голосуем #итогинедели"), (voting.CONTEST_HASHTAG, ""))
         self.assertEqual(legacy.poll_hashtag("Лучший #МассПокрас"), ("#масспокрас", "МассПокрас"))
@@ -403,6 +409,40 @@ class PlanTests(_Store):
         self.assertEqual([w.votes for w in week.works], [9, 7, 5, 3, 0])
         self.assertEqual(week.voters, 14)
 
+    def test_a_second_poll_that_names_no_contest_is_still_part_of_it(self):
+        client = _chat()
+        # Posted five minutes after week 28's poll by the same organiser: "Часть 2", no pictures.
+        client.messages[112] = _poll_message(112, _at("2026-07-12", 18) + timedelta(minutes=5), "Часть 2", [
+            _answer(0, "Боря"), _answer(1, "Аня Петрова"),
+        ], [8, 1], total=9)
+        _, scan, contests = self._plan(client)
+        self.assertEqual([p["message_id"] for p in scan["polls"]], [110, 112, 210, 310])
+        week = self._contest(contests, "2026-W28")
+        self.assertEqual(week.poll_message_ids, [110, 112])
+        self.assertEqual([(w.entry.author_id, w.votes) for w in week.works][:2], [(BORYA, 8), (ANYA, 7)])
+        # The organiser's stream poll the next day is still nobody's contest.
+        self.assertNotIn(111, [p["message_id"] for p in scan["polls"]])
+
+    def test_a_numbered_field_split_over_two_polls_and_two_albums(self):
+        client = FakeClient([
+            _message(400, _at("2026-08-01"), sender=ANYA, text="#итогинедели а", media=_media(21)),
+            _message(401, _at("2026-08-01"), sender=BORYA, text="#итогинедели б", media=_media(22)),
+            _message(402, _at("2026-08-01"), sender=VIKA, text="#итогинедели в", media=_media(23)),
+            _message(403, _at("2026-08-01"), sender=GOSHA, text="#итогинедели г", media=_media(24)),
+            _message(410, _at("2026-08-02", 17), media=_media(21, (90, 70)), grouped_id=1),
+            _message(411, _at("2026-08-02", 17), media=_media(22, (90, 70)), grouped_id=1),
+            _poll_message(412, _at("2026-08-02", 18), "Итоги недели, часть 1", [_answer(0, "1"), _answer(1, "2")], [1, 2]),
+            _message(420, _at("2026-08-02", 18), media=_media(23, (90, 70)), grouped_id=2),
+            _message(421, _at("2026-08-02", 18), media=_media(24, (90, 70)), grouped_id=2),
+            _poll_message(422, _at("2026-08-02", 19), "Часть 2", [_answer(0, "3"), _answer(1, "4")], [5, 0]),
+        ])
+        _, _, contests = self._plan(client)
+        self.assertEqual(len(contests), 1)
+        self.assertEqual(contests[0].poll_message_ids, [412, 422])
+        self.assertEqual([(w.entry.author_id, w.votes, w.how) for w in contests[0].works],
+                         [(VIKA, 5, legacy.HOW_PICTURE), (BORYA, 2, legacy.HOW_PICTURE),
+                          (ANYA, 1, legacy.HOW_PICTURE), (GOSHA, 0, legacy.HOW_PICTURE)])
+
     def test_a_week_already_recorded_or_the_bots_own_is_not_written_again(self):
         voting.save_imported_results(CHAT, "2026-W29", [], created_at="", announced_at="", voters=0,
                                      extra={"source": legacy.SOURCE})
@@ -474,6 +514,18 @@ class ApplyTests(_Store):
         self.assertEqual(result["winners"]["awarded"], [1, 2, 3])
         self.assertEqual(result["winners"]["next"], 4)
         self.assertEqual(stats.weekly_wins_for_user(CHAT, ANYA), 1)
+
+    def test_the_report_lists_every_new_winner(self):
+        client = _chat()
+        client.messages[112] = _poll_message(112, _at("2026-07-12", 18) + timedelta(minutes=5), "Часть 2", [
+            _answer(0, "Боря"), _answer(1, "Аня Петрова"),
+        ], [8, 1], total=9)
+        self._plan(client)
+        report = legacy.apply_report(legacy.apply_plan(CHAT, log=lambda *_: None))
+        self.assertIn("Победители:", report)
+        self.assertIn("• 2026-W28 · 12.07.2026 (2 опроса, 5 работ) — 🥇 Боря — 8 голосов · №1", report)
+        self.assertIn("• 2026-W29 · 19.07.2026 — 🥇 Вика (@vika) — 6 голосов · №2", report)
+        self.assertIn("• 2026-W30 · 26.07.2026 — 🥇 Гоша (@gosha) — 4 голоса · №3", report)
 
     def test_running_it_again_changes_nothing(self):
         self._plan()
