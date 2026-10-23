@@ -1168,44 +1168,55 @@ disk that was lost: every work is a post, and the hall knows its message id
 Telegram does not throttle the session). Only a work whose post was deleted from the chat
 stays without a picture; the reply says how many.
 
-**Before the bot: the Sunday polls.** Until `/vote` (2 August 2026) the weekly contest was
-run by hand: works were posted with `#итогинедели`, and on Sunday a Telegram poll asked which
-was best, the works' pictures on its options. `/hall опросы` (DM, administrators; also
-"🗳 Старые конкурсы" under `/hall`) brings those weeks in (`legacy_contests.py`):
+**Before the bot: the polls.** Until `/vote` (2 August 2026) the weekly contest was run by
+hand: works were posted with `#итогинедели`, and the channel posted a Telegram poll into the
+chat — often two or three, a field too big for one — with the works' pictures on its options
+or in the album right before it. `/hall опросы` (DM, administrators; also "🗳 Старые
+конкурсы" under `/hall`) brings those weeks in (`legacy_contests.py`):
 
-- **Finds them.** Telegram's poll filter lists every poll the chat had before the first
-  week the bot ran itself — one cheap listing, not a read of the whole history. A poll is a
-  contest when two or more of its options carry a picture, or when its question names the
-  contest ("итоги", "конкурс", "голосование", "лучшая работа"); "что заказываем на стрим?"
-  is passed over. Polls of one week and hashtag are one contest — a field too big for one
-  poll, split in two, is ranked as one field — and a second part whose question names no
-  contest ("Часть 2") still counts when the same person posted it within two hours of the
-  first. A poll posted Monday to Wednesday counts for the week before. A question with its
-  own hashtag is that thematic contest.
-- **Loads the works.** Every option's picture, and every `#итогинедели` post of the two weeks
-  before each poll (Telegram's search, the whole album of each). A numbered poll — options
-  "1", "2", "3" — takes its pictures from the album the organiser posted just before it; a
-  second part may restart its numbering or carry it on ("11".."15") under its own album.
-- **Matches them to people**, strongest evidence first: a mention or an `@tag` in the
-  option; the option's picture being one of the week's posts (a 64-bit difference hash,
-  which survives Telegram recompressing the same photo); whoever added the option to an
-  open poll (not the organiser, who adds three or more), or whose photo the album
-  forwarded; the option's text being a post author's name; the text being the name of
-  somebody `/stat` knows. An ambiguous name ("Аня" when there are two) matches nobody. A
-  matched work is its post — its album, caption and link; an option nothing matches is
-  recorded under its own text, with its picture and its votes.
-- **Shows the plan first**: each week, its podium, how many authors were recognised and by
-  what, the options it could not place, and whether it will be written. A poll whose results
-  Telegram does not show this account (still open, not voted in) is listed and skipped — stop
-  it and scan again; voting in it would add a vote.
-- **"✅ Записать" writes it** the way every finished week is kept: the photos into the voting
-  archive, a results record beside the announced weeks' (marked `"source": "telegram_poll"`),
-  then the Hall of Fame imports them like any other week, covers and all. The weekly winners
-  go into `/weekwinner`'s numbered table too — reputation and the 🏆 in `/stat` — but only
-  while that table's numbering agrees with the order of the weeks (its №1 is the hall's first
-  week, and so on); otherwise the table is left alone and the reply says so. A week already
-  recorded is never overwritten, so a second run writes nothing. The reply lists every week
-  it wrote with its winner, their votes and their `/weekwinner` number.
+- **Finds them.** Telegram's poll filter lists every poll before the first week the bot ran
+  itself — one cheap listing. A poll that is in the chat twice (the channel's post and a
+  forward of it) is one poll: copies share Telegram's poll id and are read once, so a field
+  is never doubled. A poll is a contest when its options are works: pictures, bare numbers
+  ("6") standing for the album before it, or authors' mentions, `@tags` and `t.me` links; a
+  poll of sentences ("Да, делай промежуточные", "Старые тоже ОК") is a question to the chat
+  and is left out. Polls of one week are one contest, and a second part posted by the same
+  author within two hours counts even when its question names no contest. A poll posted
+  Monday to Wednesday counts for the week before.
+- **Loads the works**: every option's picture; the organiser's messages in the two days
+  before each poll (its album, the captions crediting each photo, a numbered list of
+  authors); every `#итогинедели` post of the two weeks before (Telegram's search, each
+  album whole); and the usernames nobody in `/stat` uses (an artist's link to their own
+  channel). A second part may restart its numbering or carry it on ("11".."15") under its
+  own album, or come after the first with every album posted before both.
+- **Matches them to people**, strongest evidence first: a mention, `@tag` or `t.me` link in
+  the option; its picture being an artist's own post (the very photo, or a 256-bit
+  difference hash that is close and clearly closer than any other artist's); its picture
+  being in a repost whose caption — or numbered list — credits the author; whoever added the
+  option to an open poll (not the organiser, who adds three or more) or whose photo the
+  album forwarded; the organiser's numbered list; the option's text being an artist's or a
+  member's name (an ambiguous one is nobody). **A channel, or the poll's own author, is
+  never an author**: their posts are reposts, and the work in one is whoever it credits.
+- **Shows the plan first**: each week, its podium, how its authors were recognised, and what
+  was left out (copies, question polls). A week whose results Telegram does not show this
+  account (still open, not voted in) waits — stop the poll and scan again; voting in it would
+  add a vote.
+- **Asks about whoever it could not place.** A week with an unknown author is not written.
+  "🖼 Подписать неузнанных" sends each such work's picture (or a link to its poll), and the
+  reply — an `@tag`, a `t.me` link or a name — names its author; typed in one go it is `/hall
+  опросы автор 5123.6 @user`, the code being under the picture. Names given this way survive
+  a re-scan.
+- **"✅ Записать готовые недели" writes them** the way every finished week is kept: the photos
+  into the voting archive, a results record beside the announced weeks' (marked `"source":
+  "telegram_poll"`), then the Hall of Fame imports them like any other week. The weekly
+  winners go into `/weekwinner`'s numbered table too — reputation and the 🏆 in `/stat` — but
+  only while that table's numbering agrees with the order of the weeks; otherwise it is left
+  alone and the reply says so. The reply lists every week written with its winner, their
+  votes and their number. A week already recorded is never overwritten.
+- **`/hall опросы отменить`** takes all of it back out, behind a confirmation: the imported
+  results records and photos (moved into `voting/legacy/<chat>/undone/`, not deleted), their
+  Hall of Fame copies and the weekly winners the import wrote. The bot's own weeks and
+  winners assigned by hand stay.
 
 A lost option picture comes back from the poll itself, as a post's photos come back from the
 post (`/hall импорт`).

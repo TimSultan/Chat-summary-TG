@@ -1580,17 +1580,20 @@ def weekly_contest_winners(entry: str) -> dict[int, dict]:
 
 def record_weekly_contest_winners(
     entry: str,
-    awards: list[tuple[int, int | str, str]],
+    awards: list[tuple],
     giver_id: int | str,
     giver_name: str,
 ) -> dict[int, str]:
     """record_weekly_contest_winner for many weeks at once -- (week, user id, display
-    name) each -- with one read and one write of the store, whatever the count. Same
-    rules per week: "awarded", "already" (the same person), or "taken" (somebody else,
-    left as it is). Returns the status of each week."""
+    name) each, optionally with a dict of fields to keep on the record (where it came
+    from) -- with one read and one write of the store, whatever the count. Same rules per
+    week: "awarded", "already" (the same person), or "taken" (somebody else, left as it
+    is). Returns the status of each week."""
     data = _load_weekly_contest_data(entry)
     statuses: dict[int, str] = {}
-    for contest_week, user_id, user_display_name in awards:
+    for award in awards:
+        contest_week, user_id, user_display_name = award[:3]
+        extra = award[3] if len(award) > 3 else {}
         if contest_week < 1:
             continue
         existing = data["winners"].get(str(contest_week))
@@ -1604,12 +1607,25 @@ def record_weekly_contest_winners(
             "given_at": app_now().isoformat(),
             "given_by_id": str(giver_id),
             "given_by_name": giver_name,
+            **(extra or {}),
         }
         statuses[contest_week] = "awarded"
     if "awarded" in statuses.values():
         data["version"] = WEEKLY_CONTEST_STORE_VERSION
         _write_json_atomic(_weekly_contest_path(entry), data)
     return statuses
+
+
+def remove_weekly_contest_winners(entry: str, weeks: list[int]) -> int:
+    """Takes the numbered weeks out of the winners table -- one read and one write -- and
+    says how many were there. For taking back an import, never for a winner an
+    administrator assigned by hand."""
+    data = _load_weekly_contest_data(entry)
+    removed = sum(1 for week in set(weeks) if data["winners"].pop(str(week), None) is not None)
+    if removed:
+        data["version"] = WEEKLY_CONTEST_STORE_VERSION
+        _write_json_atomic(_weekly_contest_path(entry), data)
+    return removed
 
 
 def weekly_wins_for_user(entry: str, user_id: int | str) -> int:

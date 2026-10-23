@@ -620,14 +620,27 @@ HALL_ACTION_CALLBACK_PREFIX = "hallaction"
 HALL_ACTIONS = {
     "import": "/hall импорт", "contests": "/hall конкурсы",
     "polls": "/hall опросы", "pollsyes": "/hall опросы записать",
+    "pollsask": "/hall опросы подписать", "pollsundo": "/hall опросы отменить",
+    "pollsundoyes": "/hall опросы отменить да",
 }
 # The contests from before the bot ran the vote: a Telegram poll every Sunday, its options
 # carrying the works' pictures (legacy_contests.py). "/hall опросы" (DM, administrators)
 # finds them, matches every option to a person and shows what it found; "/hall опросы
 # записать" -- the button under that preview -- writes them into the results records, the
 # Hall of Fame and the numbered weekly winners. Nothing already recorded is overwritten.
+# A work nobody could be matched to keeps its week from being written: "/hall опросы
+# подписать" sends each one's picture with HALL_AUTHOR_PROMPT, and the reply -- an @tag, a
+# t.me link or a name -- names its author (matched by the code on the prompt's last line,
+# so nothing is held in memory). Typed in one go: "/hall опросы автор 5123.6 @user".
+# "/hall опросы отменить" takes everything an import wrote back out, behind a confirmation.
 HALL_POLLS_WORDS = frozenset({"опросы", "опрос", "старые", "polls"})
 HALL_POLLS_APPLY_WORDS = frozenset({"опросы записать", "опросы да", "polls apply"})
+HALL_POLLS_ASK_WORDS = frozenset({"опросы подписать", "опросы неизвестные", "polls ask"})
+HALL_POLLS_UNDO_WORDS = frozenset({"опросы отменить", "polls undo"})
+HALL_POLLS_UNDO_YES_WORDS = frozenset({"опросы отменить да", "polls undo yes"})
+HALL_AUTHOR_PROMPT = "Чья это работа?"
+HALL_AUTHOR_CODE = re.compile(r"Код работы: (\d+\.\d+)\s*$")
+HALL_AUTHOR_PROMPTS_PER_PRESS = 25
 _HALL_POLL_SCANS_IN_PROGRESS: set = set()
 # Saying after the fact what a recorded contest was -- a week recorded as "Итоги недели"
 # that was really #МассПокрас. "/hall конкурсы" lists the contests as buttons; a tap asks
@@ -7055,11 +7068,11 @@ async def _scan_hall_polls(api: TelegramBotAPI, telethon_client, chat_id, reply,
             entity = await asyncio.wait_for(resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS)
             _, first_automated = await asyncio.to_thread(legacy_contests.known_contests, entry)
             until = legacy_contests.week_start(first_automated, tz) if first_automated else None
+            members = await asyncio.to_thread(_legacy_members, entry)
             scan = await legacy_contests.scan_chat(
                 telethon_client, entity, tz, legacy_contests.cache_dir(entry),
-                until=until, progress=progress, log=log,
+                until=until, members=members, progress=progress, log=log,
             )
-            members = await asyncio.to_thread(_legacy_members, entry)
             contests = await asyncio.to_thread(legacy_contests.build_plan, entry, scan, members)
         except Exception:
             log(f"[bot_listener] the legacy contest scan failed:\n{traceback.format_exc()}")
@@ -7068,21 +7081,213 @@ async def _scan_hall_polls(api: TelegramBotAPI, telethon_client, chat_id, reply,
     finally:
         _HALL_POLL_SCANS_IN_PROGRESS.discard(entry)
 
-    messages = legacy_contests.preview_messages(contests, scan.get("polls_seen", 0))
+    await _send_hall_poll_preview(reply, contests, scan, user)
+
+
+async def _send_hall_poll_preview(reply, contests, scan: dict, user: dict) -> None:
+    """The plan, and a button for each thing that can be done with it next: write the
+    weeks that are complete, and name the authors the bot did not recognise."""
+    messages = legacy_contests.preview_messages(
+        contests, scan.get("polls_seen", 0), scan.get("copies", 0), scan.get("questions", 0),
+    )
     ready = sum(1 for contest in contests if contest.status == legacy_contests.READY)
+    unknown = sum(len(contest.unknown()) for contest in contests
+                  if contest.status in (legacy_contests.READY, legacy_contests.INCOMPLETE))
     for text in messages[:-1]:
         await reply(text)
-    if not ready:
-        await reply(messages[-1])
+    rows = []
+    if unknown:
+        rows.append([{"text": f"🖼 Подписать неузнанных ({unknown})",
+                      "callback_data": _hall_action_callback_data("pollsask", user.get("id"))}])
+    if ready:
+        rows.append([{"text": f"✅ Записать готовые недели ({ready})",
+                      "callback_data": _hall_action_callback_data("pollsyes", user.get("id"))}])
+    tail = ""
+    if unknown:
+        tail += ("\n\nНеузнанных пришлю картинками — ответь на каждую @ником, ссылкой t.me/… или "
+                 "именем. Неделя записывается, когда в ней узнаны все.")
+    if ready:
+        tail += "\n\nЗапишу по кнопке. Уже записанное не трогаю; отменить можно: /hall опросы отменить."
+    await reply(messages[-1] + tail, reply_markup={"inline_keyboard": rows} if rows else None)
+
+
+def _hall_poll_link(entity, message_id: int) -> str | None:
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{username}/{message_id}"
+    chat_id = getattr(entity, "id", None)
+    return f"https://t.me/c/{chat_id}/{message_id}" if chat_id else None
+
+
+async def _ask_hall_poll_authors(api: TelegramBotAPI, telethon_client, chat_id, reply, entry: str,
+                                 log=print) -> None:
+    """"/hall опросы подписать": each work nobody could be matched to, as its picture with
+    HALL_AUTHOR_PROMPT -- a reply names the author (handle_hall_author_reply). A work with
+    no picture is asked about with a link to its poll instead."""
+    if legacy_contests is None:
+        await reply("Доска почёта сейчас недоступна — чиню.")
         return
-    await reply(
-        f"{messages[-1]}\n\nВсё верно? Запишу по кнопке. Уже записанное не трогаю, "
-        "поэтому повторный запуск безопасен.",
-        reply_markup={"inline_keyboard": [[{
-            "text": f"✅ Записать в Доску почёта ({ready})",
-            "callback_data": _hall_action_callback_data("pollsyes", user.get("id")),
-        }]]},
-    )
+    unknown = await asyncio.to_thread(legacy_contests.unknown_works, entry)
+    if not unknown:
+        await reply("Неузнанных работ нет. Если недели готовы — /hall опросы записать.")
+        return
+    entity = None
+    if telethon_client is not None:
+        try:
+            entity = await asyncio.wait_for(resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS)
+        except Exception as e:
+            log(f"[bot_listener] could not open the chat for poll links: {e}")
+    batch = unknown[:HALL_AUTHOR_PROMPTS_PER_PRESS]
+    await reply(f"Неузнанных работ: {len(unknown)}. Присылаю {len(batch)} — ответь на каждую @ником, "
+                "ссылкой t.me/… или именем.")
+    cache = legacy_contests.cache_dir(entry)
+    for contest, work in batch:
+        poll_id = int(work.key.split(".")[0])
+        link = _hall_poll_link(entity, poll_id) if entity is not None else None
+        caption = (
+            f"{HALL_AUTHOR_PROMPT}\n{contest.week} · {legacy_contests._short_date(contest.created_at)} · "
+            f"вариант «{work.option_text}» · {voting.votes_label(work.votes)}\n"
+            + (f"Опрос: {link}\n" if link else "")
+            + "Ответь на это сообщение @ником, ссылкой t.me/… или именем.\n"
+            f"Код работы: {work.key}"
+        )
+        photo = cache / work.photo if work.photo else None
+        try:
+            if photo is not None and photo.is_file():
+                await api.send_photo_file(chat_id, photo, caption=caption,
+                                          reply_markup={"force_reply": True, "selective": True})
+            else:
+                await api.send_message(chat_id, caption, parse_mode=None,
+                                       reply_markup={"force_reply": True, "selective": True})
+        except Exception as e:
+            log(f"[bot_listener] could not ask about legacy work {work.key}: {e}")
+    if len(unknown) > len(batch):
+        await reply(f"Ещё {len(unknown) - len(batch)} — пришлю, когда ответишь на эти: /hall опросы подписать.")
+
+
+async def _resolve_hall_poll_author(telethon_client, entry: str, answer: str, log=print) -> dict | None:
+    """{"id", "name", "username"} for an administrator's answer naming an author: a member
+    or an artist the plan knows, else whoever Telegram says the @tag is; a plain name is
+    taken as written, matched to a member only when exactly one goes by it."""
+    parsed = legacy_contests.parse_author(answer)
+    if parsed is None:
+        return None
+    username, name = parsed
+    plan = await asyncio.to_thread(legacy_contests.load_plan, entry)
+    if username:
+        found = legacy_contests.find_member(plan, username)
+        if found is not None:
+            return found
+        if telethon_client is not None:
+            try:
+                target = await telethon_client.get_entity(username)
+                person = legacy_contests._person(target)
+                return {"id": getattr(target, "id", None) if person["is_user"] else None,
+                        "name": person["name"], "username": person["username"] or username}
+            except Exception as e:
+                log(f"[bot_listener] could not look up @{username}: {e}")
+        return {"id": None, "name": f"@{username}", "username": username}
+    members = (plan or {}).get("members") or {}
+    exact = [(uid, m) for uid, m in members.items()
+             if legacy_contests.name_score(name, m.get("name") or "", m.get("username")) == 3]
+    if len(exact) == 1 and legacy_contests._as_id(exact[0][0]) is not None:
+        uid, member = exact[0]
+        return {"id": legacy_contests._as_id(uid), "name": member.get("name") or name, "username": member.get("username")}
+    return {"id": None, "name": name, "username": None}
+
+
+async def _name_hall_poll_author(telethon_client, entry: str, key: str, answer: str, log=print) -> str:
+    """Names the author of one work of the plan and says, in one message, what is left."""
+    if legacy_contests is None:
+        return "Доска почёта сейчас недоступна — чиню."
+    author = await _resolve_hall_poll_author(telethon_client, entry, answer, log=log)
+    if author is None:
+        return "Не понял, кто это: пришли @ник, ссылку t.me/… или имя."
+    result = await asyncio.to_thread(legacy_contests.set_author, entry, key, author)
+    if result is None:
+        return "Не нашёл такую работу — запусти /hall опросы заново."
+    contest, work = result
+    left = len(contest.unknown())
+    who = f"{author['name']} (@{author['username']})" if author.get("username") else author["name"]
+    text = f"Записал: «{work.option_text}» ({contest.week}) — {who}."
+    if author.get("id") is None:
+        text += " Аккаунт не нашёл — будет под этим именем."
+    if left:
+        text += f" В этой неделе неузнанных ещё: {left}."
+    else:
+        text += f" Неделя {contest.week} готова — /hall опросы записать."
+    return text
+
+
+async def handle_hall_author_reply(api: TelegramBotAPI, telethon_client, cfg, message: dict,
+                                   entry: str | None, log=print) -> bool:
+    """A DM reply to HALL_AUTHOR_PROMPT (a picture's caption, or a text when the work has
+    no picture): the author of the work its code names. Returns True once the message was
+    such a reply. Re-checks the administrator."""
+    chat = message.get("chat") or {}
+    replied = message.get("reply_to_message") or {}
+    prompt = str(replied.get("caption") or replied.get("text") or "")
+    if (chat.get("type") != "private" or not (replied.get("from") or {}).get("is_bot")
+            or not prompt.startswith(HALL_AUTHOR_PROMPT)):
+        return False
+
+    async def answer(text: str) -> None:
+        try:
+            await api.send_message(chat["id"], text, reply_to_message_id=message.get("message_id"), parse_mode=None)
+        except Exception as e:
+            log(f"[bot_listener] could not answer a legacy author reply: {e}")
+
+    code = HALL_AUTHOR_CODE.search(prompt)
+    if code is None or legacy_contests is None or not entry:
+        await answer("Не понял, какая это работа — нажми «Подписать неузнанных» заново.")
+        return True
+    user = message.get("from") or {}
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+    if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, user, entry):
+        await answer("Подписывать работы могут только администраторы.")
+        return True
+    await answer(await _name_hall_poll_author(
+        telethon_client, entry, code.group(1), str(message.get("text") or ""), log=log,
+    ))
+    return True
+
+
+async def _undo_hall_polls(reply, entry: str, user: dict, confirmed: bool, log=print) -> None:
+    """"/hall опросы отменить": what an import wrote, and a button that takes it out;
+    "… да" takes it out (legacy_contests.undo_import)."""
+    if legacy_contests is None:
+        await reply("Доска почёта сейчас недоступна — чиню.")
+        return
+
+    def imported() -> list[str]:
+        return [poll_id for poll_id in voting.results_poll_ids(entry)
+                if (voting.load_results(entry, poll_id) or {}).get("source") == legacy_contests.SOURCE]
+
+    weeks = await asyncio.to_thread(imported)
+    if not weeks:
+        await reply("Из старых опросов ничего не записано — отменять нечего.")
+        return
+    if not confirmed:
+        await reply(
+            f"Уберу с Доски почёта недели из старых опросов: {', '.join(weeks)} — и их победителей из "
+            "таблицы /weekwinner. Недели, которые вёл бот, не трогаю. Найти и записать их можно будет заново.",
+            reply_markup={"inline_keyboard": [[{
+                "text": f"🗑 Да, убрать ({len(weeks)})",
+                "callback_data": _hall_action_callback_data("pollsundoyes", user.get("id")),
+            }]]},
+        )
+        return
+    try:
+        result = await asyncio.to_thread(legacy_contests.undo_import, entry)
+    except Exception:
+        log(f"[bot_listener] undoing the legacy import failed:\n{traceback.format_exc()}")
+        await reply("Не получилось отменить — смотри логи.")
+        return
+    lines = [f"Убрал недели: {', '.join(result['contests'])}."]
+    if result["winners"]:
+        lines.append("Из таблицы победителей недель: №" + ", №".join(map(str, result["winners"])) + ".")
+    lines.append("Записи сохранены в архиве на сервере. Найти заново: /hall опросы")
+    await reply("\n".join(lines))
 
 
 async def _apply_hall_polls(api: TelegramBotAPI, telethon_client, chat_id, reply, entry: str, user: dict,
@@ -7293,6 +7498,12 @@ async def handle_hall_command(
     wants_contests = " ".join(argument.lower().split()) in HALL_CONTESTS_WORDS
     wants_polls = " ".join(argument.lower().split()) in HALL_POLLS_WORDS
     wants_polls_apply = " ".join(argument.lower().split()) in HALL_POLLS_APPLY_WORDS
+    wants_polls_ask = " ".join(argument.lower().split()) in HALL_POLLS_ASK_WORDS
+    wants_polls_undo = " ".join(argument.lower().split()) in HALL_POLLS_UNDO_WORDS
+    wants_polls_undo_yes = " ".join(argument.lower().split()) in HALL_POLLS_UNDO_YES_WORDS
+    author_words = argument.split()
+    wants_polls_author = (len(author_words) >= 2 and author_words[0].lower() in ("опросы", "polls")
+                          and author_words[1].lower() in ("автор", "author"))
     words = argument.split()
     theme_request = (words[1:] if words and words[0].lower() in HALL_THEME_WORDS else None)
 
@@ -7300,7 +7511,8 @@ async def handle_hall_command(
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         return admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
 
-    if wants_polls or wants_polls_apply:
+    if wants_polls or wants_polls_apply or wants_polls_ask or wants_polls_undo or wants_polls_undo_yes \
+            or wants_polls_author:
         if not is_private:
             await reply("Старые конкурсы — только в личке с ботом.")
             return
@@ -7309,6 +7521,16 @@ async def handle_hall_command(
             return
         if wants_polls_apply:
             await _apply_hall_polls(api, telethon_client, chat_id, reply, entry, user, url, cfg=cfg, log=log)
+        elif wants_polls_ask:
+            await _ask_hall_poll_authors(api, telethon_client, chat_id, reply, entry, log=log)
+        elif wants_polls_author:
+            if len(author_words) < 4:
+                await reply("Напиши так: /hall опросы автор 5123.6 @ник — код работы есть под её картинкой.")
+                return
+            await reply(await _name_hall_poll_author(telethon_client, entry, author_words[2],
+                                                     " ".join(author_words[3:]), log=log))
+        elif wants_polls_undo or wants_polls_undo_yes:
+            await _undo_hall_polls(reply, entry, user, confirmed=wants_polls_undo_yes, log=log)
         else:
             await _scan_hall_polls(api, telethon_client, chat_id, reply, entry, user, log=log)
         return
@@ -12788,6 +13010,9 @@ async def _dispatch_update(
     ):
         return
 
+    # The answer to "чья это работа?" under a picture from an old poll (/hall опросы).
+    if await handle_hall_author_reply(api, telethon_client, cfg, message, home_chat_ref, log=log):
+        return
     # The answer to "/hall конкурсы"'s question: which hashtag a recorded contest had.
     if await handle_hall_theme_reply(api, telethon_client, cfg, message, home_chat_ref, log=log):
         return
