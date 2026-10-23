@@ -474,6 +474,21 @@ async def collect_entries(
         f" -> {len(groups)} nomination(s)"
     )
 
+    entries, skipped = await _entries_from_groups(
+        client, groups, media_dir, tz, hashtag, skip_entry_ids, report, log, sender_display_name,
+    )
+    log(f"[voting] {len(entries)} new entr{'y' if len(entries) == 1 else 'ies'}, {skipped} already known -- skipped")
+    return entries
+
+
+async def _entries_from_groups(
+    client, groups: list[list], media_dir: Path, tz, hashtag: str, skip_entry_ids, report, log,
+    display_name,
+) -> tuple[list[Entry], int]:
+    """One Entry per nominated post in `groups` (group_into_entries' output), with every
+    photo of it downloaded into `media_dir`; and how many were skipped as already known.
+    Shared by collect_entries and search_entries, which differ only in how they find the
+    messages."""
     media_dir.mkdir(parents=True, exist_ok=True)
     entries: list[Entry] = []
     skipped = 0
@@ -506,14 +521,67 @@ async def collect_entries(
                 entry_id=str(head.id),
                 message_id=head.id,
                 author_id=getattr(sender, "id", None),
-                author_name=sender_display_name(sender),
+                author_name=display_name(sender),
                 author_username=getattr(sender, "username", None),
                 text=_clean_caption(group, hashtag),
                 media=files,
                 posted_at=head.date.astimezone(tz).isoformat(),
             )
         )
-    log(f"[voting] {len(entries)} new entr{'y' if len(entries) == 1 else 'ies'}, {skipped} already known -- skipped")
+    return entries, skipped
+
+
+async def search_entries(
+    client, entity, tz, media_dir: Path, since: datetime, until: datetime,
+    hashtag: str = CONTEST_HASHTAG, progress=None, log=print,
+) -> list[Entry]:
+    """Every nominated post between `since` and `until` (timezone-aware, `until`
+    exclusive), found by Telegram's own search for `hashtag` rather than by reading every
+    message -- the way to reach months back, where collect_entries' full read would be
+    tens of thousands of messages. Photos go into `media_dir` under collect_entries' names.
+
+    The search finds the one message of an album that carries the caption; the album's
+    other photos are the messages either side of it with the same grouped_id, fetched
+    by id. Returns [] when the search finds nothing, which the caller may take as a sign
+    to fall back to collect_entries' full read: a chat whose search index is missing a
+    tag loses nothing that way."""
+    from telegram_fetch import sender_display_name
+
+    async def report(stage: str, done: int, total: int) -> None:
+        if progress is None:
+            return
+        try:
+            await progress(stage, done, total)
+        except Exception as e:
+            log(f"[voting] progress report failed: {e}")
+
+    since_utc, until_utc = since.astimezone(timezone.utc), until.astimezone(timezone.utc)
+    found: dict[int, object] = {}
+    async for message in client.iter_messages(entity, search=hashtag, offset_date=until_utc):
+        if message.date < since_utc:
+            break
+        if message.date >= until_utc or getattr(message, "action", None) is not None:
+            continue
+        found[message.id] = message
+        if len(found) % 50 == 0:
+            await report("scan", len(found), 0)
+    albums = {m.grouped_id for m in found.values() if getattr(m, "grouped_id", None)}
+    for hit in [m for m in found.values() if getattr(m, "grouped_id", None)]:
+        ids = [i for i in range(hit.id - MAX_ALBUM_ITEMS + 1, hit.id + MAX_ALBUM_ITEMS) if i not in found]
+        try:
+            around = await client.get_messages(entity, ids=ids)
+        except Exception as e:  # the captioned photo is still a work on its own
+            log(f"[voting] could not read the album around {hit.id}: {e}")
+            continue
+        for message in around or []:
+            if message is not None and getattr(message, "grouped_id", None) in albums:
+                found[message.id] = message
+    groups = group_into_entries(list(found.values()), hashtag)
+    entries, _ = await _entries_from_groups(
+        client, groups, media_dir, tz, hashtag, frozenset(), report, log, sender_display_name,
+    )
+    log(f"[voting] search {hashtag} {since.date()}..{until.date()}: {len(found)} message(s) "
+        f"-> {len(groups)} post(s), {len(entries)} with photos")
     return entries
 
 
@@ -823,6 +891,24 @@ def photo_dirs(entry: str, poll_id: str) -> list[Path]:
     return [media_path(entry, poll_id)] + archive_store.archived_media_dirs(
         archive_dir(), poll_path(entry, poll_id).stem,
     )
+
+
+def archived_media_path(entry: str, poll_id: str) -> Path:
+    """Where a cleared week's photos are kept (archive_store.move_to_archive) -- and where
+    a contest the bot never ran keeps its own (legacy_contests), so photo_dirs finds both
+    the same way."""
+    return archive_dir() / archive_store.MEDIA_SUBDIR / poll_path(entry, poll_id).stem
+
+
+def archived_poll_ids(entry: str) -> list[str]:
+    """The poll ids of every cleared poll in the archive, oldest first, once each however
+    many times the week was cleared. Poll ids never contain "_", so whatever follows one
+    in a file name is the archive's time stamp."""
+    directory = archive_dir()
+    if not directory.exists():
+        return []
+    prefix = f"{_poll_key(entry)}_"
+    return sorted({path.stem[len(prefix):].split("_")[0] for path in directory.glob(f"{prefix}*.json")})
 
 
 def poll_ids(entry: str) -> list[str]:
@@ -1270,20 +1356,53 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
     Overwrites an existing record for the same poll: announcing is idempotent here (see
     close_and_announce), and a re-announcement is the newer truth, not a second event.
     """
-    path = results_path(poll.entry, poll.poll_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "poll_id": poll.poll_id,
-        "entry": poll.entry,
-        "created_at": poll.created_at,
-        "announced_at": datetime.now(timezone.utc).isoformat(),
-        "voters": len(poll.votes),
+    record = _results_record(
+        poll.poll_id, poll.entry, standings, text, created_at=poll.created_at,
+        announced_at=datetime.now(timezone.utc).isoformat(), voters=len(poll.votes),
+        hashtag=poll.hashtag, title=poll.title, badge=poll.badge,
+    )
+    return _write_results(results_path(poll.entry, poll.poll_id), record)
+
+
+def save_imported_results(
+    entry: str, poll_id: str, standings: list[tuple[Entry, int]], *, created_at: str,
+    announced_at: str, voters: int, hashtag: str = CONTEST_HASHTAG, title: str = "",
+    badge: str = "", extra: dict | None = None,
+) -> Path | None:
+    """A results record for a contest the bot did not run -- one decided by a Telegram
+    poll before /vote existed (legacy_contests.py) -- in the same shape as save_results',
+    so everything that reads the announced weeks reads it too. `extra` says where it came
+    from. Returns None, writing nothing, when the week already has a record: an announced
+    result is never replaced by an import."""
+    path = results_path(entry, poll_id)
+    if path.exists():
+        return None
+    header_poll = Poll(poll_id=poll_id, entry=entry, created_at=created_at, hashtag=hashtag, title=title)
+    record = _results_record(
+        poll_id, entry, standings, format_results_text(standings, header=results_header(header_poll)),
+        created_at=created_at, announced_at=announced_at, voters=voters,
+        hashtag=hashtag, title=title, badge=badge,
+    )
+    record.update(extra or {})
+    return _write_results(path, record)
+
+
+def _results_record(
+    poll_id: str, entry: str, standings: list[tuple[Entry, int]], text: str, *, created_at: str,
+    announced_at: str, voters: int, hashtag: str, title: str, badge: str,
+) -> dict:
+    return {
+        "poll_id": poll_id,
+        "entry": entry,
+        "created_at": created_at,
+        "announced_at": announced_at,
+        "voters": voters,
         "text": text,
         # Which contest this was: the Hall of Fame (hall_of_fame.import_history) reads
         # these back for a week whose poll file has since been archived.
-        "hashtag": poll.hashtag,
-        "title": poll.title,
-        "badge": poll.badge,
+        "hashtag": hashtag,
+        "title": title,
+        "badge": badge,
         "standings": [
             {
                 "place": place,
@@ -1300,6 +1419,10 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
             for place, (e, votes) in enumerate(standings, start=1)
         ],
     }
+
+
+def _write_results(path: Path, record: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     # Same tmp-then-replace as save_poll: a crash mid-write must not leave a half-written
     # record, which here would be a week's result lost for good rather than re-fetchable.
     temporary = path.with_suffix(".json.tmp")

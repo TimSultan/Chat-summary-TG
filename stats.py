@@ -1564,6 +1564,54 @@ def record_weekly_contest_winner(
     return "awarded", user_wins, None
 
 
+def weekly_contest_winners(entry: str) -> dict[int, dict]:
+    """The numbered weekly winners as stored, {contest week: record}. Raises on a corrupt
+    store, unlike the /stat readers: a caller about to add winners must not take a broken
+    file for an empty one and write over it."""
+    data = _load_weekly_contest_data(entry)
+    winners = {}
+    for week, winner in data["winners"].items():
+        try:
+            winners[int(week)] = winner
+        except (TypeError, ValueError):
+            continue
+    return winners
+
+
+def record_weekly_contest_winners(
+    entry: str,
+    awards: list[tuple[int, int | str, str]],
+    giver_id: int | str,
+    giver_name: str,
+) -> dict[int, str]:
+    """record_weekly_contest_winner for many weeks at once -- (week, user id, display
+    name) each -- with one read and one write of the store, whatever the count. Same
+    rules per week: "awarded", "already" (the same person), or "taken" (somebody else,
+    left as it is). Returns the status of each week."""
+    data = _load_weekly_contest_data(entry)
+    statuses: dict[int, str] = {}
+    for contest_week, user_id, user_display_name in awards:
+        if contest_week < 1:
+            continue
+        existing = data["winners"].get(str(contest_week))
+        if existing:
+            statuses[contest_week] = "already" if str(existing.get("user_id")) == str(user_id) else "taken"
+            continue
+        data["winners"][str(contest_week)] = {
+            "contest_week": contest_week,
+            "user_id": str(user_id),
+            "user_display_name": user_display_name,
+            "given_at": app_now().isoformat(),
+            "given_by_id": str(giver_id),
+            "given_by_name": giver_name,
+        }
+        statuses[contest_week] = "awarded"
+    if "awarded" in statuses.values():
+        data["version"] = WEEKLY_CONTEST_STORE_VERSION
+        _write_json_atomic(_weekly_contest_path(entry), data)
+    return statuses
+
+
 def weekly_wins_for_user(entry: str, user_id: int | str) -> int:
     """How many numbered weekly contests this person has won -- the peer-granted half of
     reputation_score. Same corruption tolerance as the badge readers: a broken store

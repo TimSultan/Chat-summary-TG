@@ -194,9 +194,10 @@ except Exception:  # noqa: BLE001
 try:
     import hall_of_fame
     import hall_web
+    import legacy_contests
 except Exception:  # noqa: BLE001
     HALL_IMPORT_ERROR = traceback.format_exc()
-    hall_of_fame = hall_web = None
+    hall_of_fame = hall_web = legacy_contests = None
 import backup
 
 
@@ -616,7 +617,18 @@ HALL_COMMANDS = ("/hall", "/зал", "/доска")
 HALL_IMPORT_WORDS = frozenset({"импорт", "import", "история", "history"})
 HALL_OPEN_BUTTON_TEXT = "🏆 Доска почёта"
 HALL_ACTION_CALLBACK_PREFIX = "hallaction"
-HALL_ACTIONS = {"import": "/hall импорт", "contests": "/hall конкурсы"}
+HALL_ACTIONS = {
+    "import": "/hall импорт", "contests": "/hall конкурсы",
+    "polls": "/hall опросы", "pollsyes": "/hall опросы записать",
+}
+# The contests from before the bot ran the vote: a Telegram poll every Sunday, its options
+# carrying the works' pictures (legacy_contests.py). "/hall опросы" (DM, administrators)
+# finds them, matches every option to a person and shows what it found; "/hall опросы
+# записать" -- the button under that preview -- writes them into the results records, the
+# Hall of Fame and the numbered weekly winners. Nothing already recorded is overwritten.
+HALL_POLLS_WORDS = frozenset({"опросы", "опрос", "старые", "polls"})
+HALL_POLLS_APPLY_WORDS = frozenset({"опросы записать", "опросы да", "polls apply"})
+_HALL_POLL_SCANS_IN_PROGRESS: set = set()
 # Saying after the fact what a recorded contest was -- a week recorded as "Итоги недели"
 # that was really #МассПокрас. "/hall конкурсы" lists the contests as buttons; a tap asks
 # for the hashtag and title (HALL_THEME_PROMPT, answered by a reply, matched by the
@@ -6968,13 +6980,24 @@ async def _restore_hall_photos(telethon_client, entry: str, log=print) -> tuple[
         return 0, 0
     restored = gone = 0
     for contest_id, entry_id, message_id in missing:
+        # A work from a Sunday poll before the bot ran the vote can be an option of that
+        # poll rather than a post: its picture is the option's (legacy_contests).
+        option = legacy_contests.OPTION_ENTRY.match(entry_id) if legacy_contests is not None else None
         try:
-            names = await voting.download_post_photos(
-                telethon_client, entity, message_id, hall_of_fame.media_dir(entry, contest_id), log=log,
-            )
+            if option is not None:
+                names = await legacy_contests.download_option_photo(
+                    telethon_client, entity, int(option.group(1)), int(option.group(2)),
+                    hall_of_fame.media_dir(entry, contest_id), log=log,
+                )
+            else:
+                names = await voting.download_post_photos(
+                    telethon_client, entity, message_id, hall_of_fame.media_dir(entry, contest_id), log=log,
+                )
         except Exception as e:
             log(f"[bot_listener] could not fetch post {message_id} for the hall: {e}")
             continue
+        if option is not None and names == []:
+            continue  # an option that never had a picture: nothing was lost
         if not names:
             gone += 1
             continue
@@ -6982,6 +7005,123 @@ async def _restore_hall_photos(telethon_client, entry: str, log=print) -> tuple[
             restored += 1
     log(f"[bot_listener] hall photos: {restored} work(s) restored from the chat, {gone} post(s) gone")
     return restored, gone
+
+
+def _legacy_members(entry: str) -> dict:
+    """Everybody the chat statistics know, {user id: {"name", "username"}} -- the last
+    resort for a poll option that only names its author. Reads every recorded day:
+    a worker thread."""
+    try:
+        users = stats.aggregate_all_time(entry)
+    except Exception:  # noqa: BLE001 -- without it, fewer options are matched; that is all
+        return {}
+    return {str(user_id): {"name": user.display_name, "username": user.username}
+            for user_id, user in users.items()}
+
+
+async def _scan_hall_polls(api: TelegramBotAPI, telethon_client, chat_id, reply, entry: str, user: dict,
+                           log=print) -> None:
+    """"/hall опросы": finds the contests the chat ran as Telegram polls before the bot
+    ran the vote, matches their works to people and shows the plan with a button that
+    writes it (legacy_contests). Reads the chat through the user session; the matching
+    and the picture hashing run in a worker thread."""
+    if telethon_client is None or legacy_contests is None:
+        await reply("Не могу прочитать чат: нет сессии Telegram.")
+        return
+    if entry in _HALL_POLL_SCANS_IN_PROGRESS:
+        await reply("Уже ищу — подожди, пожалуйста: второй поиск полез бы качать те же картинки.")
+        return
+    _HALL_POLL_SCANS_IN_PROGRESS.add(entry)
+    try:
+        status = await reply(
+            "Ищу в чате старые конкурсы — опросы до автоматизации. Это может занять несколько "
+            "минут: качаю картинки вариантов и работы с #итогинедели. Прогресс — здесь."
+        )
+        status_id = (status or {}).get("message_id")
+        last_edit = {"at": 0.0}
+
+        async def progress(text: str) -> None:
+            now = time.monotonic()
+            if status_id is None or now - last_edit["at"] < VOTE_PROGRESS_EDIT_SECONDS:
+                return
+            last_edit["at"] = now
+            try:
+                await api.edit_message_text(chat_id, status_id, text, parse_mode=None)
+            except Exception as e:
+                log(f"[bot_listener] legacy contest progress edit failed: {e}")
+
+        tz = resolve_tz(None)
+        try:
+            entity = await asyncio.wait_for(resolve_chat(telethon_client, entry), timeout=CHAT_RESOLVE_TIMEOUT_SECONDS)
+            _, first_automated = await asyncio.to_thread(legacy_contests.known_contests, entry)
+            until = legacy_contests.week_start(first_automated, tz) if first_automated else None
+            scan = await legacy_contests.scan_chat(
+                telethon_client, entity, tz, legacy_contests.cache_dir(entry),
+                until=until, progress=progress, log=log,
+            )
+            members = await asyncio.to_thread(_legacy_members, entry)
+            contests = await asyncio.to_thread(legacy_contests.build_plan, entry, scan, members)
+        except Exception:
+            log(f"[bot_listener] the legacy contest scan failed:\n{traceback.format_exc()}")
+            await reply("Не получилось найти старые конкурсы — смотри логи.")
+            return
+    finally:
+        _HALL_POLL_SCANS_IN_PROGRESS.discard(entry)
+
+    messages = legacy_contests.preview_messages(contests, scan.get("polls_seen", 0))
+    ready = sum(1 for contest in contests if contest.status == legacy_contests.READY)
+    for text in messages[:-1]:
+        await reply(text)
+    if not ready:
+        await reply(messages[-1])
+        return
+    await reply(
+        f"{messages[-1]}\n\nВсё верно? Запишу по кнопке. Уже записанное не трогаю, "
+        "поэтому повторный запуск безопасен.",
+        reply_markup={"inline_keyboard": [[{
+            "text": f"✅ Записать в Доску почёта ({ready})",
+            "callback_data": _hall_action_callback_data("pollsyes", user.get("id")),
+        }]]},
+    )
+
+
+async def _apply_hall_polls(api: TelegramBotAPI, telethon_client, chat_id, reply, entry: str, user: dict,
+                            url: str | None, cfg=None, log=print) -> None:
+    """"/hall опросы записать": writes the plan "/hall опросы" showed. Disk and image work
+    in a worker thread; then any picture still missing is fetched back from the chat, and
+    the history zip goes to BACKUP_CHAT_ID when one is set, as after a closed vote."""
+    if legacy_contests is None:
+        await reply("Доска почёта сейчас недоступна — чиню.")
+        return
+    if entry in _HALL_POLL_SCANS_IN_PROGRESS:
+        await reply("Ещё ищу старые конкурсы — подожди, пока покажу, что нашёл.")
+        return
+    _HALL_POLL_SCANS_IN_PROGRESS.add(entry)
+    try:
+        await reply("Записываю старые конкурсы… Копирую фото и рисую обложки.")
+        giver = f"@{user['username']}" if user.get("username") else (user.get("first_name") or str(user.get("id")))
+        try:
+            result = await asyncio.to_thread(
+                legacy_contests.apply_plan, entry, giver_id=user.get("id") or 0, giver_name=giver, log=log,
+            )
+        except Exception:
+            log(f"[bot_listener] writing the legacy contests failed:\n{traceback.format_exc()}")
+            await reply("Не получилось записать старые конкурсы — смотри логи.")
+            return
+    finally:
+        _HALL_POLL_SCANS_IN_PROGRESS.discard(entry)
+
+    lines = [legacy_contests.apply_report(result)]
+    if result.get("written"):
+        restored, _ = await _restore_hall_photos(telethon_client, entry, log=log)
+        if restored:
+            lines.append(f"Фото возвращены из чата: {restored} работ.")
+        if getattr(cfg, "backup_chat_id", None):
+            problem = await _send_history_backup(api, cfg.backup_chat_id, "после переноса старых конкурсов", log=log)
+            if problem:
+                log(f"[bot_listener] {problem}")
+    await reply("\n".join(lines),
+                reply_markup={"inline_keyboard": [[{"text": HALL_OPEN_BUTTON_TEXT, "url": url}]]} if url else None)
 
 
 def _hall_contest_label(contest) -> str:
@@ -7151,12 +7291,27 @@ async def handle_hall_command(
             break
     wants_import = " ".join(argument.lower().split()) in HALL_IMPORT_WORDS
     wants_contests = " ".join(argument.lower().split()) in HALL_CONTESTS_WORDS
+    wants_polls = " ".join(argument.lower().split()) in HALL_POLLS_WORDS
+    wants_polls_apply = " ".join(argument.lower().split()) in HALL_POLLS_APPLY_WORDS
     words = argument.split()
     theme_request = (words[1:] if words and words[0].lower() in HALL_THEME_WORDS else None)
 
     async def is_admin() -> bool:
         admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
         return admin_chat_id is not None and await _can_manage_chat(api, admin_chat_id, user, entry)
+
+    if wants_polls or wants_polls_apply:
+        if not is_private:
+            await reply("Старые конкурсы — только в личке с ботом.")
+            return
+        if not await is_admin():
+            await reply("Переносить старые конкурсы в Доску почёта могут только администраторы.")
+            return
+        if wants_polls_apply:
+            await _apply_hall_polls(api, telethon_client, chat_id, reply, entry, user, url, cfg=cfg, log=log)
+        else:
+            await _scan_hall_polls(api, telethon_client, chat_id, reply, entry, user, log=log)
+        return
 
     if wants_import:
         if not is_private:
@@ -7232,6 +7387,8 @@ async def handle_hall_command(
     if await is_admin():
         rows.append([{"text": "📥 Перенести историю итогов",
                       "callback_data": _hall_action_callback_data("import", user.get("id"))}])
+        rows.append([{"text": "🗳 Старые конкурсы (опросы в чате)",
+                      "callback_data": _hall_action_callback_data("polls", user.get("id"))}])
         if hall.contests:
             rows.append([{"text": "✏️ Хэштег и название конкурса",
                           "callback_data": _hall_action_callback_data("contests", user.get("id"))}])

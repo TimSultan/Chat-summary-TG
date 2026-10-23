@@ -1168,6 +1168,44 @@ disk that was lost: every work is a post, and the hall knows its message id
 Telegram does not throttle the session). Only a work whose post was deleted from the chat
 stays without a picture; the reply says how many.
 
+**Before the bot: the Sunday polls.** Until `/vote` (2 August 2026) the weekly contest was
+run by hand: works were posted with `#итогинедели`, and on Sunday a Telegram poll asked which
+was best, the works' pictures on its options. `/hall опросы` (DM, administrators; also
+"🗳 Старые конкурсы" under `/hall`) brings those weeks in (`legacy_contests.py`):
+
+- **Finds them.** Telegram's poll filter lists every poll the chat had before the first
+  week the bot ran itself — one cheap listing, not a read of the whole history. A poll is a
+  contest when two or more of its options carry a picture, or when its question names the
+  contest ("итоги", "конкурс", "голосование", "лучшая работа"); "что заказываем на стрим?"
+  is passed over. Polls of one week (a field split over two polls) are one contest; a poll
+  posted Monday to Wednesday counts for the week before. A question with its own hashtag is
+  that thematic contest.
+- **Loads the works.** Every option's picture, and every `#итогинедели` post of the two weeks
+  before each poll (Telegram's search, the whole album of each). A numbered poll — options
+  "1", "2", "3" — takes its pictures from the album the organiser posted just before it.
+- **Matches them to people**, strongest evidence first: a mention or an `@tag` in the
+  option; the option's picture being one of the week's posts (a 64-bit difference hash,
+  which survives Telegram recompressing the same photo); whoever added the option to an
+  open poll (not the organiser, who adds three or more), or whose photo the album
+  forwarded; the option's text being a post author's name; the text being the name of
+  somebody `/stat` knows. An ambiguous name ("Аня" when there are two) matches nobody. A
+  matched work is its post — its album, caption and link; an option nothing matches is
+  recorded under its own text, with its picture and its votes.
+- **Shows the plan first**: each week, its podium, how many authors were recognised and by
+  what, the options it could not place, and whether it will be written. A poll whose results
+  Telegram does not show this account (still open, not voted in) is listed and skipped — stop
+  it and scan again; voting in it would add a vote.
+- **"✅ Записать" writes it** the way every finished week is kept: the photos into the voting
+  archive, a results record beside the announced weeks' (marked `"source": "telegram_poll"`),
+  then the Hall of Fame imports them like any other week, covers and all. The weekly winners
+  go into `/weekwinner`'s numbered table too — reputation and the 🏆 in `/stat` — but only
+  while that table's numbering agrees with the order of the weeks (its №1 is the hall's first
+  week, and so on); otherwise the table is left alone and the reply says so. A week already
+  recorded is never overwritten, so a second run writes nothing.
+
+A lost option picture comes back from the poll itself, as a post's photos come back from the
+post (`/hall импорт`).
+
 **Saying what a contest was, after the fact.** A week recorded as "Итоги недели" that was
 really a thematic contest (week 40 was `#МассПокрас`) is renamed from the bot: `/hall
 конкурсы` (DM, administrators; also "✏️ Хэштег и название конкурса" under `/hall`) lists the
