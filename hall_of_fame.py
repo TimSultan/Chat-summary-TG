@@ -20,6 +20,13 @@ on disk, with the photos its clear archived. A week whose photos were deleted (b
 from before clears kept them) comes in without them, and works_missing_photos /
 attach_photos let the bot fetch them back from the posts in the chat.
 
+The contests run in the channel before the bot existed -- four weeks of #итогинедели and the
+"Лучшая работа месяца" rounds, voted in Telegram polls -- live in the repository under
+hall_archive/, checked by the administrators, and import_archive writes them in the same
+way, never over a contest the hall already has. A monthly round (MONTHLY_HASHTAG) gives
+one medal only: its winner takes the round's own (Contest.tier), so the bronze round's
+winner is the month's bronze; every medal count goes through Contest.medal_for.
+
 Storage is DATA_DIR/hall_of_fame/<chat key>/: one JSON file per contest under contests/,
 the pictures under media/<contest id>/. Reads go through a cache keyed on the files' own
 names, sizes and mtimes, so a page view costs a directory listing rather than a parse of
@@ -58,10 +65,25 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
 # contest's own badge, or voting.DEFAULT_THEME_BADGE when it was given none.
 WEEKLY_BADGE = "🏆"
 
+# "Работа месяца": three rounds a month (bronze, silver, gold) that re-ran the weeks'
+# third, second and first places. Each round crowns one winner with the round's own medal
+# (Contest.tier), so they are neither weekly contests nor thematic ones.
+MONTHLY_HASHTAG = "#итогимесяца"
+
+# The contests run in the channel before the bot existed (albums and Telegram polls),
+# checked by the administrators and kept in the repository: import_archive writes them in.
+ARCHIVE_DIR = Path(__file__).resolve().parent / "hall_archive"
+MEDAL_TIERS = (1, 2, 3)
+
 
 def _hall_dir() -> Path:
     """Indirection purely for tests, like voting._voting_dir."""
     return HALL_DIR
+
+
+def _archive_dir() -> Path:
+    """Indirection purely for tests."""
+    return ARCHIVE_DIR
 
 
 def _key(entry: str) -> str:
@@ -167,10 +189,18 @@ class Contest:
     closed_at: str = ""
     voters: int = 0
     works: list[Work] = field(default_factory=list)   # in place order
+    # 0 for an ordinary contest, whose first three places take gold, silver and bronze.
+    # 1, 2 or 3 for a round whose WINNER alone takes that medal -- the monthly bronze
+    # round's winner is the month's bronze, not a gold.
+    tier: int = 0
 
     @property
     def is_weekly(self) -> bool:
         return voting.is_weekly_hashtag(self.hashtag)
+
+    @property
+    def is_monthly(self) -> bool:
+        return self.hashtag == MONTHLY_HASHTAG
 
     def label(self) -> str:
         return voting.contest_title(self.hashtag, self.title)
@@ -188,10 +218,21 @@ class Contest:
         return None
 
     def podium(self) -> list[Work]:
+        """The works that took a medal, best first."""
+        if self.tier:
+            winner = self.winner()
+            return [winner] if winner else []
         return [work for work in self.works[:3] if work.votes > 0]
 
+    def medal_for(self, work: Work) -> int | None:
+        """The medal `work` took here -- 1 gold, 2 silver, 3 bronze -- or None. Every count
+        of medals (the leaderboard, an artist's tiles, the cards) goes through this."""
+        if not any(placed is work for placed in self.podium()):
+            return None
+        return self.tier or work.place
+
     def on_podium(self, work: Work) -> bool:
-        return any(placed is work for placed in self.podium())
+        return self.medal_for(work) is not None
 
     def week(self) -> str:
         """The ISO week the poll id names ("2026-W41"), whatever slug follows it."""
@@ -211,6 +252,7 @@ class Contest:
             "created_at": self.created_at,
             "closed_at": self.closed_at,
             "voters": self.voters,
+            "tier": self.tier,
             "works": [work.to_dict() for work in self.works],
         }
 
@@ -228,7 +270,13 @@ class Contest:
             closed_at=str(raw.get("closed_at") or ""),
             voters=int(raw.get("voters") or 0),
             works=works,
+            tier=_tier(raw.get("tier")),
         )
+
+
+def _tier(value) -> int:
+    tier = _int_or_none(value)
+    return tier if tier in MEDAL_TIERS else 0
 
 
 # One writer at a time: recording runs in worker threads (the close of a vote, an import),
@@ -336,7 +384,7 @@ def _make_thumb(directory: Path, name: str, crop: dict | None) -> str | None:
 
 def _record(
     entry: str, contest_id: str, standings: list, *, hashtag: str, title: str, badge: str,
-    created_at: str, closed_at: str, voters: int, sources: list[Path], crops: dict,
+    created_at: str, closed_at: str, voters: int, sources: list[Path], crops: dict, tier: int = 0,
 ) -> Contest:
     target = media_dir(entry, contest_id)
     works = []
@@ -352,7 +400,7 @@ def _record(
         ))
     contest = Contest(
         contest_id=contest_id, entry=entry, hashtag=hashtag, title=title, badge=badge,
-        created_at=created_at, closed_at=closed_at, voters=voters, works=works,
+        created_at=created_at, closed_at=closed_at, voters=voters, works=works, tier=tier,
     )
     save_contest(contest)
     return contest
@@ -452,6 +500,73 @@ def import_history(entry: str) -> dict:
     return {"added": added, "known": known, "without_photos": without_photos}
 
 
+def load_archive(directory: Path | None = None) -> list[dict]:
+    """The contests in hall_archive/contests.json, as written there: each with its works
+    in the order its Telegram poll listed them. [] when there is no archive."""
+    path = (directory or _archive_dir()) / "contests.json"
+    if not path.is_file():
+        return []
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return [item for item in raw.get("contests") or [] if isinstance(item, dict)]
+
+
+def archive_standings(record: dict) -> list[tuple["voting.Entry", int]]:
+    """One archived contest's works, best first. A tie keeps the poll's own order -- the
+    order the works were shown in -- which is what the bot's tally does with post order."""
+    rows = [row for row in record.get("works") or [] if isinstance(row, dict)]
+    ranked = sorted(enumerate(rows), key=lambda pair: (-int(pair[1].get("votes") or 0), pair[0]))
+    standings = []
+    for _, row in ranked:
+        photo = str(row.get("photo") or "")
+        standings.append((voting.Entry(
+            entry_id=str(row.get("entry_id") or ""),
+            message_id=int(row.get("message_id") or 0),
+            author_id=_int_or_none(row.get("author_id")),
+            author_name=str(row.get("author_name") or "Unknown"),
+            author_username=row.get("author_username") or None,
+            text=str(row.get("text") or ""),
+            media=[photo] if _SAFE_NAME.match(photo) else [],
+            posted_at=str(row.get("posted_at") or ""),
+        ), int(row.get("votes") or 0)))
+    return standings
+
+
+def import_archive(entry: str, directory: Path | None = None) -> dict:
+    """Writes in every archived contest (hall_archive/) the hall does not have yet, and
+    says how many: {"added", "known", "works_without_photos"}. Like import_history it
+    never overwrites a contest already in the hall, so running it again changes nothing.
+
+    The photos are the album pictures the channel's vote showed, kept beside the records.
+    A work without one but with the message id of its post in the chat is fetched back
+    from there by the bot afterwards (works_missing_photos), as any other hall work is."""
+    directory = directory or _archive_dir()
+    added = known = works_without_photos = 0
+    with _write_lock:
+        recorded = {path.stem for path in contests_dir(entry).glob("*.json")} if contests_dir(entry).exists() else set()
+        for record in load_archive(directory):
+            contest_id = str(record.get("contest_id") or "")
+            if not _SAFE_NAME.match(contest_id):
+                continue
+            if contest_id in recorded:
+                known += 1
+                continue
+            standings = archive_standings(record)
+            if not standings:
+                continue
+            contest = _record(
+                entry, contest_id, standings,
+                hashtag=voting.normalize_hashtag(record.get("hashtag")) or voting.CONTEST_HASHTAG,
+                title=str(record.get("title") or ""), badge=str(record.get("badge") or ""),
+                created_at=str(record.get("created_at") or ""), closed_at=str(record.get("closed_at") or ""),
+                voters=int(record.get("voters") or 0),
+                sources=[directory / "media" / contest_id], crops={}, tier=_tier(record.get("tier")),
+            )
+            recorded.add(contest_id)
+            added += 1
+            works_without_photos += sum(1 for work in contest.works if not work.photos)
+    return {"added": added, "known": known, "works_without_photos": works_without_photos}
+
+
 def works_missing_photos(entry: str) -> list[tuple[str, str, int]]:
     """(contest id, entry id, message id) of every work in the hall with no picture --
     a week whose photos were deleted before the hall kept copies. The message id is the
@@ -502,6 +617,8 @@ def relabel_contest(entry: str, contest_id: str, hashtag, title: str = "", badge
         weekly = tag == voting.CONTEST_HASHTAG
         contest.title = "" if weekly else (title or "")[:voting.THEME_TITLE_MAX_LENGTH].strip()
         contest.badge = "" if weekly else (badge or "")[:voting.THEME_BADGE_MAX_LENGTH].strip()
+        if tag != MONTHLY_HASHTAG:
+            contest.tier = 0   # only a monthly round crowns a single medal
         save_contest(contest)
         return contest
 
@@ -526,18 +643,20 @@ class Artist:
     def podiums(self) -> int:
         return sum(1 for contest, work in self.entries if contest.on_podium(work))
 
-    def medals(self, place: int) -> int:
-        """How many times this artist took `place` (1, 2 or 3) with votes behind it --
-        the podium rule (Contest.podium): a nought earns no medal, whatever its place."""
-        return sum(1 for contest, work in self.entries if work.place == place and contest.on_podium(work))
+    def medals(self, medal: int) -> int:
+        """How many times this artist took `medal` (1 gold, 2 silver, 3 bronze) -- by
+        Contest.medal_for: a nought earns no medal whatever its place, and a monthly
+        round's winner takes the round's own medal."""
+        return sum(1 for contest, work in self.entries if contest.medal_for(work) == medal)
 
     @property
     def total_votes(self) -> int:
         return sum(work.votes for _, work in self.entries)
 
     def best_place(self) -> int | None:
-        places = [work.place for contest, work in self.entries if contest.on_podium(work)]
-        return min(places) if places else None
+        """The best medal taken (1 is gold), or None for an artist without one."""
+        medals = [contest.medal_for(work) for contest, work in self.entries if contest.on_podium(work)]
+        return min(medals) if medals else None
 
 
 @dataclass
