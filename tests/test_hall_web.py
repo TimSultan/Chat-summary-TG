@@ -162,7 +162,8 @@ class HallApiTests(AsyncTestCase):
         self.assertEqual([w["contest"] for w in data["entries"]], ["2026-W40-abcdef", "2026-W40", "2026-W39"])
         self.assertEqual(data["entries"][0]["contest_title"], "Лучший аниме-покрас")
         self.assertEqual(data["badges"], [
-            {"badge": "🏆", "title": "Итоги недели", "weekly": True, "count": 2, "contests": ["2026-W40", "2026-W39"]},
+            {"badge": "🏆", "title": "Итоги недели", "weekly": True, "kind": "weekly", "count": 2,
+             "contests": ["2026-W40", "2026-W39"]},
         ])
         boria = (await self._json("/api/artists/2"))["artist"]
         self.assertEqual([(b["badge"], b["title"], b["count"]) for b in boria["badges"]],
@@ -308,6 +309,42 @@ class LeaderboardLayoutTests(unittest.TestCase):
     def test_every_row_shows_all_three_medals(self):
         for medal in ('medalCount("🥇", artist.gold', 'medalCount("🥈", artist.silver', 'medalCount("🥉", artist.bronze'):
             self.assertIn(medal, hall_web.PAGE_HTML)
+
+
+class MonthlyRoundPayloadTests(unittest.TestCase):
+    """A monthly round is its own kind: not counted among the thematic contests, and its
+    winner shown with the round's medal, which the page draws instead of the place's."""
+
+    def setUp(self):
+        week = _contest("2026-W27", [("1", 1, "Аня", 9), ("2", 2, "Боря", 5)], when="2026-07-08")
+        bronze = _contest("2026-07-bronze", [("3", 2, "Боря", 28), ("4", 1, "Аня", 17)],
+                          hashtag=hall_of_fame.MONTHLY_HASHTAG, title="Работа месяца · июль · Бронза",
+                          badge="🥉", when="2026-08-01")
+        bronze.tier = 3
+        self.hall = hall_of_fame.build_hall([week, bronze])
+
+    def test_it_is_neither_weekly_nor_thematic(self):
+        overview = hall_web.overview_payload(self.hall, P)
+        self.assertEqual(overview["stats"]["themes"], 0)
+        self.assertEqual(overview["themes"], [])
+        kinds = {c["id"]: c["kind"] for c in hall_web.contests_payload(self.hall, P)["contests"]}
+        self.assertEqual(kinds, {"2026-W27": "weekly", "2026-07-bronze": "monthly"})
+
+    def test_its_winner_alone_takes_the_rounds_medal(self):
+        (summary,) = [c for c in hall_web.contests_payload(self.hall, P)["contests"] if c["id"] == "2026-07-bronze"]
+        self.assertEqual([(w["author"]["name"], w["place"], w["medal"]) for w in summary["podium"]], [("Боря", 1, 3)])
+        entries = hall_web.contest_payload(self.hall, P, "2026-07-bronze", None)["contest"]["entries"]
+        self.assertEqual([(w["medal"], w["podium"]) for w in entries], [(3, True), (None, False)])
+        week = hall_web.contest_payload(self.hall, P, "2026-W27", None)["contest"]["entries"]
+        self.assertEqual([w["medal"] for w in week], [1, 2])
+
+    def test_the_medal_table_and_badges_follow_it(self):
+        borya = hall_web.artist_payload(self.hall, P, "2", None)["artist"]
+        self.assertEqual((borya["gold"], borya["silver"], borya["bronze"]), (0, 1, 1))
+        self.assertEqual([(b["badge"], b["title"], b["kind"]) for b in borya["badges"]],
+                         [("🥉", "Работа месяца · июль · Бронза", "monthly")])
+        anya = hall_web.artist_payload(self.hall, P, "1", None)["artist"]
+        self.assertEqual((anya["gold"], anya["silver"], anya["bronze"]), (1, 0, 0))   # 2nd in the round: nothing
 
 
 class PageScriptSyntaxTests(unittest.TestCase):

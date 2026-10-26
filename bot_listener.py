@@ -7069,15 +7069,24 @@ async def handle_hall_command(
             await reply("Переносить историю в Доску почёта могут только администраторы.")
             return
         await reply("Переношу прошлые итоги в Доску почёта… Это может занять минуту: копирую фото.")
+
+        def import_all() -> tuple[dict, dict]:
+            # The bot's own records, then the contests run in the channel before the bot
+            # (hall_archive/). Both copy photos and draw thumbnails: one worker thread, so
+            # the chat is not kept waiting behind it.
+            return hall_of_fame.import_history(entry), hall_of_fame.import_archive(entry)
+
         try:
-            # Copies photos and draws thumbnails for every week it brings in: a worker
-            # thread, so the chat is not kept waiting behind it.
-            counts = await asyncio.to_thread(hall_of_fame.import_history, entry)
+            counts, archived = await asyncio.to_thread(import_all)
         except Exception:
             log(f"[bot_listener] the hall import failed:\n{traceback.format_exc()}")
             await reply("Не получилось перенести историю — смотри логи.")
             return
-        lines = [f"Готово. Перенесено конкурсов: {counts['added']}, уже были: {counts['known']}."]
+        log(f"[bot_listener] hall import: history {counts}, pre-bot archive {archived}")
+        lines = [f"Готово. Перенесено конкурсов: {counts['added'] + archived['added']}, "
+                 f"уже были: {counts['known'] + archived['known']}."]
+        if archived["added"]:
+            lines.append(f"Из них конкурсов до бота (из канала ЕПХ): {archived['added']}.")
         restored, gone = await _restore_hall_photos(telethon_client, entry, log=log)
         if restored:
             lines.append(f"Фото возвращены из чата: {restored} работ.")

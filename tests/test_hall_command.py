@@ -51,6 +51,8 @@ class _Hall(unittest.TestCase):
         self._patchers = [
             patch("voting._voting_dir", return_value=root / "voting"),
             patch("hall_of_fame._hall_dir", return_value=root / "hall"),
+            # No pre-bot archive unless a test writes one: the import counts stay the bot's own.
+            patch("hall_of_fame._archive_dir", return_value=root / "archive"),
         ]
         for patcher in self._patchers:
             patcher.start()
@@ -134,6 +136,24 @@ class HallCommandTests(_Hall):
         self.assertIn("Перенесено конкурсов: 1, уже были: 0", api.sent[-1][0])
         self.assertIsNotNone(hall_of_fame.load_contest(CHAT, "2026-W41"))
         self.assertIn("уже были: 1", self._type("/hall импорт").sent[-1][0])
+
+    def test_the_import_also_brings_in_the_contests_from_before_the_bot(self):
+        voting.save_results(self._closed_poll(), self._closed_poll().tally(), "текст")
+        archive = hall_of_fame._archive_dir()
+        (archive / "media" / "2026-W27").mkdir(parents=True)
+        (archive / "media" / "2026-W27" / "48.jpg").write_bytes(b"not really a jpeg")
+        (archive / "contests.json").write_text(
+            '{"contests": [{"contest_id": "2026-W27", "hashtag": "#итогинедели", "voters": 3, '
+            '"works": [{"entry_id": "epx48", "votes": 3, "author_id": 21, "author_name": "Юля", "photo": "48.jpg"}]}]}',
+            encoding="utf-8")
+
+        text = self._type("/hall импорт").sent[-1][0]
+        self.assertIn("Перенесено конкурсов: 2, уже были: 0", text)
+        self.assertIn("Из них конкурсов до бота (из канала ЕПХ): 1", text)
+        self.assertEqual(hall_of_fame.load_contest(CHAT, "2026-W27").winner().author_name, "Юля")
+        again = self._type("/hall импорт").sent[-1][0]
+        self.assertIn("Перенесено конкурсов: 0, уже были: 2", again)
+        self.assertNotIn("до бота", again)
 
     def test_the_import_button_replays_the_command_for_its_owner_only(self):
         api = FakeApi()

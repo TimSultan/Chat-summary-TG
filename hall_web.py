@@ -82,6 +82,9 @@ def _work_brief(base: str, contest: hall_of_fame.Contest, work: hall_of_fame.Wor
         "votes": work.votes,
         "winner": contest.winner() is work,
         "podium": contest.on_podium(work),
+        # Which medal, not just whether: a monthly round's winner takes the round's own
+        # (hall_of_fame.Contest.medal_for), so the place alone cannot say.
+        "medal": contest.medal_for(work),
         "author": _author(base, work.author_id, work.author_name, work.author_username),
         "thumb": _photo_url(base, contest, work.thumb or first),
         "photo": _photo_url(base, contest, first),
@@ -100,6 +103,12 @@ def _work_full(base: str, contest: hall_of_fame.Contest, work: hall_of_fame.Work
     return payload
 
 
+def _kind(contest: hall_of_fame.Contest) -> str:
+    if contest.is_weekly:
+        return "weekly"
+    return "monthly" if contest.is_monthly else "theme"
+
+
 def _contest_summary(base: str, contest: hall_of_fame.Contest) -> dict:
     winner = contest.winner()
     return {
@@ -107,6 +116,7 @@ def _contest_summary(base: str, contest: hall_of_fame.Contest) -> dict:
         "title": contest.label(),
         "hashtag": contest.hashtag,
         "weekly": contest.is_weekly,
+        "kind": _kind(contest),
         "badge": contest.winner_badge(),
         "week": contest.week(),
         "closed_at": contest.when(),
@@ -125,7 +135,8 @@ def _badges(artist: hall_of_fame.Artist) -> list[dict]:
         title = voting.WEEKLY_CONTEST_TITLE if contest.is_weekly else contest.label()
         key = (contest.winner_badge(), title)
         badge = grouped.setdefault(key, {
-            "badge": key[0], "title": title, "weekly": contest.is_weekly, "count": 0, "contests": [],
+            "badge": key[0], "title": title, "weekly": contest.is_weekly, "kind": _kind(contest),
+            "count": 0, "contests": [],
         })
         badge["count"] += 1
         badge["contests"].append(contest.contest_id)
@@ -163,11 +174,11 @@ def overview_payload(hall: hall_of_fame.Hall, base: str, bot: str = "") -> dict:
             "contests": len(hall.contests),
             "works": sum(len(c.works) for c in hall.contests),
             "artists": len(hall.artists),
-            "themes": sum(1 for c in hall.contests if not c.is_weekly),
+            "themes": sum(1 for c in hall.contests if _kind(c) == "theme"),
         },
         "latest": [_contest_summary(base, c) for c in winners[:OVERVIEW_WINNERS]],
         "artists": [_artist_summary(base, a, rank) for rank, a in enumerate(hall.artists[:OVERVIEW_ARTISTS], start=1)],
-        "themes": [_contest_summary(base, c) for c in hall.contests if not c.is_weekly],
+        "themes": [_contest_summary(base, c) for c in hall.contests if _kind(c) == "theme"],
     }
 
 
@@ -717,11 +728,11 @@ function emptyState(text) {
 
 // ------------------------------------------------------------------- pieces
 function workCard(work, sub, list, index) {
-  const placeClass = work.podium ? `place p${work.place}` : "place";
+  const placeClass = work.medal ? `place p${work.medal}` : "place";
   return h("div", {class: "card" + (work.winner ? " win" : "")},
     h("div", {class: "pic", onclick: () => openLightbox(list, index)},
       picture(work.thumb, work.author.name),
-      h("span", {class: placeClass}, work.podium ? `${medal(work.place)} ${work.place}` : `#${work.place}`),
+      h("span", {class: placeClass}, work.medal ? `${medal(work.medal)} ${work.place}` : `#${work.place}`),
       h("span", {class: "votes"}, votesLabel(work.votes))),
     h("a", {class: "foot", href: `#/artist/${work.author.key}`},
       avatar(work.author, "s"),
@@ -731,7 +742,8 @@ function workCard(work, sub, list, index) {
 function badgePills(badges) {
   if (!badges || !badges.length) return null;
   return h("div", {class: "badges"}, badges.map((b) =>
-    h("span", {class: "badge", title: b.weekly ? "Победы в итогах недели" : "Победа в тематическом конкурсе"},
+    h("span", {class: "badge", title: b.weekly ? "Победы в итогах недели"
+                                     : b.kind === "monthly" ? "Лучшая работа месяца" : "Победа в тематическом конкурсе"},
       h("span", {class: "e"}, b.badge), b.title, b.count > 1 ? h("span", {class: "x"}, `×${b.count}`) : null)));
 }
 
@@ -773,7 +785,7 @@ function contestBlock(contest) {
     const work = contest.podium.find((w) => w.place === place);
     return h("a", {class: "slot", href: work ? `#/artist/${work.author.key}` : `#/contest/${contest.id}`},
       work ? picture(work.thumb, work.author.name) : null,
-      work ? h("span", {class: `place p${place}`}, medal(place)) : null,
+      work ? h("span", {class: `place p${work.medal}`}, medal(work.medal)) : null,
       work ? h("span", {class: "cap"}, work.author.name) : null);
   });
   return h("article", {class: "contest"},
@@ -823,7 +835,7 @@ async function screenHome() {
         h("div", {class: "heroMeta"}, `${contestMeta(top)} · ${votesLabel(win.votes)} у победителя`)),
       h("div", {class: "podiumMini"}, top.podium.map((w) =>
         h("a", {class: "pmRow", href: `#/artist/${w.author.key}`},
-          h("span", {style: "font-size:20px"}, medal(w.place)),
+          h("span", {style: "font-size:20px"}, medal(w.medal)),
           w.thumb ? h("img", {class: "th", src: w.thumb, alt: "", loading: "lazy"}) : null,
           h("span", {class: "who"}, w.author.name),
           h("span", {class: "v"}, votesLabel(w.votes))))))));
@@ -856,9 +868,11 @@ async function screenContests() {
   const holder = h("div", {class: "timeline"});
   const chips = h("div", {class: "chips"});
   const draw = () => {
-    chips.replaceChildren(...[["all", "Все"], ["weekly", "Итоги недели"], ["themes", "Тематические"]].map(([key, label]) =>
+    const kinds = [["all", "Все"], ["weekly", "Итоги недели"], ["monthly", "Итоги месяца"], ["theme", "Тематические"]]
+      .filter(([key]) => key === "all" || data.contests.some((c) => c.kind === key));
+    chips.replaceChildren(...kinds.map(([key, label]) =>
       h("button", {class: "chip" + (filter === key ? " on" : ""), onclick: () => { filter = key; draw(); }}, label)));
-    const shown = data.contests.filter((c) => filter === "all" || (filter === "weekly") === c.weekly);
+    const shown = data.contests.filter((c) => filter === "all" || c.kind === filter);
     const nodes = [];
     let month = "";
     for (const contest of shown) {
@@ -1034,7 +1048,7 @@ function showWork(index) {
   strip.scrollLeft = 0;
   document.getElementById("lbCount").textContent =
     (lbList.length > 1 ? `Работа ${lbIndex + 1} из ${lbList.length}` : "") + (photos.length > 1 ? ` · ${photos.length} фото` : "");
-  const where = [work.contest_title, work.podium ? `${medal(work.place)} ${work.place} место` : `${work.place} место`, votesLabel(work.votes)]
+  const where = [work.contest_title, work.medal ? `${medal(work.medal)} ${work.place} место` : `${work.place} место`, votesLabel(work.votes)]
     .filter(Boolean).join(" · ");
   document.getElementById("lbInfo").replaceChildren(
     avatar(work.author, "m"),

@@ -295,5 +295,157 @@ class ReadingTests(_Store):
         self.assertEqual(hall_of_fame.Contest.from_dict(raw).to_dict(), contest.to_dict())
 
 
+MONTHLY = hall_of_fame.MONTHLY_HASHTAG
+
+
+def _round(contest_id, rows, tier, when="2026-08-01"):
+    """A monthly round: rows are (entry id, author id, name, votes), in place order."""
+    return hall_of_fame.Contest(
+        contest_id=contest_id, entry=CHAT, hashtag=MONTHLY, title="Работа месяца", badge="🥉",
+        closed_at=f"{when}T00:00:00+00:00", tier=tier,
+        works=[hall_of_fame.Work(entry_id=e, place=i, votes=v, author_id=a, author_name=n)
+               for i, (e, a, n, v) in enumerate(rows, start=1)],
+    )
+
+
+class MonthlyRoundTests(unittest.TestCase):
+    """A monthly round re-runs the weeks' placed works; its winner alone takes the round's
+    own medal -- the bronze round's winner is the month's bronze, not a gold."""
+
+    def test_the_bronze_rounds_winner_takes_bronze_and_nobody_else_a_medal(self):
+        contest = _round("2026-07-bronze", [("1", 1, "Аня", 28), ("2", 2, "Боря", 21), ("3", 3, "Вера", 17)], tier=3)
+        hall = hall_of_fame.build_hall([contest])
+        anya, borya, vera = (hall.by_key[k] for k in ("1", "2", "3"))
+        self.assertEqual((anya.medals(1), anya.medals(2), anya.medals(3)), (0, 0, 1))
+        self.assertEqual((borya.podiums, vera.podiums), (0, 0))
+        self.assertEqual([w.entry_id for w in contest.podium()], ["1"])
+        self.assertEqual(anya.best_place(), 3)
+        self.assertEqual([c.contest_id for c in anya.wins], ["2026-07-bronze"])   # the badge
+        self.assertTrue(contest.is_monthly)
+        self.assertFalse(contest.is_weekly)
+
+    def test_a_round_nobody_voted_in_crowns_nobody(self):
+        contest = _round("2026-07-gold", [("1", 1, "Аня", 0)], tier=1)
+        self.assertEqual(contest.podium(), [])
+        self.assertIsNone(contest.medal_for(contest.works[0]))
+
+    def test_monthly_medals_rank_like_any_other(self):
+        hall = hall_of_fame.build_hall([
+            _round("2026-07-gold", [("1", 1, "Аня", 9), ("2", 2, "Боря", 8)], tier=1),
+            _round("2026-07-silver", [("3", 2, "Боря", 9), ("4", 3, "Вера", 1)], tier=2),
+        ])
+        self.assertEqual([a.key for a in hall.artists], ["1", "2", "3"])
+        self.assertEqual(hall.by_key["2"].medals(2), 1)
+
+    def test_an_ordinary_contest_keeps_three_medals(self):
+        contest = hall_of_fame.Contest(contest_id="2026-W27", entry=CHAT, works=[
+            hall_of_fame.Work(entry_id=str(i), place=i, votes=10 - i, author_id=i, author_name=str(i)) for i in (1, 2, 3, 4)])
+        self.assertEqual([contest.medal_for(w) for w in contest.works], [1, 2, 3, None])
+
+    def test_the_tier_survives_a_round_trip_and_nonsense_is_no_tier(self):
+        contest = _round("2026-07-silver", [("1", 1, "Аня", 5)], tier=2)
+        raw = json.loads(json.dumps(contest.to_dict()))
+        self.assertEqual(hall_of_fame.Contest.from_dict(raw).tier, 2)
+        raw["tier"] = 7
+        self.assertEqual(hall_of_fame.Contest.from_dict(raw).tier, 0)
+        del raw["tier"]                                     # every record from before tiers
+        self.assertEqual(hall_of_fame.Contest.from_dict(raw).tier, 0)
+
+
+class RelabelTierTests(_Store):
+    def test_relabelling_a_round_as_anything_else_drops_its_single_medal(self):
+        hall_of_fame.save_contest(_round("2026-07-bronze", [("1", 1, "Аня", 5), ("2", 2, "Боря", 4)], tier=3))
+        contest = hall_of_fame.relabel_contest(CHAT, "2026-07-bronze", ANIME, "Аниме", "🌸")
+        self.assertEqual(contest.tier, 0)
+        self.assertEqual([contest.medal_for(w) for w in contest.works], [1, 2])
+
+
+def _jpeg(path: Path, colour=(120, 60, 30)):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (600, 800), colour).save(path, "JPEG")
+
+
+class ArchiveImportTests(_Store):
+    def _archive(self, contests):
+        directory = Path(self._temporary.name) / "archive"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "contests.json").write_text(
+            json.dumps({"contests": contests}, ensure_ascii=False), encoding="utf-8")
+        for record in contests:
+            for row in record["works"]:
+                if row.get("photo"):
+                    _jpeg(directory / "media" / record["contest_id"] / row["photo"])
+        return directory
+
+    def _week(self, contest_id="2026-W27", votes=(3, 9, 3, 1)):
+        return {
+            "contest_id": contest_id, "hashtag": "#итогинедели", "voters": sum(votes),
+            "created_at": "2026-07-05T06:24:51+00:00", "closed_at": "2026-07-08T07:23:00+00:00",
+            "works": [{"entry_id": f"epx{48 + i}", "votes": v, "author_id": 100 + i, "author_name": f"Автор {i}",
+                       "author_username": f"user{i}", "message_id": 70000 + i, "photo": f"{48 + i}.jpg"}
+                      for i, v in enumerate(votes)],
+        }
+
+    def test_an_archived_week_comes_in_ranked_with_its_album_photos(self):
+        directory = self._archive([self._week()])
+        self.assertEqual(hall_of_fame.import_archive(CHAT, directory),
+                         {"added": 1, "known": 0, "works_without_photos": 0})
+        contest = hall_of_fame.load_contest(CHAT, "2026-W27")
+        # 9 first; the two threes keep the poll's order; the one last.
+        self.assertEqual([w.entry_id for w in contest.works], ["epx49", "epx48", "epx50", "epx51"])
+        self.assertEqual([w.place for w in contest.works], [1, 2, 3, 4])
+        self.assertEqual(contest.works[0].author_id, 101)
+        self.assertEqual(contest.works[0].message_id, 70001)       # the post in the chat
+        self.assertTrue(all(w.photos and w.thumb for w in contest.works))
+        self.assertTrue(contest.is_weekly)
+        self.assertEqual((contest.voters, contest.closed_at), (16, "2026-07-08T07:23:00+00:00"))
+
+    def test_a_monthly_round_keeps_its_tier(self):
+        record = dict(self._week("2026-07-bronze"), hashtag=MONTHLY, title="Работа месяца · июль · Бронза",
+                      badge="🥉", tier=3)
+        hall_of_fame.import_archive(CHAT, self._archive([record]))
+        contest = hall_of_fame.load_contest(CHAT, "2026-07-bronze")
+        self.assertEqual((contest.tier, contest.winner_badge(), contest.label()),
+                         (3, "🥉", "Работа месяца · июль · Бронза"))
+        self.assertEqual([contest.medal_for(w) for w in contest.works], [3, None, None, None])
+
+    def test_importing_again_changes_nothing_and_never_overwrites(self):
+        directory = self._archive([self._week()])
+        hall_of_fame.import_archive(CHAT, directory)
+        before = hall_of_fame.contest_path(CHAT, "2026-W27").read_bytes()
+        with patch("hall_of_fame.save_contest", wraps=hall_of_fame.save_contest) as save:
+            self.assertEqual(hall_of_fame.import_archive(CHAT, directory),
+                             {"added": 0, "known": 1, "works_without_photos": 0})
+            self.assertEqual(save.call_count, 0)
+        self.assertEqual(hall_of_fame.contest_path(CHAT, "2026-W27").read_bytes(), before)
+
+    def test_a_contest_the_bot_already_recorded_is_left_alone(self):
+        poll = self._poll(poll_id="2026-W27")
+        hall_of_fame.record_poll(poll, poll.tally())
+        before = hall_of_fame.contest_path(CHAT, "2026-W27").read_bytes()
+        self.assertEqual(hall_of_fame.import_archive(CHAT, self._archive([self._week()]))["known"], 1)
+        self.assertEqual(hall_of_fame.contest_path(CHAT, "2026-W27").read_bytes(), before)
+
+    def test_each_contest_is_written_once(self):
+        directory = self._archive([self._week("2026-W27"), self._week("2026-W28"), self._week("2026-W29")])
+        with patch("hall_of_fame.save_contest", wraps=hall_of_fame.save_contest) as save:
+            self.assertEqual(hall_of_fame.import_archive(CHAT, directory)["added"], 3)
+        self.assertEqual(save.call_count, 3)
+
+    def test_a_work_without_a_photo_is_fetched_back_from_its_post_only(self):
+        week = self._week()
+        week["works"][0]["photo"] = ""                    # post known, picture not kept
+        week["works"][1].update(photo="", message_id=0)   # neither
+        counts = hall_of_fame.import_archive(CHAT, self._archive([week]))
+        self.assertEqual(counts["works_without_photos"], 2)
+        # Only the work whose chat post is known is sent to be fetched -- an archive entry id
+        # is never mistaken for a message id.
+        self.assertEqual(hall_of_fame.works_missing_photos(CHAT), [("2026-W27", "epx48", 70000)])
+
+    def test_no_archive_is_nothing_to_import(self):
+        empty = Path(self._temporary.name) / "nothing"
+        self.assertEqual(hall_of_fame.import_archive(CHAT, empty), {"added": 0, "known": 0, "works_without_photos": 0})
+
+
 if __name__ == "__main__":
     unittest.main()
