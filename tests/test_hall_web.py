@@ -333,6 +333,12 @@ class MonthlyRoundPayloadTests(unittest.TestCase):
     def test_its_winner_alone_takes_the_rounds_medal(self):
         (summary,) = [c for c in hall_web.contests_payload(self.hall, P)["contests"] if c["id"] == "2026-07-bronze"]
         self.assertEqual([(w["author"]["name"], w["place"], w["medal"]) for w in summary["podium"]], [("Боря", 1, 3)])
+        # The card still shows the round's places, not one lonely winner beside empty slots.
+        self.assertEqual([(w["author"]["name"], w["place"], w["medal"]) for w in summary["top"]],
+                         [("Боря", 1, 3), ("Аня", 2, None)])
+        for work in summary["top"]:
+            self.assertNotIn("text", work)
+            self.assertNotIn("photos", work)
         entries = hall_web.contest_payload(self.hall, P, "2026-07-bronze", None)["contest"]["entries"]
         self.assertEqual([(w["medal"], w["podium"]) for w in entries], [(3, True), (None, False)])
         week = hall_web.contest_payload(self.hall, P, "2026-W27", None)["contest"]["entries"]

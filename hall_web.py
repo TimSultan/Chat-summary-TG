@@ -123,6 +123,9 @@ def _contest_summary(base: str, contest: hall_of_fame.Contest) -> dict:
         "voters": contest.voters,
         "works": len(contest.works),
         "podium": [_work_brief(base, contest, work) for work in contest.podium()],
+        # The first three places, medal or not: a monthly round's medal goes to its winner
+        # alone, yet its card still shows who came second and third.
+        "top": [_work_brief(base, contest, work) for work in contest.works[:3] if work.votes > 0],
         "winner": _work_brief(base, contest, winner) if winner else None,
     }
 
@@ -780,12 +783,19 @@ function contestMeta(contest) {
     .filter(Boolean).join(" · ");
 }
 
+// The first three places as the card's three slots. A place without a medal (second
+// and third in a monthly round) shows its number instead.
+function placeMark(work) {
+  return work.medal ? h("span", {class: `place p${work.medal}`}, medal(work.medal)) : h("span", {class: "place"}, `#${work.place}`);
+}
+
 function contestBlock(contest) {
+  const top = contest.top || contest.podium;
   const slots = [1, 2, 3].map((place) => {
-    const work = contest.podium.find((w) => w.place === place);
+    const work = top.find((w) => w.place === place);
     return h("a", {class: "slot", href: work ? `#/artist/${work.author.key}` : `#/contest/${contest.id}`},
       work ? picture(work.thumb, work.author.name) : null,
-      work ? h("span", {class: `place p${work.medal}`}, medal(work.medal)) : null,
+      work ? placeMark(work) : null,
       work ? h("span", {class: "cap"}, work.author.name) : null);
   });
   return h("article", {class: "contest"},
@@ -795,7 +805,7 @@ function contestBlock(contest) {
         h("div", {class: "t"}, contest.title, " ", contest.weekly ? null : h("span", {class: "tag"}, contest.hashtag)),
         h("div", {class: "m"}, contestMeta(contest))),
       h("span", {class: "more"}, "Все работы →")),
-    contest.podium.length ? h("div", {class: "pod"}, slots) : h("p", {class: "muted"}, "В этом конкурсе никто не набрал голосов."));
+    top.length ? h("div", {class: "pod"}, slots) : h("p", {class: "muted"}, "В этом конкурсе никто не набрал голосов."));
 }
 
 // ------------------------------------------------------------------- screens
@@ -833,9 +843,10 @@ async function screenHome() {
       h("a", {href: `#/contest/${top.id}`},
         h("div", {style: "font-weight:700"}, `${top.title} `, top.weekly ? null : h("span", {class: "tag"}, top.hashtag)),
         h("div", {class: "heroMeta"}, `${contestMeta(top)} · ${votesLabel(win.votes)} у победителя`)),
-      h("div", {class: "podiumMini"}, top.podium.map((w) =>
+      h("div", {class: "podiumMini"}, (top.top || top.podium).map((w) =>
         h("a", {class: "pmRow", href: `#/artist/${w.author.key}`},
-          h("span", {style: "font-size:20px"}, medal(w.medal)),
+          w.medal ? h("span", {style: "font-size:20px"}, medal(w.medal))
+            : h("span", {class: "muted", style: "font-weight:700"}, `#${w.place}`),
           w.thumb ? h("img", {class: "th", src: w.thumb, alt: "", loading: "lazy"}) : null,
           h("span", {class: "who"}, w.author.name),
           h("span", {class: "v"}, votesLabel(w.votes))))))));
