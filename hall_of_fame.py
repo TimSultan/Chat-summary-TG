@@ -27,6 +27,11 @@ way, never over a contest the hall already has. A monthly round (MONTHLY_HASHTAG
 one medal only: its winner takes the round's own (Contest.tier), so the bronze round's
 winner is the month's bronze; every medal count goes through Contest.medal_for.
 
+THE LEADERBOARD IS RANKED BY POINTS (Artist.score): a medal is worth a fixed number of them,
+one gold as much as two silvers or three bronzes, and every contest entered adds one more,
+so taking part counts even without a place. Votes never become points -- one week has
+twice another's voters -- they only break a tie.
+
 Storage is DATA_DIR/hall_of_fame/<chat key>/: one JSON file per contest under contests/,
 the pictures under media/<contest id>/. Reads go through a cache keyed on the files' own
 names, sizes and mtimes, so a page view costs a directory listing rather than a parse of
@@ -74,6 +79,19 @@ MONTHLY_HASHTAG = "#итогимесяца"
 # checked by the administrators and kept in the repository: import_archive writes them in.
 ARCHIVE_DIR = Path(__file__).resolve().parent / "hall_archive"
 MEDAL_TIERS = (1, 2, 3)
+
+# The leaderboard's points, agreed with the administrators. One gold = two silvers = three
+# bronzes. The month's medals are worth half as much again: its rounds are run between the
+# weeks' own medallists. Every contest an artist entered adds PARTICIPATION_POINTS, once
+# however many of their works it had -- otherwise more posts would mean more points.
+MEDAL_POINTS = {1: 12, 2: 6, 3: 4}
+MONTHLY_MEDAL_POINTS = {1: 18, 2: 9, 3: 6}
+PARTICIPATION_POINTS = 1
+
+
+def medal_points(medal: int, monthly: bool) -> int:
+    """What `medal` (1 gold, 2 silver, 3 bronze) is worth on the leaderboard."""
+    return (MONTHLY_MEDAL_POINTS if monthly else MEDAL_POINTS)[medal]
 
 
 def _hall_dir() -> Path:
@@ -626,6 +644,37 @@ def relabel_contest(entry: str, contest_id: str, hashtag, title: str = "", badge
 # ------------------------------------------------------------------------------ reading
 
 
+@dataclass(frozen=True)
+class MedalLine:
+    """One kind of medal in an artist's points: the contests' golds, the month's golds..."""
+    medal: int        # 1 gold, 2 silver, 3 bronze
+    monthly: bool
+    count: int
+
+    @property
+    def each(self) -> int:
+        return medal_points(self.medal, self.monthly)
+
+    @property
+    def points(self) -> int:
+        return self.count * self.each
+
+
+@dataclass(frozen=True)
+class Score:
+    """An artist's leaderboard points and what they are made of."""
+    medals: tuple[MedalLine, ...]   # gold first; the month's before the contests' of a kind
+    contests: int                    # contests entered, each counted once
+
+    @property
+    def participation(self) -> int:
+        return self.contests * PARTICIPATION_POINTS
+
+    @property
+    def points(self) -> int:
+        return sum(line.points for line in self.medals) + self.participation
+
+
 @dataclass
 class Artist:
     key: str
@@ -658,6 +707,22 @@ class Artist:
         medals = [contest.medal_for(work) for contest, work in self.entries if contest.on_podium(work)]
         return min(medals) if medals else None
 
+    def score(self) -> Score:
+        """The leaderboard's points, in one pass over the entries: every medal by
+        medal_points, and PARTICIPATION_POINTS once per contest entered -- two works in
+        one contest are one participation, though each keeps its own medal."""
+        counts: dict[tuple[int, bool], int] = {}
+        contests = set()
+        for contest, work in self.entries:
+            contests.add(contest.contest_id)
+            medal = contest.medal_for(work)
+            if medal is not None:
+                kind = (medal, contest.is_monthly)
+                counts[kind] = counts.get(kind, 0) + 1
+        order = sorted(counts, key=lambda kind: (kind[0], not kind[1]))
+        return Score(medals=tuple(MedalLine(medal, monthly, counts[(medal, monthly)]) for medal, monthly in order),
+                     contests=len(contests))
+
 
 @dataclass
 class Hall:
@@ -668,10 +733,10 @@ class Hall:
 
 
 def _rank(artist: Artist) -> tuple:
-    """The medal table: golds, then silvers, then bronzes -- so one silver outranks any
-    number of bronzes, as at the Olympics -- then votes, then works entered."""
-    return (-artist.medals(1), -artist.medals(2), -artist.medals(3), -artist.total_votes,
-            -len(artist.entries), artist.name.lower())
+    """Points (Artist.score); between equal points golds, then silvers, then bronzes, then
+    votes, then works entered."""
+    return (-artist.score().points, -artist.medals(1), -artist.medals(2), -artist.medals(3),
+            -artist.total_votes, -len(artist.entries), artist.name.lower())
 
 
 def build_hall(contests: list[Contest]) -> Hall:

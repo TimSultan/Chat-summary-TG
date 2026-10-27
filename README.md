@@ -1127,16 +1127,30 @@ every work they entered and every badge they won. Four screens, picked by the UR
 `#fragment`:
 
 - **Зал славы** — the latest winner large, with the podium beside it; the recent winners
-  as a gallery; the best artists, ranked as a medal table (🥇 golds, then 🥈 silvers, then
-  🥉 bronzes -- a place with no votes earns no medal -- then votes); the thematic
-  contests and how they work.
+  as a gallery; the best artists, ranked by points (below); the thematic contests and how
+  they work.
 - **Хронология** — every contest newest first, grouped by month, with its podium; one tap
   opens all its works. Filters: all, итоги недели, тематические.
 - **Художники** — the whole leaderboard, searchable by name or @tag.
-- **Профиль художника** — avatar, @tag (a link to Telegram), 🥇 gold / 🥈 silver / 🥉 bronze / works /
-  votes, the badges (each weekly win is the same 🏆 with a count; each thematic contest is
+- **Профиль художника** — avatar, @tag (a link to Telegram), points / 🥇 gold / 🥈 silver / 🥉 bronze /
+  works / votes, how the points add up, the badges (each weekly win is the same 🏆 with a count; each thematic contest is
   its own badge — the one the administrator gave it when collecting, 🏅 if none), and every
   work they entered.
+
+**The leaderboard's points** (`hall_of_fame.MEDAL_POINTS`, `MONTHLY_MEDAL_POINTS`,
+`PARTICIPATION_POINTS`). One gold is worth two silvers or three bronzes:
+
+| | 🥇 | 🥈 | 🥉 |
+|---|---|---|---|
+| #итогинедели and thematic contests | 12 | 6 | 4 |
+| «Работа месяца» rounds | 18 | 9 | 6 |
+
+Every contest an artist entered adds **+1**, once however many works they put into it, so
+taking part counts even without a place; each medal still counts. A place with no votes
+earns no medal, only the point for taking part. Votes never become points (one week has
+twice another's voters); between equal points the artist with more golds, then silvers,
+then bronzes, then votes ranks higher. The points are counted from the stored results on
+every read, so past contests are scored the same way.
 
 Tapping a work opens it full screen with all its photos, its caption, its place and a link
 to the original post in the chat (`t.me/<chat>/<id>`, or `t.me/c/…` for a private

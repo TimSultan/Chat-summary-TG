@@ -169,10 +169,36 @@ class HallApiTests(AsyncTestCase):
         self.assertEqual([(b["badge"], b["title"], b["count"]) for b in boria["badges"]],
                          [("🌸", "Лучший аниме-покрас", 1)])
 
+    async def test_an_artist_page_shows_how_the_points_add_up(self):
+        data = (await self._json("/api/artists/1"))["artist"]
+        # Two golds and a silver, and three contests entered.
+        self.assertEqual(data["points"], 2 * 12 + 6 + 3)
+        self.assertEqual(data["score"], {
+            "points": 33,
+            "medals": [{"medal": 1, "monthly": False, "count": 2, "each": 12, "points": 24},
+                       {"medal": 2, "monthly": False, "count": 1, "each": 6, "points": 6}],
+            "contests": 3,
+            "participation": 3,
+        })
+        # Вера never took a medal -- a nought third, a contest nobody voted in -- and still scores.
+        vera = (await self._json("/api/artists/3"))["artist"]
+        self.assertEqual((vera["points"], vera["score"]["medals"], vera["score"]["contests"]), (2, [], 2))
+
     async def test_the_artist_list_is_the_whole_leaderboard(self):
         data = await self._json("/api/artists")
-        self.assertEqual([(a["rank"], a["key"]) for a in data["artists"]], [(1, "1"), (2, "2"), (3, "3")])
-        self.assertNotIn("entries", data["artists"][0])
+        self.assertEqual([(a["rank"], a["key"], a["points"]) for a in data["artists"]],
+                         [(1, "1", 33), (2, "2", 27), (3, "3", 2)])
+        # The rows draw the points, not their breakdown: that is the artist page's.
+        for artist in data["artists"]:
+            self.assertNotIn("entries", artist)
+            self.assertNotIn("score", artist)
+        self.assertEqual(data["scoring"], {"medal": [12, 6, 4], "monthly": [18, 9, 6], "participation": 1})
+
+    async def test_the_front_page_explains_the_points(self):
+        data = await self._json("/api/overview")
+        self.assertEqual(data["scoring"], hall_web.scoring_rules())
+        self.assertEqual([a["points"] for a in data["artists"]], [33, 27, 2])
+        self.assertNotIn("score", data["artists"][0])
 
     # ---- pictures -------------------------------------------------------------------------
 
@@ -310,6 +336,14 @@ class LeaderboardLayoutTests(unittest.TestCase):
         for medal in ('medalCount("🥇", artist.gold', 'medalCount("🥈", artist.silver', 'medalCount("🥉", artist.bronze'):
             self.assertIn(medal, hall_web.PAGE_HTML)
 
+    def test_every_row_shows_its_points_and_the_boards_explain_them(self):
+        page = hall_web.PAGE_HTML
+        row = page[page.index("function artistRow"):page.index("function contestMeta")]
+        self.assertIn("artist.points", row)
+        self.assertIn("scoringHint(data.scoring)", page[page.index("async function screenHome"):page.index("function themesTeaser")])
+        self.assertIn("scoringHint(data.scoring)", page[page.index("async function screenArtists"):page.index("async function screenArtist(")])
+        self.assertIn("scoreBreakdown(artist.score)", page[page.index("async function screenArtist("):page.index("async function screenThemes")])
+
 
 class MonthlyRoundPayloadTests(unittest.TestCase):
     """A monthly round is its own kind: not counted among the thematic contests, and its
@@ -351,6 +385,11 @@ class MonthlyRoundPayloadTests(unittest.TestCase):
                          [("🥉", "Работа месяца · июль · Бронза", "monthly")])
         anya = hall_web.artist_payload(self.hall, P, "1", None)["artist"]
         self.assertEqual((anya["gold"], anya["silver"], anya["bronze"]), (1, 0, 0))   # 2nd in the round: nothing
+
+    def test_the_months_bronze_is_scored_as_the_months(self):
+        borya = hall_web.artist_payload(self.hall, P, "2", None)["artist"]["score"]
+        self.assertEqual([(m["medal"], m["monthly"], m["each"]) for m in borya["medals"]], [(2, False, 6), (3, True, 6)])
+        self.assertEqual(borya["points"], 6 + 6 + 2)
 
 
 class PageScriptSyntaxTests(unittest.TestCase):

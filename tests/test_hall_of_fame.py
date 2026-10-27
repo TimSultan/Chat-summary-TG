@@ -250,16 +250,66 @@ class ReadingTests(_Store):
         self.assertEqual(hall.by_key["4"].podiums, 0)      # fourth, with a nought
         self.assertEqual(hall.by_key["3"].best_place(), 3)
 
-    def test_the_ranking_is_a_medal_table_silver_before_any_number_of_bronzes(self):
-        """Under the old rule (wins, then podium places) two bronzes beat one silver."""
+    def test_one_gold_is_worth_two_silvers_or_three_bronzes(self):
+        for points in (hall_of_fame.MEDAL_POINTS, hall_of_fame.MONTHLY_MEDAL_POINTS):
+            with self.subTest(points=points):
+                self.assertEqual(points[1], 2 * points[2])
+                self.assertEqual(points[1], 3 * points[3])
+        self.assertEqual(hall_of_fame.MEDAL_POINTS, {1: 12, 2: 6, 3: 4})
+        self.assertEqual(hall_of_fame.MONTHLY_MEDAL_POINTS, {1: 18, 2: 9, 3: 6})
+        self.assertEqual(hall_of_fame.PARTICIPATION_POINTS, 1)
+
+    def test_the_ranking_is_by_points_so_two_bronzes_beat_one_silver(self):
+        """Under the medal table that came before, one silver outranked any number of
+        bronzes; now two bronzes (4 + 4, and a point for each contest) beat it."""
         hall = hall_of_fame.build_hall([
             self._contest("2026-W39", [("1", 9, "Победа", 9), ("2", 1, "Серебро", 5), ("3", 2, "Бронза", 4)]),
             self._contest("2026-W40", [("4", 9, "Победа", 9), ("5", 3, "Другой", 6), ("6", 2, "Бронза", 5)]),
         ])
-        bronze, silver = hall.by_key["2"], hall.by_key["1"]
-        self.assertEqual((bronze.medals(1), bronze.medals(2), bronze.medals(3)), (0, 0, 2))
-        self.assertEqual((silver.medals(1), silver.medals(2), silver.medals(3)), (0, 1, 0))
-        self.assertEqual([a.key for a in hall.artists], ["9", "3", "1", "2"])
+        points = {a.key: a.score().points for a in hall.artists}
+        self.assertEqual(points, {"9": 2 * 12 + 2, "2": 2 * 4 + 2, "3": 6 + 1, "1": 6 + 1})
+        # "3" and "1" have a silver and a contest each: the votes decide, 6 to 5.
+        self.assertEqual([a.key for a in hall.artists], ["9", "2", "3", "1"])
+
+    def test_equal_points_go_to_more_gold_before_more_votes(self):
+        hall = hall_of_fame.build_hall([
+            self._contest("2026-W39", [("1", 1, "Золото", 3), ("2", 2, "Серебро", 2)]),
+            self._contest("2026-W40", [("3", 4, "Победа", 9), ("4", 2, "Серебро", 9), ("5", 5, "Третий", 1),
+                                       ("6", 1, "Золото", 0)]),
+        ])
+        gold, silver = hall.by_key["1"], hall.by_key["2"]
+        self.assertEqual((gold.score().points, silver.score().points), (12 + 2, 6 + 6 + 2))
+        self.assertGreater(silver.total_votes, gold.total_votes)
+        keys = [a.key for a in hall.artists]
+        self.assertLess(keys.index("1"), keys.index("2"))
+
+    def test_taking_part_earns_a_point_per_contest_even_without_a_medal(self):
+        hall = hall_of_fame.build_hall([
+            self._contest("2026-W39", [("1", 9, "Победа", 9), ("2", 9, "Победа", 8), ("3", 8, "Ещё", 7),
+                                       ("4", 1, "Постоянный", 1), ("5", 2, "Разовый", 6)]),
+            self._contest("2026-W40", [("6", 9, "Победа", 9), ("7", 8, "Ещё", 8), ("8", 7, "Третий", 7),
+                                       ("9", 1, "Постоянный", 0)]),
+            self._contest("2026-W41", [("10", 9, "Победа", 9), ("11", 8, "Ещё", 8), ("12", 7, "Третий", 7),
+                                       ("13", 1, "Постоянный", 1)]),
+        ])
+        regular, once = hall.by_key["1"], hall.by_key["2"]
+        self.assertEqual((regular.score().points, regular.score().medals), (3, ()))
+        self.assertEqual(once.score().points, 1)
+        keys = [a.key for a in hall.artists]
+        self.assertLess(keys.index("1"), keys.index("2"))     # though it had 6 votes to 2
+
+    def test_two_works_in_one_contest_take_part_once_and_keep_both_medals(self):
+        hall = hall_of_fame.build_hall([
+            self._contest("2026-W39", [("1", 1, "Аня", 9), ("2", 2, "Боря", 5), ("3", 1, "Аня", 4), ("4", 1, "Аня", 1)]),
+        ])
+        score = hall.by_key["1"].score()
+        self.assertEqual(score.contests, 1)
+        self.assertEqual([(m.medal, m.monthly, m.count, m.each) for m in score.medals], [(1, False, 1, 12), (3, False, 1, 4)])
+        self.assertEqual(score.points, 12 + 4 + 1)
+
+    def test_a_place_nobody_voted_for_scores_only_its_participation(self):
+        hall = hall_of_fame.build_hall([self._contest("2026-W39", [("1", 1, "Аня", 3), ("2", 2, "Боря", 0)])])
+        self.assertEqual(hall.by_key["2"].score().points, 1)
 
     def test_a_place_nobody_voted_for_earns_no_medal(self):
         hall = hall_of_fame.build_hall([self._contest("2026-W39", [("1", 1, "Аня", 3), ("2", 2, "Боря", 0)])])
@@ -336,6 +386,19 @@ class MonthlyRoundTests(unittest.TestCase):
         ])
         self.assertEqual([a.key for a in hall.artists], ["1", "2", "3"])
         self.assertEqual(hall.by_key["2"].medals(2), 1)
+
+    def test_the_months_medals_are_worth_half_as_much_again(self):
+        hall = hall_of_fame.build_hall([
+            _round("2026-07-gold", [("1", 1, "Аня", 9), ("2", 2, "Боря", 8)], tier=1),
+            _round("2026-07-silver", [("3", 2, "Боря", 9), ("4", 3, "Вера", 1)], tier=2),
+            _round("2026-07-bronze", [("5", 3, "Вера", 9), ("6", 1, "Аня", 1)], tier=3),
+            hall_of_fame.Contest(contest_id="2026-W27", entry=CHAT, closed_at="2026-07-05T00:00:00+00:00", works=[
+                hall_of_fame.Work(entry_id="7", place=1, votes=5, author_id=1, author_name="Аня")]),
+        ])
+        anya, borya, vera = (hall.by_key[k].score() for k in ("1", "2", "3"))
+        self.assertEqual([(m.medal, m.monthly, m.count, m.points) for m in anya.medals], [(1, True, 1, 18), (1, False, 1, 12)])
+        self.assertEqual((anya.contests, anya.points), (3, 18 + 12 + 3))
+        self.assertEqual((borya.points, vera.points), (9 + 2, 6 + 2))   # a round entered is a contest entered
 
     def test_an_ordinary_contest_keeps_three_medals(self):
         contest = hall_of_fame.Contest(contest_id="2026-W27", entry=CHAT, works=[

@@ -147,16 +147,38 @@ def _badges(artist: hall_of_fame.Artist) -> list[dict]:
     return sorted(grouped.values(), key=lambda b: (b["weekly"], -b["count"], b["title"]))
 
 
+def scoring_rules() -> dict:
+    """What each medal and each contest entered is worth, gold first, for the page's
+    explanation of the leaderboard -- the numbers live in hall_of_fame alone."""
+    return {
+        "medal": [hall_of_fame.medal_points(medal, False) for medal in hall_of_fame.MEDAL_TIERS],
+        "monthly": [hall_of_fame.medal_points(medal, True) for medal in hall_of_fame.MEDAL_TIERS],
+        "participation": hall_of_fame.PARTICIPATION_POINTS,
+    }
+
+
+def _score(score: hall_of_fame.Score) -> dict:
+    """How an artist's points add up, line by line, for their own page."""
+    return {
+        "points": score.points,
+        "medals": [{"medal": line.medal, "monthly": line.monthly, "count": line.count,
+                    "each": line.each, "points": line.points} for line in score.medals],
+        "contests": score.contests,
+        "participation": score.participation,
+    }
+
+
 def _artist_summary(base: str, artist: hall_of_fame.Artist, rank: int) -> dict:
     newest_contest, newest_work = artist.entries[0]
     best = next(((c, w) for c, w in artist.entries if c.winner() is w), None) or (newest_contest, newest_work)
     payload = _author(base, artist.author_id, artist.name, artist.username)
     payload.update({
         "rank": rank,
+        # What the leaderboard is ranked by (hall_of_fame._rank); the medals break a tie.
+        "points": artist.score().points,
         "works": len(artist.entries),
         "wins": len(artist.wins),
         "podiums": artist.podiums,
-        # The medal table the ranking is (hall_of_fame._rank), shown as it is ranked.
         "gold": artist.medals(1),
         "silver": artist.medals(2),
         "bronze": artist.medals(3),
@@ -181,6 +203,7 @@ def overview_payload(hall: hall_of_fame.Hall, base: str, bot: str = "") -> dict:
         },
         "latest": [_contest_summary(base, c) for c in winners[:OVERVIEW_WINNERS]],
         "artists": [_artist_summary(base, a, rank) for rank, a in enumerate(hall.artists[:OVERVIEW_ARTISTS], start=1)],
+        "scoring": scoring_rules(),
         "themes": [_contest_summary(base, c) for c in hall.contests if _kind(c) == "theme"],
     }
 
@@ -199,7 +222,8 @@ def contest_payload(hall: hall_of_fame.Hall, base: str, contest_id: str, link_ba
 
 
 def artists_payload(hall: hall_of_fame.Hall, base: str) -> dict:
-    return {"artists": [_artist_summary(base, a, rank) for rank, a in enumerate(hall.artists, start=1)]}
+    return {"artists": [_artist_summary(base, a, rank) for rank, a in enumerate(hall.artists, start=1)],
+            "scoring": scoring_rules()}
 
 
 def artist_payload(hall: hall_of_fame.Hall, base: str, key: str, link_base: str | None) -> dict | None:
@@ -208,6 +232,7 @@ def artist_payload(hall: hall_of_fame.Hall, base: str, key: str, link_base: str 
         return None
     rank = hall.artists.index(artist) + 1
     payload = _artist_summary(base, artist, rank)
+    payload["score"] = _score(artist.score())
     payload["entries"] = [
         dict(_work_full(base, contest, work, link_base),
              contest_title=contest.label(), contest_week=contest.week(),
@@ -528,6 +553,16 @@ PAGE_HTML = r"""<!doctype html>
   .row .nums b { display: block; color: var(--fg); font-size: 16px; }
   .row .nums .medal { min-width: 26px; }
   .row .nums .medal.none { opacity: .35; }
+  .row .nums .pts { min-width: 34px; }
+  .row .nums .pts b { color: var(--gold); }
+  /* The points column took the name's room on a 360px phone; tighter spacing gives it back. */
+  @media (max-width: 420px) {
+    .row { gap: 8px; padding: 10px; }
+    .row .rk { width: 20px; }
+    .row .ava.m { width: 36px; height: 36px; font-size: 15px; }
+    .row .nums { gap: 8px; }
+  }
+  .hint { color: var(--muted); font-size: 13px; margin: 10px 0 0; max-width: 640px; }
   @media (max-width: 520px) { .row .nums .opt { display: none; } }
   .row img.cov { width: 48px; height: 48px; border-radius: 10px; object-fit: cover; background: var(--card-hi); }
   @media (max-width: 420px) { .row img.cov { display: none; } }
@@ -554,12 +589,17 @@ PAGE_HTML = r"""<!doctype html>
   .profile > div { min-width: 0; overflow-wrap: anywhere; }
   .profile .n { font-size: clamp(24px, 4.5vw, 34px); font-weight: 800; line-height: 1.15; }
   .profile .u { color: var(--accent); font-weight: 600; }
-  .tiles { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin-top: 22px; }
+  .tiles { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-top: 22px; }
   @media (max-width: 720px) { .tiles { grid-template-columns: repeat(3, 1fr); } }
   @media (max-width: 420px) { .tiles { grid-template-columns: repeat(2, 1fr); } }
   .tile { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
   .tile b { display: block; font-size: 24px; line-height: 1.2; }
   .tile span { color: var(--muted); font-size: 13px; }
+  .score { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 6px 14px; max-width: 520px; }
+  .score .line { display: flex; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  .score .line:last-child { border-bottom: 0; }
+  .score .line .each { color: var(--muted); font-size: 13px; }
+  .score .line.total b { color: var(--gold); }
   .badges { display: flex; flex-wrap: wrap; gap: 8px; }
   .badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 14px 8px 10px; border-radius: 999px;
            background: var(--gold-soft); border: 1px solid rgba(242,193,78,.35); font-weight: 700; font-size: 14px; }
@@ -673,6 +713,7 @@ function plural(n, one, few, many) {
   return `${n} ${many}`;
 }
 const votesLabel = (n) => plural(n, "голос", "голоса", "голосов");
+const pointsLabel = (n) => plural(n, "очко", "очка", "очков");
 const worksLabel = (n) => plural(n, "работа", "работы", "работ");
 
 const MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август",
@@ -761,6 +802,28 @@ function medalCount(emoji, count, title) {
     h("b", {}, count), emoji);
 }
 
+// How the leaderboard is counted, from the server's own numbers (hall_web.scoring_rules).
+function scoringHint(rules) {
+  if (!rules) return null;
+  const [g, s, b] = rules.medal, [mg, ms, mb] = rules.monthly;
+  return h("p", {class: "hint"},
+    `Очки: 🥇 ${g} · 🥈 ${s} · 🥉 ${b}, в «Работе месяца» — ${mg} · ${ms} · ${mb}; `
+    + `+${rules.participation} за каждый конкурс, в котором художник участвовал. `
+    + "При равенстве очков выше тот, у кого больше золота, потом серебра, бронзы, голосов.");
+}
+
+const MEDAL_NAMES = {1: "Золото", 2: "Серебро", 3: "Бронза"};
+
+// An artist's points, line by line: each kind of medal, then taking part, then the total.
+function scoreBreakdown(score) {
+  const line = (label, each, points) => h("div", {class: "line"},
+    h("span", {}, label, each ? h("span", {class: "each"}, ` · по ${each}`) : null), h("b", {}, `+${points}`));
+  return h("div", {class: "score"},
+    score.medals.map((m) => line(`${medal(m.medal)} ${MEDAL_NAMES[m.medal]}${m.monthly ? " месяца" : ""} × ${m.count}`, m.each, m.points)),
+    score.contests ? line(`🎨 Участие в ${plural(score.contests, "конкурсе", "конкурсах", "конкурсах")}`, null, score.participation) : null,
+    h("div", {class: "line total"}, h("span", {}, "Итого"), h("b", {}, pointsLabel(score.points))));
+}
+
 function artistRow(artist) {
   const rk = artist.rank <= 3 ? `rk r${artist.rank}` : "rk";
   return h("a", {class: "row", href: `#/artist/${artist.key}`},
@@ -770,6 +833,7 @@ function artistRow(artist) {
       h("div", {class: "n"}, artist.name),
       h("div", {class: "b"}, badgeLine(artist.badges) || (artist.username ? "@" + artist.username : worksLabel(artist.works)))),
     h("div", {class: "nums"},
+      h("div", {class: "pts", title: `Очки: ${artist.points}`}, h("b", {}, artist.points), pointsLabel(artist.points).replace(/^\d+ /, "")),
       medalCount("🥇", artist.gold, "золото"),
       medalCount("🥈", artist.silver, "серебро"),
       medalCount("🥉", artist.bronze, "бронза"),
@@ -857,7 +921,7 @@ async function screenHome() {
       workCard(c.winner, `${c.badge} ${c.title}${c.week ? " · " + weekLabel(c.week) : ""}`, winners, i)))));
   if (data.artists.length) {
     nodes.push(section("Лучшие художники", "#/artists", "Все художники →",
-      h("div", {class: "board"}, data.artists.map(artistRow))));
+      h("div", {class: "board"}, data.artists.map(artistRow)), scoringHint(data.scoring)));
   }
   nodes.push(themesTeaser(data.themes));
   return nodes;
@@ -925,7 +989,8 @@ async function screenArtists() {
   };
   draw("");
   return [h("h1", {}, "Художники"),
-          h("p", {class: "lead"}, "Все, кто участвовал в конкурсах, — по медалям: сначала золото, потом серебро, потом бронза; при равенстве — по голосам."),
+          h("p", {class: "lead"}, "Все, кто участвовал в конкурсах, — по очкам за медали и за участие."),
+          scoringHint(data.scoring),
           h("div", {class: "section", style: "margin-top:18px"},
             h("input", {class: "search", type: "search", placeholder: "Найти по имени или @нику", oninput: (e) => draw(e.target.value)}),
             h("div", {style: "height:14px"}), board)];
@@ -945,11 +1010,13 @@ async function screenArtist(key) {
           : artist.username ? h("div", {class: "u"}, "@" + artist.username) : null,
         h("div", {class: "muted", style: "margin-top:4px"}, `${artist.rank}-е место среди художников`))),
     h("div", {class: "tiles"},
+      h("div", {class: "tile"}, h("b", {}, artist.points), h("span", {}, pointsLabel(artist.points).replace(/^\d+ /, "") + " в рейтинге")),
       h("div", {class: "tile"}, h("b", {}, `🥇 ${artist.gold}`), h("span", {}, "золото — 1 место")),
       h("div", {class: "tile"}, h("b", {}, `🥈 ${artist.silver}`), h("span", {}, "серебро — 2 место")),
       h("div", {class: "tile"}, h("b", {}, `🥉 ${artist.bronze}`), h("span", {}, "бронза — 3 место")),
       h("div", {class: "tile"}, h("b", {}, artist.works), h("span", {}, "работ в конкурсах")),
       h("div", {class: "tile"}, h("b", {}, artist.votes), h("span", {}, "голосов всего"))),
+    section("Как набраны очки", null, null, scoreBreakdown(artist.score)),
     artist.badges.length ? section("Значки и ачивки", null, null, badgePills(artist.badges)) : null,
     section("Работы", null, null,
       h("div", {class: "grid"}, entries.map((w, i) =>
