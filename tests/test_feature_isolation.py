@@ -21,10 +21,12 @@ sys.path.insert(0, str(ROOT))
 import bot_listener
 import listener
 import pets_ui
+import seabattle
 
 GAME_MODULES = (
     "pets", "pets_combat", "pets_image", "pets_ui", "pets_updates", "pets_web",
     "casino", "arena", "arena_core", "arena_web", "nominations", "nominations_web",
+    "seabattle",
 )
 
 
@@ -122,6 +124,24 @@ class GuardedImportTests(unittest.TestCase):
             'callback_data.startswith(f"{PETS_CALLBACK_PREFIX_LITERAL}:")',
             (ROOT / "bot_listener.py").read_text(encoding="utf-8"),
         )
+
+    def test_the_router_knows_the_seabattle_prefix_without_its_module(self):
+        self.assertEqual(bot_listener.SEABATTLE_CALLBACK_PREFIX_LITERAL, seabattle.CALLBACK_PREFIX)
+        self.assertIsNone(bot_listener.SEABATTLE_IMPORT_ERROR)
+        self.assertIn(
+            'callback_data.startswith(f"{SEABATTLE_CALLBACK_PREFIX_LITERAL}:")',
+            (ROOT / "bot_listener.py").read_text(encoding="utf-8"),
+        )
+
+    def test_seabattle_entry_points_check_the_module_loaded(self):
+        source = (ROOT / "bot_listener.py").read_text(encoding="utf-8")
+        tree = ast.parse(source, filename="bot_listener.py")
+        wanted = {"handle_seabattle_command", "handle_seabattle_callback"}
+        for node in tree.body:
+            if isinstance(node, ast.AsyncFunctionDef) and node.name in wanted:
+                wanted.discard(node.name)
+                self.assertIn("seabattle_available()", ast.get_source_segment(source, node) or "")
+        self.assertFalse(wanted, f"these entry points have vanished: {sorted(wanted)}")
 
     def test_every_game_entry_point_declines_instead_of_crashing(self):
         """A handler that just raises leaves a button spinning and a command silent."""

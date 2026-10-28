@@ -122,6 +122,8 @@ NOMINATIONS_IMPORT_ERROR: str | None = None
 # The Hall of Fame site (hall_of_fame*, hall_web), likewise: a broken hall must cost the
 # hall and nothing else -- not the ballot, and not the close that records into it.
 HALL_IMPORT_ERROR: str | None = None
+# Морской бой (seabattle.py), the same again: a broken board costs the chat its board.
+SEABATTLE_IMPORT_ERROR: str | None = None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -197,6 +199,11 @@ try:
 except Exception:  # noqa: BLE001
     HALL_IMPORT_ERROR = traceback.format_exc()
     hall_of_fame = hall_web = None
+try:
+    import seabattle
+except Exception:  # noqa: BLE001
+    SEABATTLE_IMPORT_ERROR = traceback.format_exc()
+    seabattle = None
 import backup
 
 
@@ -232,6 +239,11 @@ def nominations_available() -> bool:
 def hall_available() -> bool:
     """The same for the Hall of Fame (/hall)."""
     return HALL_IMPORT_ERROR is None
+
+
+def seabattle_available() -> bool:
+    """The same for Морской бой (/seabattle)."""
+    return SEABATTLE_IMPORT_ERROR is None
 
 
 GAME_UNAVAILABLE_NOTICE = (
@@ -702,6 +714,7 @@ GROUP_CHAT_COMMANDS = (
     {"command": "hall", "description": "Доска почёта: победители и их работы"},
     {"command": "pet", "description": "Моё существо"},
     {"command": "duel", "description": "Вызвать существо на дуэль"},
+    {"command": "seabattle", "description": "Морской бой: вызвать соперника"},
 )
 
 # An unhandled DM gets the menu back instead of silence -- see maybe_send_menu. The
@@ -12109,6 +12122,426 @@ async def handle_moderator_reaction(api: TelegramBotAPI, cfg, reaction: dict, lo
     return True
 
 
+# --- Морской бой ---------------------------------------------------------------------
+#
+# The rules and every screen are seabattle.py; what is here is Telegram: the invitation
+# and its 30-second clock, the buttons, and replacing the field after every shot.
+#
+# Games live in memory only (run_bot_listener's seabattle_games). A game lasts minutes
+# and moves no coins, so a restart costs the players one rematch -- and a button left on
+# a field from before it is answered and stripped rather than left to spin.
+SEABATTLE_COMMANDS = ("/seabattle", "/морскойбой", "/морской_бой")
+# Spelled out rather than read from seabattle, for the same reason as the pet prefix: the
+# router must recognise -- and refuse -- a button of a module that failed to import.
+SEABATTLE_CALLBACK_PREFIX_LITERAL = "sea"
+SEABATTLE_UNAVAILABLE_NOTICE = (
+    "Морской бой сейчас недоступен — чиню. Остальные команды чата работают как обычно."
+)
+SEABATTLE_NOTICE_DELETE_AFTER = 10
+# A declined invitation says so for this long before it goes, so the challenger can tell
+# a refusal from an invitation that simply ran out.
+SEABATTLE_DECLINED_DELETE_AFTER = 10
+# Finding a member by display name goes through the Telethon session, which can wait
+# indefinitely on a connection that is not coming back (see _handle_one_update).
+SEABATTLE_RESOLVE_TIMEOUT_SECONDS = 20
+_SEABATTLE_USERNAME = re.compile(r"[A-Za-z0-9_]{4,32}")
+
+
+def _seabattle_spawn(coroutine, background_tasks: set) -> None:
+    task = asyncio.create_task(coroutine)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+async def _seabattle_opponent(
+    telethon_client, tz, message: dict, command_text: str, entry: str | None,
+    bot_username: str | None, log=print,
+):
+    """(Player, None) for whoever the command names, or (None, why not) to say back.
+
+    In order: a member picked from the mention list (a text_mention carries their id even
+    without a username), a reply to their message, "@username" as typed, and last a
+    display name, which only the chat's tracked members can be found by.
+    """
+    actor = message.get("from") or {}
+    parts = command_text.split(maxsplit=1)
+    argument = parts[1].strip() if len(parts) == 2 else ""
+    bot_refusal = "С ботом не сыграть — позови живого соперника."
+    for entity in message.get("entities") or []:
+        user = entity.get("user") if entity.get("type") == "text_mention" else None
+        if user and user.get("id") is not None:
+            if user.get("is_bot"):
+                return None, bot_refusal
+            return seabattle.Player(user["id"], _display_name(user), user.get("username")), None
+    replied = (message.get("reply_to_message") or {}).get("from") or {}
+    if not argument and replied.get("id") is not None:
+        if replied.get("is_bot"):
+            return None, bot_refusal
+        return seabattle.Player(replied["id"], _display_name(replied), replied.get("username")), None
+    if not argument:
+        return None, (
+            "Кого вызываем? Напиши <code>/seabattle @ник</code> "
+            "или ответь этой командой на сообщение соперника."
+        )
+    if argument.startswith("@"):
+        username = argument[1:].split()[0] if argument[1:].split() else ""
+        if not _SEABATTLE_USERNAME.fullmatch(username):
+            return None, "Не понял ник. Напиши так: <code>/seabattle @ник</code>"
+        if bot_username and username.casefold() == bot_username.casefold():
+            return None, bot_refusal
+        return seabattle.Player(None, f"@{username}", username), None
+    not_found = (
+        f"Не нашёл «{html.escape(argument[:40])}». Укажи @ник "
+        "или ответь командой на сообщение соперника."
+    )
+    if entry is None or telethon_client is None:
+        return None, not_found
+    try:
+        target, _, _, _, _ = await asyncio.wait_for(
+            stats.resolve_stat_target(
+                telethon_client, entry, entry, argument,
+                actor.get("username"), _display_name(actor), tz, log=log,
+            ),
+            timeout=SEABATTLE_RESOLVE_TIMEOUT_SECONDS,
+        )
+        user_id = int(target.user_id) if target is not None else None
+    except Exception:
+        log(f"[seabattle] could not look up an opponent:\n{traceback.format_exc()}")
+        return None, not_found
+    if user_id is None:
+        return None, not_found
+    return seabattle.Player(user_id, target.display_name, target.username), None
+
+
+async def handle_seabattle_command(
+    api: TelegramBotAPI, telethon_client, tz, message: dict, command_text: str,
+    entry: str | None, games: dict, background_tasks: set,
+    bot_username: str | None = None, log=print,
+) -> None:
+    """"/seabattle @name": post an invitation only that member can accept.
+
+    Nobody accepting within seabattle.INVITE_TTL_SECONDS removes it, and the command with
+    it. Every refusal is a short notice that sweeps itself and the command away.
+    """
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    group_chat = chat.get("type") != "private"
+    actor = message.get("from") or {}
+    message_id = message.get("message_id")
+
+    async def notice(text: str) -> None:
+        sent = None
+        try:
+            sent = await api.send_message(
+                chat_id, text, reply_to_message_id=message_id, parse_mode="HTML",
+            )
+        except Exception:
+            log(f"[seabattle] could not answer the command:\n{traceback.format_exc()}")
+        if group_chat:
+            schedule_bot_delete(
+                api, chat_id, [sent["message_id"]] if sent and "message_id" in sent else [],
+                SEABATTLE_NOTICE_DELETE_AFTER, log, background_tasks,
+                trigger_message_id=message_id,
+            )
+
+    if not seabattle_available():
+        log("[bot_listener] refused /seabattle: the module never loaded:\n" + (SEABATTLE_IMPORT_ERROR or ""))
+        await notice(SEABATTLE_UNAVAILABLE_NOTICE)
+        return
+    if not group_chat:
+        await notice("Морской бой играется в общем чате: напиши там <code>/seabattle @ник</code>.")
+        return
+    if actor.get("id") is None or actor.get("is_bot"):
+        return
+
+    opponent, problem = await _seabattle_opponent(
+        telethon_client, tz, message, command_text, entry, bot_username, log=log,
+    )
+    if opponent is None:
+        await notice(problem)
+        return
+    if seabattle.same_person(opponent, actor.get("id"), actor.get("username")):
+        await notice("С самим собой не сыграть 🙂")
+        return
+    if seabattle.busy_game(games, actor.get("id"), actor.get("username")) is not None:
+        await notice("Ты уже в партии — сначала доиграй её.")
+        return
+    if seabattle.busy_game(games, opponent.user_id, opponent.username) is not None:
+        await notice(f"<b>{html.escape(opponent.name)}</b> уже играет — позови позже.")
+        return
+
+    challenger = seabattle.Player(actor["id"], _display_name(actor), actor.get("username"))
+    game = seabattle.new_game(chat_id, challenger, opponent, now=time.monotonic())
+    game.command_message_id = message_id
+    # Registered before the first await, so a second "/seabattle" typed while this one is
+    # still being sent finds both players busy.
+    games[game.game_id] = game
+    try:
+        sent = await api.send_message(
+            chat_id, seabattle.invite_text(game),
+            reply_markup=seabattle.invite_keyboard(game), parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[seabattle] could not post the invitation:\n{traceback.format_exc()}")
+        sent = None
+    if not sent or sent.get("message_id") is None:
+        games.pop(game.game_id, None)
+        game.phase = seabattle.PHASE_FINISHED
+        await notice("Приглашение не отправилось. Попробуй ещё раз.")
+        return
+    game.message_id = sent["message_id"]
+    _seabattle_spawn(_seabattle_invite_clock(api, games, game, log=log), background_tasks)
+
+
+async def _seabattle_delete(api: TelegramBotAPI, chat_id, message_id, log=print) -> None:
+    if message_id is None:
+        return
+    try:
+        await api.delete_message(chat_id, message_id)
+    except Exception:
+        log(f"[seabattle] could not delete message {message_id}:\n{traceback.format_exc()}")
+
+
+async def _seabattle_invite_clock(api: TelegramBotAPI, games: dict, game, log=print) -> None:
+    await asyncio.sleep(seabattle.INVITE_TTL_SECONDS)
+    await _seabattle_expire_invite(api, games, game, log=log)
+
+
+async def _seabattle_expire_invite(api: TelegramBotAPI, games: dict, game, log=print) -> bool:
+    """Remove an invitation nobody accepted, and the command that made it. False when it
+    was answered first -- accepted, declined -- and there is nothing to remove."""
+    if game.phase != seabattle.PHASE_INVITE or games.get(game.game_id) is not game:
+        return False
+    # Decided before the first await: a press arriving while the deletes are in flight
+    # must find the invitation closed, not accept a message that is being deleted.
+    game.phase = seabattle.PHASE_FINISHED
+    games.pop(game.game_id, None)
+    await _seabattle_delete(api, game.chat_id, game.message_id, log=log)
+    await _seabattle_delete(api, game.chat_id, game.command_message_id, log=log)
+    return True
+
+
+async def _seabattle_turn_clock(api: TelegramBotAPI, games: dict, game, log=print) -> None:
+    """Sleeps until the player on the move has run out of time, re-reading the deadline
+    after every wake: each shot moves it, and this one task covers the whole game."""
+    while game.phase == seabattle.PHASE_PLAYING and games.get(game.game_id) is game:
+        remaining = game.last_move_at + seabattle.TURN_TIMEOUT_SECONDS - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+            continue
+        await _seabattle_time_out(api, games, game, log=log)
+        return
+
+
+async def _seabattle_time_out(api: TelegramBotAPI, games: dict, game, log=print) -> bool:
+    if game.phase != seabattle.PHASE_PLAYING or games.get(game.game_id) is not game:
+        return False
+    seabattle.time_out(game)
+    games.pop(game.game_id, None)
+    await _seabattle_post(api, game, log=log)
+    return True
+
+
+def _seabattle_screen(game) -> tuple[str, dict]:
+    if game.phase == seabattle.PHASE_FINISHED:
+        return seabattle.final_text(game), {"inline_keyboard": []}
+    return seabattle.board_text(game), seabattle.board_keyboard(game)
+
+
+async def _seabattle_post(api: TelegramBotAPI, game, log=print) -> None:
+    """The game as it now stands, as a NEW message, and the previous one deleted.
+
+    New rather than edited, as asked for: an edit is silent, and a shot that changes
+    nothing visible at the bottom of the chat is a turn nobody notices is theirs. Sent
+    first and deleted second, so the chat is never without a field.
+
+    If Telegram refuses the new message -- a quick game can run into the group's flood
+    limit -- the old one is edited into the new state instead, so a move is never lost.
+    """
+    text, markup = _seabattle_screen(game)
+    old = game.message_id
+    sent = None
+    try:
+        sent = await api.send_message(game.chat_id, text, reply_markup=markup, parse_mode="HTML")
+    except Exception:
+        log(f"[seabattle] could not post the field:\n{traceback.format_exc()}")
+    if sent and sent.get("message_id") is not None:
+        game.message_id = sent["message_id"]
+        if old is not None and old != game.message_id:
+            await _seabattle_delete(api, game.chat_id, old, log=log)
+        return
+    await _seabattle_redraw(api, game, log=log)
+
+
+async def _seabattle_redraw(api: TelegramBotAPI, game, log=print) -> None:
+    """The same message, edited -- picking a row is not a move."""
+    if game.message_id is None:
+        return
+    text, markup = _seabattle_screen(game)
+    try:
+        await api.edit_message_text(
+            game.chat_id, game.message_id, text, reply_markup=markup, parse_mode="HTML",
+        )
+    except Exception:
+        log(f"[seabattle] could not redraw the field:\n{traceback.format_exc()}")
+
+
+async def handle_seabattle_callback(
+    api: TelegramBotAPI, callback: dict, games: dict, background_tasks: set, log=print,
+) -> None:
+    """Every Морской бой button.
+
+    Everybody in the group sees the same buttons, so somebody else pressing is the normal
+    case: they get a toast on their own screen and nothing changes. Every answer is
+    decided from memory and sent before any other Telegram call, so the spinner stops at
+    once however slow the field is to replace.
+    """
+    callback_id = callback.get("id")
+    presser = callback.get("from") or {}
+    message = callback.get("message") or {}
+    message_id = message.get("message_id")
+
+    async def answer(text: str | None = None, alert: bool = False) -> None:
+        try:
+            await api.answer_callback_query(callback_id, text, show_alert=alert)
+        except Exception:
+            log(f"[seabattle] could not answer a button:\n{traceback.format_exc()}")
+
+    if not seabattle_available():
+        log("[bot_listener] refused a /seabattle button: the module never loaded")
+        await answer(SEABATTLE_UNAVAILABLE_NOTICE)
+        return
+    parsed = seabattle.parse_callback(callback.get("data") or "")
+    if parsed is None:
+        await answer()
+        return
+    game_id, seq, action, args = parsed
+    game = games.get(game_id)
+    if game is None or not seabattle.is_live(game):
+        await answer("Эта партия уже закончилась.")
+        # A field from before a restart: take away buttons that lead nowhere.
+        chat_id = (message.get("chat") or {}).get("id")
+        if chat_id is not None and message_id is not None:
+            try:
+                await api.edit_message_reply_markup(chat_id, message_id, {"inline_keyboard": []})
+            except Exception:
+                log(f"[seabattle] could not strip a dead field:\n{traceback.format_exc()}")
+        return
+
+    index = seabattle.player_index(game, presser.get("id"), presser.get("username"))
+    now = time.monotonic()
+
+    if game.phase == seabattle.PHASE_INVITE:
+        if action not in ("acc", "dec"):
+            await answer()
+            return
+        if index is None:
+            await answer("Это приглашение не тебе. Позови кого-нибудь сам: /seabattle @ник")
+            return
+        if action == "dec":
+            game.phase = seabattle.PHASE_FINISHED
+            games.pop(game.game_id, None)
+            await answer("Вызов отменён." if index == 0 else "Вызов отклонён.")
+            try:
+                await api.edit_message_text(
+                    game.chat_id, game.message_id, seabattle.declined_text(game, index),
+                    reply_markup={"inline_keyboard": []}, parse_mode="HTML",
+                )
+            except Exception:
+                log(f"[seabattle] could not mark the invitation declined:\n{traceback.format_exc()}")
+            schedule_bot_delete(
+                api, game.chat_id, [game.message_id] if game.message_id is not None else [],
+                SEABATTLE_DECLINED_DELETE_AFTER, log, background_tasks,
+                trigger_message_id=game.command_message_id,
+            )
+            return
+        if index == 0:
+            await answer("Принять вызов должен соперник.")
+            return
+        if game.players[1].user_id is None:
+            # Invited by @username: from here on they are known by id.
+            if seabattle.busy_game(
+                games, presser.get("id"), presser.get("username"), exclude=game,
+            ) is not None:
+                await answer("Сначала доиграй свою партию.")
+                return
+            game.players[1] = seabattle.Player(
+                presser["id"], _display_name(presser), presser.get("username"),
+            )
+        seabattle.start(game, now=now)
+        await answer("Поехали! ⚓")
+        await _seabattle_post(api, game, log=log)
+        await _seabattle_delete(api, game.chat_id, game.command_message_id, log=log)
+        _seabattle_spawn(_seabattle_turn_clock(api, games, game, log=log), background_tasks)
+        return
+
+    if index is None:
+        await answer("Это чужая партия. Сыграй свою: /seabattle @ник")
+        return
+    if action == "m":
+        await answer(seabattle.fleet_popup(game, index), alert=True)
+        return
+    if action == "s":
+        if not seabattle.request_surrender(game, index, now=now):
+            await answer("Точно сдаёшься? Нажми «Сдаться» ещё раз.")
+            return
+        games.pop(game.game_id, None)
+        await answer("Партия окончена.")
+        await _seabattle_post(api, game, log=log)
+        return
+    if action not in ("r", "f", "b"):
+        await answer()
+        return
+    if index != game.turn:
+        await answer(f"Сейчас стреляет {game.players[game.turn].name}.")
+        return
+    if seq != game.shots or message_id != game.message_id:
+        await answer("Поле уже обновилось.")
+        # The game's own message showing an old field means a replacement never got
+        # through to Telegram (see _seabattle_post): bring it up to date.
+        if message_id == game.message_id:
+            await _seabattle_redraw(api, game, log=log)
+        return
+
+    board = seabattle.target_board(game)
+    if action == "b":
+        game.selected_row = None
+        await answer()
+        await _seabattle_redraw(api, game, log=log)
+        return
+    if action == "r":
+        row = args[0] if len(args) == 1 and 0 <= args[0] < seabattle.SIZE else None
+        if row is None:
+            await answer()
+            return
+        if not board.row_open(row):
+            await answer("В этой строке уже всё обстреляно.")
+            return
+        game.selected_row = row
+        await answer()
+        await _seabattle_redraw(api, game, log=log)
+        return
+    # action == "f"
+    if len(args) != 2 or not all(0 <= value < seabattle.SIZE for value in args):
+        await answer()
+        return
+    result = seabattle.fire(game, args[0], args[1], now=now)
+    if result == seabattle.REPEAT:
+        await answer("Сюда уже стреляли — выбери другую клетку.")
+        return
+    if game.phase == seabattle.PHASE_FINISHED:
+        games.pop(game.game_id, None)
+        toast = "Победа! 🏆"
+    else:
+        toast = {
+            seabattle.MISS: "Мимо 💦",
+            seabattle.HIT: "Попадание! 💥 Стреляй ещё",
+            seabattle.SUNK: "Потоплен! 🟥 Стреляй ещё",
+        }[result]
+    await answer(toast)
+    await _seabattle_post(api, game, log=log)
+
+
 async def _handle_one_update(dispatch, update_id, log=print) -> None:
     """Await one update's handling, and never let it stop the poll loop.
 
@@ -12154,6 +12587,7 @@ async def _dispatch_update(
     vote_result_flows: dict[str, dict] | None = None,
     pets_flows: dict[str, dict] | None = None,
     tripo_flows: dict[int, dict] | None = None,
+    seabattle_games: dict | None = None,
     log=print,
 ) -> None:
     """Handles one update. Must never let an exception escape to the caller: an unhandled
@@ -12171,6 +12605,7 @@ async def _dispatch_update(
     vote_result_flows = vote_result_flows if vote_result_flows is not None else {}
     pets_flows = pets_flows if pets_flows is not None else {}
     tripo_flows = tripo_flows if tripo_flows is not None else {}
+    seabattle_games = seabattle_games if seabattle_games is not None else {}
     reaction = update.get("message_reaction")
     if reaction is not None:
         await handle_moderator_reaction(api, cfg, reaction, log=log)
@@ -12278,6 +12713,12 @@ async def _dispatch_update(
             await handle_tripo_callback(api, callback, tripo_flows, background_tasks, log=log)
         elif callback_data.startswith(f"{summary_share.CALLBACK_PREFIX}:"):
             await handle_summary_share_callback(api, callback, bot_username, log=log)
+        elif callback_data.startswith(f"{SEABATTLE_CALLBACK_PREFIX_LITERAL}:"):
+            # Decided from memory and answered before any other call, so it stays inline:
+            # one press at a time is what keeps two quick taps from firing twice.
+            await handle_seabattle_callback(
+                api, callback, seabattle_games, background_tasks, log=log,
+            )
         else:
             # Unrecognized callback_data -- answer it anyway so the tapped button's spinner
             # doesn't hang forever on the client.
@@ -12668,6 +13109,23 @@ async def _dispatch_update(
         return
 
     text_lower = message_text.lower()
+
+    # "/seabattle @name" -- Морской бой. Any group, tracked or not: it reads no chat data,
+    # and the tracked chat is only needed to find an opponent named without an @.
+    # A background task, because that lookup goes through the Telethon session.
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in SEABATTLE_COMMANDS
+    ):
+        _seabattle_spawn(
+            handle_seabattle_command(
+                api, telethon_client, tz, message, command_text,
+                _stats_entry_for(chat, matched_entry, home_chat_ref), seabattle_games,
+                background_tasks, bot_username=bot_username, log=log,
+            ),
+            background_tasks,
+        )
+        return
 
     # Shop and wallet commands (see economy.py). Same chat gating as /stat: they read and
     # spend against a tracked chat's ledger, so there is nothing meaningful to answer for
@@ -13211,6 +13669,9 @@ async def run_bot_listener(
     # A restart costs re-sending the photos; a running generation can still be fetched
     # from its message's "Проверить результат" button.
     tripo_flows: dict[int, dict] = {}
+    # Морской бой games and open invitations by game id (see seabattle.py). Memory only: a
+    # game lasts minutes and moves no coins, so a restart costs one rematch.
+    seabattle_games: dict = {}
     # Last time the fallback menu was sent per DM chat_id, so a burst of messages
     # gets one menu rather than one each (see MENU_FALLBACK_COOLDOWN_SECONDS).
     menu_last_sent: dict[int, float] = {}
@@ -13358,7 +13819,7 @@ async def run_bot_listener(
                             button_builder_flows=button_builder_flows, admin_flows=admin_flows,
                             vote_chat_flows=vote_chat_flows,
                             vote_result_flows=vote_result_flows, pets_flows=pets_flows,
-                            tripo_flows=tripo_flows, log=log,
+                            tripo_flows=tripo_flows, seabattle_games=seabattle_games, log=log,
                         ),
                         update.get("update_id"),
                         log=log,

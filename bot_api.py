@@ -397,13 +397,18 @@ class TelegramBotAPI:
 
     async def answer_callback_query(
         self, callback_query_id: str, text: str | None = None, url: str | None = None,
+        show_alert: bool = False,
     ) -> None:
         """`url` may be a t.me/<bot>?start=<payload> link: Telegram then opens the bot's
         DM with a Start button, which is the only way to reach somebody who has never
-        started the bot -- it cannot write to them first."""
+        started the bot -- it cannot write to them first.
+
+        `show_alert` turns the toast into a dialog that stays until dismissed: the one way
+        to show a person something private in a group, since only the presser sees it."""
         try:
             await self._call(
                 "answerCallbackQuery", callback_query_id=callback_query_id, text=text, url=url,
+                show_alert=True if show_alert else None,
             )
         except ChatSummaryError:
             pass  # best-effort: just stops the client-side loading spinner

@@ -1082,7 +1082,7 @@ class MenuRegistrationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "stat", "works", "top", "shop", "tree", "vote", "hall", "arena", "quests", "pet",
-                "duel", "testfight",
+                "duel", "testfight", "seabattle",
             },
             {command["command"] for command in bot_listener.GROUP_CHAT_COMMANDS},
         )

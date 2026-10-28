@@ -831,6 +831,58 @@ Both are bounded Bot API calls with an HTTP timeout, not the unbounded Telethon 
 made the rule necessary: the spinner can be slow, but it cannot hang forever. Every other
 poker button decides from disk and answers immediately.
 
+### `/seabattle` — Морской бой between two members
+
+Classic battleship on a 10×10 field, played on one message in the group (`seabattle.py`
+for the rules and screens, `handle_seabattle_*` in `bot_listener.py` for Telegram). Also
+spelled `/морскойбой` and `/морской_бой`; it works in any group the bot is in and reads no
+chat data.
+
+**The invitation.** `/seabattle @ник` names the opponent — so does answering somebody's
+message with a bare `/seabattle`, picking them from the mention list, or a display name
+the chat's statistics know. The bot posts **⚓ Принять бой / ✖ Отказ**; only the named
+member can accept, the challenger can withdraw, and anybody else pressing gets a toast.
+Nobody answering within **30 seconds** deletes the invitation and the command. A member
+already in a game or an open invitation cannot start or accept another.
+
+**The game.** On acceptance both fleets are placed at random — one 4-deck, two 3-deck,
+three 2-deck, four 1-deck, no two ships touching even at a corner — and a coin toss picks
+who fires first. The message shows the field being fired at: only what the shooter
+already knows is drawn, so an unhit ship is water like any other.
+
+```text
+⚓ Морской бой · Аня ⚔️ Борис
+🌊 Поле: Борис
+
+~ 1️⃣2️⃣3️⃣4️⃣5️⃣6️⃣7️⃣8️⃣9️⃣🔟
+А 🟦⚪🟦🔥🟦🟦🟦🟦🟦🟦
+…
+🚢 ▰▰▰▰ ▰▰▰ ▰▰▰ ▰▰ ▰▰ ▰▰ ▰ ▰ ▱ ▱
+
+💦 Борис → В10: мимо
+🎯 Ход: Аня — выбери строку
+```
+
+Telegram allows at most 8 buttons in a row and 100 in a keyboard, so a 10×10 grid of
+buttons cannot exist; the field is an emoji grid and a shot is **two taps** — a row
+letter, then a cell (`Д1`…`Д10`, already-known cells shown as their mark). Picking the row
+only edits the message and lights the row up in 🟨. **Every shot posts a new message and
+deletes the old one**, with whose turn it is at the bottom; the shooter's name is a
+mention only when the turn has just passed to them. A hit earns another shot, a miss
+passes the turn, and sinking a ship marks the water around it.
+
+**🚢 Мой флот** shows the presser their own ships and the opponent's shots in a popup only
+they see (BMP-only symbols, so it fits the 200-character alert). **🏳 Сдаться** needs a
+second press within 5 seconds. Whoever is on the move and does nothing for **3 minutes**
+loses. The final message names the winner, counts both sides' shots and reveals the
+winner's fleet.
+
+Every field button carries the shot count it was drawn at, so a press on an older field is
+refused instead of firing at the wrong board. If Telegram refuses the new message — a quick
+game can reach a group's flood limit — the old one is edited instead, so a move is never
+lost. Games live in memory: a restart ends them, and a button on a field from before it is
+answered and has its keyboard taken away.
+
 ### `/vote` — voting on the week's #итогинедели posts
 
 A mobile-first voting page (`voting.py`, `vote_web.py`) opened as a **Telegram Mini App**
