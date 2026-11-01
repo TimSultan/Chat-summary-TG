@@ -545,7 +545,7 @@ VOTE_IMAGE_WORDS = frozenset({"картинка", "картинку", "изоб�
 # "/vote месяц" -- «Лучшая работа месяца»: three votes (bronze, silver, gold) between the
 # weeks' third, second and first places, built from their records in the Hall of Fame
 # (vote_monthly.py). A screen in the DM picks the month -- this one or the one before --
-# and the weeks; its "Создать" makes all three rounds, which the page then runs in turn.
+# and the weeks; its "Создать" makes all three rounds, which the page shows together.
 # "/vote месяц 10.2026" opens a given month. Every button carries the month, the ticked
 # weeks as a bit mask and a fingerprint of the list they were ticked on, so the screen
 # holds no server state.
@@ -5403,6 +5403,9 @@ async def handle_vote_link_ballot(
     subscribed = verdict.is_member
 
     voter_id = str(user["id"])
+    if len(voting.page_polls(entry)) > 1:
+        await _record_link_ballot_in_rounds(reply, entry, user, choices, subscribed, log=log)
+        return
     async with voting.poll_lock:
         poll = voting.latest_poll(entry)
         if poll is None:
@@ -5447,6 +5450,55 @@ async def handle_vote_link_ballot(
     await reply("\n".join(lines))
 
 
+async def _record_link_ballot_in_rounds(reply, entry: str, user: dict, choices: list[str],
+                                        subscribed: bool, log=print) -> None:
+    """The browser page's one link for the month's rounds: every chosen work goes to the
+    round it is in, and each round records its own ballot under its own rules -- a round
+    with nothing chosen keeps whatever ballot this voter already has there."""
+    voter_id = str(user["id"])
+    recorded, refused, events = [], [], []
+    async with voting.poll_lock:
+        polls = voting.page_polls(entry)
+        claimed: set[str] = set()
+        for poll in polls:
+            mine = [c for c in choices if c in set(poll.approved) and c not in claimed]
+            if not mine:
+                continue
+            claimed.update(mine)
+            name = f"{poll.badge} {poll.round[2] if poll.round else poll.label()}"
+            if not poll.open:
+                refused.append(f"{name}: голосование уже закрыто")
+                continue
+            if not poll.allow_revote and poll.votes.get(voter_id):
+                refused.append(f"{name}: голос уже есть, менять нельзя")
+                continue
+            if poll.max_choices and len(mine) > poll.max_choices:
+                refused.append(f"{name}: можно выбрать не более {poll.max_choices}")
+                continue
+            voting.record_vote(poll, user["id"], mine, subscriber=subscribed)
+            voting.save_poll(poll)
+            by_id = {e.entry_id: e for e in poll.entries}
+            recorded.append(f"{name} — " + ", ".join(voting.who(by_id[c]) for c in mine))
+            events.append((poll.poll_id, list(poll.votes[voter_id])))
+    for poll_id, ballot in events:
+        vote_audit.record_vote_event(
+            entry, system="v1", poll_id=poll_id, voter_id=user["id"],
+            name=voting.display_name(user), username=user.get("username"),
+            choices=ballot, is_member=subscribed, via="link", log=log,
+        )
+    log(f"[bot_listener] link ballot from {user.get('username') or voter_id}: {len(recorded)} round(s)")
+    if not recorded and not refused:
+        await reply("Этих работ больше нет в голосовании -- откройте страницу заново и выберите ещё раз.")
+        return
+    lines = ["Спасибо! Ваш голос учтён:", *recorded] if recorded else ["Голос не записан."]
+    if refused:
+        lines += ["", "Не записано:", *refused]
+    if len(claimed) < len(choices):
+        lines += ["", f"Работ, которых уже нет в голосовании, пропущено: {len(choices) - len(claimed)}."]
+    lines += ["", "Передумаете -- выберите заново на странице и отправьте ещё раз: новый голос заменит прежний."]
+    await reply("\n".join(lines))
+
+
 def _vote_group_button_url(cfg, bot_username: str | None) -> str | None:
     """What the vote button links to in a message that lands in a GROUP. A web_app button
     is private-chat only -- Telegram rejects one posted to a group outright -- so a group
@@ -5470,9 +5522,11 @@ _VOTE_MEDALS = ("🥇", "🥈", "🥉")
 def _vote_heading(entry: str) -> str:
     """What a voter is told the vote is: the weekly one, unless the page is running one
     of the month's rounds, which is named."""
-    poll = voting.latest_poll(entry)
-    if poll is not None and poll.is_monthly:
-        return f"Голосование «{poll.label()}» {poll.badge}".rstrip()
+    polls = voting.page_polls(entry)
+    if len(polls) > 1:
+        return f"Голосование «{polls[0].group_label()}»: " + " ".join(p.badge for p in polls)
+    if polls and polls[0].is_monthly:
+        return f"Голосование «{polls[0].label()}» {polls[0].badge}".rstrip()
     return "Голосование за итоги недели"
 
 
@@ -5483,8 +5537,21 @@ def _vote_who(entry) -> str:
 def _vote_status_text(entry: str) -> str:
     """The "current standings" block shared by an administrator's bare /vote status
     message and (implicitly, via the same shape) the winner announcement -- top 3 with
-    medals, or an explanation of why there's nothing to show yet."""
-    poll = voting.latest_poll(entry)
+    medals, or an explanation of why there's nothing to show yet. The month's rounds,
+    all on the page at once, get a line each."""
+    polls = voting.page_polls(entry)
+    if len(polls) > 1:
+        lines = [f"Голосование: {polls[0].group_label()} -- {len(polls)} раунда на странице сразу", ""]
+        for poll in polls:
+            top = poll.tally()[:1]
+            leader = f" · лидер: {_vote_who(top[0][0])} ({top[0][1]})" if top and top[0][1] > 0 else ""
+            lines.append(
+                f"{poll.badge} {poll.round[2]}: {'открыто' if poll.open else 'закрыто'} · "
+                f"проголосовало {len(poll.votes)} чел.{leader}"
+            )
+        lines += ["", "Итоги каждого раунда подводятся отдельно: в модерации переключи вкладку."]
+        return "\n".join(lines)
+    poll = polls[0] if polls else None
     if poll is None:
         return "Голосование ещё не создано."
     # The week is named because there can now be more than one poll in play: собрать has
@@ -6286,7 +6353,8 @@ def _vote_month_screen(entry: str, tz, today: date, year: int, month: int, user_
         works = sum(1 for week in chosen if state.round.tier in week.medals)
         buildable = buildable or (state.can_build and works > 0)
         lines.append(_vote_month_round_line(state, works))
-    lines += ["", "На странице они идут по очереди: 🥉 → 🥈 → 🥇. Подведёшь итоги одного — откроется следующий."]
+    lines += ["", "На странице все три сразу, вкладками: проголосовал в одном раунде — страница сама "
+                  "переходит к следующему."]
     shown = plan.shown
     if (shown is not None and shown.open and shown.approved and not shown.is_monthly and buildable):
         lines.append(
@@ -6338,13 +6406,15 @@ def _vote_month_create(entry: str, tz, year: int, month: int, mask: int | None, 
     if skipped:
         lines += ["", "Без фото, поэтому не попали: " + ", ".join(skipped)
                   + ". Верни фото командой /hall импорт и нажми «Обновить голосования»."]
-    shown = voting.latest_poll(entry)
-    if shown is not None:
-        lines += ["", f"На странице сейчас: {shown.label()}."]
-    if shown is not None and shown.is_monthly:
+    shown = voting.page_polls(entry)
+    if len(shown) > 1:
+        lines += ["", "На странице все раунды сразу: " + " ".join(f"{p.badge} {p.round[2]}" for p in shown) + "."]
+    elif shown:
+        lines += ["", f"На странице сейчас: {shown[0].label()}."]
+    if shown and shown[0].is_monthly:
         lines.append(
-            "Все работы уже допущены. Объяви голосование (📣 Объявление в /vote), а когда пора — "
-            "подведи итоги в модерации: тогда откроется следующий раунд."
+            "Все работы уже допущены. Объяви голосование (📣 Объявление в /vote). Итоги каждого "
+            "раунда подводятся отдельно: в модерации переключи вкладку и закрой голосование."
         )
     return "\n".join(lines)
 
@@ -6425,19 +6495,6 @@ async def handle_vote_month_callback(
             )
         except Exception as e:
             log(f"[bot_listener] could not send the monthly vote buttons: {e}")
-
-
-async def _start_next_monthly_round(poll, log=print):
-    """Hands the voting page to the next round of the month once `poll`, a monthly round,
-    has been closed (vote_monthly.start_next_round). Returns that round, or None."""
-    if vote_monthly is None or not poll.is_monthly:
-        return None
-    try:
-        async with voting.poll_lock:
-            return await asyncio.to_thread(vote_monthly.start_next_round, poll.entry, poll)
-    except Exception:
-        log(f"[bot_listener] could not open the next monthly round after {poll.poll_id}:\n{traceback.format_exc()}")
-        return None
 
 
 def _vote_action_callback_data(action: str, chat_id, user_id) -> str:
@@ -7938,6 +7995,59 @@ async def handle_votelog_command(api: TelegramBotAPI, telethon_client, message: 
     await reply("Детали по каждому голосу — в CSV.", document=path)
 
 
+async def _send_vote_image(api, reply, chat_id, message: dict, entry: str, poll, image_columns: int,
+                           named: bool = False, log=print) -> None:
+    """Renders one poll's standings as a picture and sends it as a file -- "/vote
+    картинка". `named` says which of the month's rounds it is in every reply."""
+    label = f"{poll.badge} {poll.round[2]}: " if named and poll.round else ""
+    standings = poll.tally()
+    if not standings:
+        await reply(f"{label}{'к' if label else 'К'} голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
+        return
+
+    await reply(
+        f"{label}Рисую картинку: {len(standings)} работ, {image_columns} в ряд. "
+        "Это займёт несколько секунд."
+    )
+    subtitle = (
+        f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
+        f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
+    )
+    try:
+        # In a thread: Pillow decodes, scales and re-encodes every photo in the poll,
+        # which is seconds of straight CPU work -- on the event loop it would stall
+        # every other chat the bot is serving for the whole render.
+        path = await asyncio.to_thread(
+            vote_image.render_poll_image,
+            poll,
+            voting.export_image_path(entry, poll.poll_id, image_columns),
+            subtitle=subtitle,
+            columns=image_columns,
+        )
+    except Exception:
+        log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
+        await reply("Не получилось нарисовать картинку -- смотри логи.")
+        return
+    log(
+        f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} "
+        f"({image_columns} columns, {path.stat().st_size} bytes)"
+    )
+
+    # As a document, not a photo: Telegram re-encodes photos and refuses one past
+    # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
+    # exactly that shape (see bot_api.send_document_file). The file stays on disk
+    # either way -- the send is a copy, not the save.
+    try:
+        await api.send_document_file(
+            chat_id, path,
+            caption=f"{label}Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
+            reply_to_message_id=message["message_id"],
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to send the vote image: {e}")
+        await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -8339,56 +8449,14 @@ async def handle_vote_command(
     if wants_image:
         if not await require_admin_in_dm("Рендерить картинку итогов могут только администраторы."):
             return
-        poll = voting.latest_poll(entry)
-        if poll is None:
+        polls = voting.page_polls(entry)
+        if not polls:
             await reply("Голосование ещё не создано -- нечего рисовать. Сначала /vote собрать.")
             return
-        standings = poll.tally()
-        if not standings:
-            await reply("К голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
-            return
-
-        await reply(
-            f"Рисую картинку: {len(standings)} работ, {image_columns} в ряд. "
-            "Это займёт несколько секунд."
-        )
-        subtitle = (
-            f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
-            f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
-        )
-        try:
-            # In a thread: Pillow decodes, scales and re-encodes every photo in the poll,
-            # which is seconds of straight CPU work -- on the event loop it would stall
-            # every other chat the bot is serving for the whole render.
-            path = await asyncio.to_thread(
-                vote_image.render_poll_image,
-                poll,
-                voting.export_image_path(entry, poll.poll_id, image_columns),
-                subtitle=subtitle,
-                columns=image_columns,
-            )
-        except Exception:
-            log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
-            await reply("Не получилось нарисовать картинку -- смотри логи.")
-            return
-        log(
-            f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} "
-            f"({image_columns} columns, {path.stat().st_size} bytes)"
-        )
-
-        # As a document, not a photo: Telegram re-encodes photos and refuses one past
-        # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
-        # exactly that shape (see bot_api.send_document_file). The file stays on disk
-        # either way -- the send is a copy, not the save.
-        try:
-            await api.send_document_file(
-                chat_id, path,
-                caption="Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
-                reply_to_message_id=message["message_id"],
-            )
-        except Exception as e:
-            log(f"[bot_listener] failed to send the vote image: {e}")
-            await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+        # The month's rounds are three votes on the page at once: a picture for each.
+        for poll in polls:
+            await _send_vote_image(api, reply, chat_id, message, entry, poll, image_columns,
+                                   named=len(polls) > 1, log=log)
         return
 
     # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
@@ -14548,25 +14616,12 @@ async def run_bot_listener(
                     if problem:
                         log(f"[bot_listener] {problem}")
 
-            # A monthly round hands the page to the month's next round straight away, so
-            # voters who open it now find the next vote rather than this one's result.
-            next_round = await _start_next_monthly_round(poll, log=log)
             hall_task = asyncio.create_task(_keep_the_closed_vote())
             background_tasks.add(hall_task)
             hall_task.add_done_callback(background_tasks.discard)
             await send_vote_results_draft(
                 api, user, poll, standings, admin_chat_id, vote_result_flows, log=log,
             )
-            if next_round is not None:
-                try:
-                    await api.send_message(
-                        user["id"],
-                        f"На странице голосования теперь следующий раунд: {next_round.badge} "
-                        f"{next_round.label()}. Объяви его (📣 Объявление в /vote), когда опубликуешь эти итоги.",
-                        parse_mode=None,
-                    )
-                except Exception as e:
-                    log(f"[bot_listener] could not tell the admin about the next monthly round: {e}")
 
         async def _deliver_vote_board(user: dict, poll, path) -> None:
             """Sends the picture the cropping page just rendered to the administrator who

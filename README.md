@@ -1107,10 +1107,19 @@ page that changes shape depending on who opens it:
   the weeks with their medallists as tick buttons, and only "🏅 Создать голосования"
   writes anything (`/vote месяц 10.2026` opens a given month). Every work is admitted, the
   vote is open and takes **one choice**, as the channel's own monthly polls did (the
-  moderation screen can change both). The page shows one poll at a time, so the rounds run
-  **in turn**: bronze first; closing a round from the moderation screen hands the page to
-  the next (`vote_monthly.start_next_round`), and the last one closed stays there with its
-  result. Each round is an ordinary poll under `#итогимесяца` (ids like `2026-10-bronze`,
+  moderation screen can change both). **All three are on the page at once**
+  (`voting.page_polls`): three tabs, 🥉 Бронза · 🥈 Серебро · 🥇 Золото, each in its
+  medal's colour, which the page's accent takes on while that round is open. The Mini App
+  gets every round in one `/api/poll` response, so switching is instant; a first vote in a
+  round moves the voter on to the next round they have still to vote in, and after the last
+  a "Готово" card says so (a changed vote stays put). Every write names its round
+  (`poll_id` in the body) and is refused with 404 if that poll is not on the page, so a tab
+  left open can never vote in some other poll. In moderation each tab is moderated and
+  closed on its own ("Подвести итоги: 🥉 бронза"), each with its own results draft. The
+  browser page has the same tabs and builds **one** `/start vote-…` link carrying a choice
+  from every round; the bot sorts each work back into its round and records each ballot
+  under that round's own rules. "/vote картинка" draws a picture per round, the cropping
+  page switches rounds with `?poll=`. Each round is an ordinary poll under `#итогимесяца` (ids like `2026-10-bronze`,
   the same as the archived rounds), so announcing, the board picture and the results draft
   work as for any vote; its winner takes the round's own medal in the Hall of Fame
   (`Poll.tier` → `Contest.tier`). Pressing the button again rebuilds only rounds nobody has

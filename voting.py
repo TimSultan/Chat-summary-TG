@@ -52,6 +52,14 @@ WEEKLY_CONTEST_TITLE = "Итоги недели"
 # hashtag whose winner takes the round's own medal (Poll.tier).
 MONTHLY_HASHTAG = "#итогимесяца"
 MEDAL_TIERS = (1, 2, 3)
+# The month's rounds, in the order the page lists them: (key in the poll id, the medal
+# its winner takes, its name, its badge). A round's poll id is "<YYYY-MM>-<key>".
+MONTHLY_ROUNDS = (
+    ("bronze", 3, "бронза", "🥉"),
+    ("silver", 2, "серебро", "🥈"),
+    ("gold", 1, "золото", "🥇"),
+)
+_MONTHLY_ROUND_ID = re.compile(r"^(\d{4}-\d{2})-(bronze|silver|gold)$")
 
 # A collection covers whole CONTEST WEEKS -- from Monday 00:00 local through the moment of
 # collecting -- rather than a rolling number of days. A rolling window's reach depends on
@@ -701,6 +709,22 @@ class Poll:
     def is_monthly(self) -> bool:
         return self.hashtag == MONTHLY_HASHTAG
 
+    @property
+    def round(self) -> tuple[str, int, str, str] | None:
+        """(key, medal, name, badge) of a monthly round -- MONTHLY_ROUNDS' row -- or None."""
+        match = _MONTHLY_ROUND_ID.match(self.poll_id or "") if self.is_monthly else None
+        if match is None:
+            return None
+        return next(row for row in MONTHLY_ROUNDS if row[0] == match.group(2))
+
+    def group_label(self) -> str:
+        """What the page calls the whole set: a monthly round's title without its medal
+        ("Лучшая работа месяца · октябрь"), anything else's own name."""
+        label = self.label()
+        if self.round is not None and " · " in label:
+            return label.rsplit(" · ", 1)[0]
+        return label
+
     def label(self) -> str:
         """"Итоги недели", or the thematic contest's title (its hashtag if untitled)."""
         return contest_title(self.hashtag, self.title)
@@ -967,6 +991,31 @@ def latest_poll(entry: str) -> Poll | None:
     # min() returns the FIRST of an equally-ranked group and _all_polls is newest-first, so
     # the tie-break within a rank stays "most recently made current" (see make_current).
     return min(polls, key=_ballot_rank)
+
+
+def page_polls(entry: str) -> list[Poll]:
+    """Every poll the voting page shows at once, in the order it lists them.
+
+    Normally one: latest_poll's. When that is one of a month's rounds, it is all of that
+    month's rounds still on disk, bronze, silver, gold -- three votes a voter goes through
+    on the same page, each its own poll with its own ballots and its own close."""
+    shown = latest_poll(entry)
+    if shown is None:
+        return []
+    match = _MONTHLY_ROUND_ID.match(shown.poll_id or "") if shown.is_monthly else None
+    if match is None:
+        return [shown]
+    rounds = [load_poll(entry, f"{match.group(1)}-{row[0]}") for row in MONTHLY_ROUNDS]
+    return [poll for poll in rounds if poll is not None and poll.is_monthly] or [shown]
+
+
+def page_poll(entry: str, poll_id: str | None = None) -> Poll | None:
+    """One of page_polls: the one named, or the first when none is. None for a poll that
+    is not on the page -- a request naming it must not reach any other poll on disk."""
+    polls = page_polls(entry)
+    if not poll_id:
+        return polls[0] if polls else None
+    return next((poll for poll in polls if poll.poll_id == poll_id), None)
 
 
 def make_current(poll: Poll) -> Poll:

@@ -4,7 +4,7 @@ The month's three votes are built from the weeks' records in the Hall of Fame: e
 week's third place goes into the bronze round, the second places into silver, the winners
 into gold, photos, framing and names included. A week belongs to the month of the Sunday
 its vote was held on; a week of the month before comes in when it ended after that
-month's rounds began. The page runs the rounds one after another.
+month's rounds began. The page shows all three rounds at once, one tab each.
 """
 
 import asyncio
@@ -224,24 +224,28 @@ class CreateTests(_Store):
         self.assertEqual([e.entry_id for e in voting.load_poll(CHAT, "2026-10-gold").entries],
                          ["400", "410"])
 
-    def test_the_page_opens_bronze_then_moves_to_silver_then_gold(self):
+    def test_all_three_rounds_are_on_the_page_together(self):
         self._october()
         self._create()
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, "2026-10-bronze")
-        for current, following in (("2026-10-bronze", "2026-10-silver"), ("2026-10-silver", "2026-10-gold")):
-            poll = voting.load_poll(CHAT, current)
+        self.assertEqual([p.poll_id for p in voting.page_polls(CHAT)],
+                         ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
+        self.assertEqual(voting.page_poll(CHAT).poll_id, "2026-10-bronze")
+        self.assertEqual(voting.page_poll(CHAT, "2026-10-gold").poll_id, "2026-10-gold")
+        # A poll that is not on the page is never reached through it.
+        self.assertIsNone(voting.page_poll(CHAT, "2026-W43"))
+        # Closing one leaves the other two open beside its result -- in whichever order.
+        for poll_id in ("2026-10-silver", "2026-10-bronze", "2026-10-gold"):
+            poll = voting.load_poll(CHAT, poll_id)
             voting.record_vote(poll, "voter", [poll.approved[0]])
             voting.close_and_announce(poll)
             voting.save_poll(poll)
-            self.assertEqual(vote_monthly.start_next_round(CHAT, poll).poll_id, following)
-            self.assertEqual(voting.latest_poll(CHAT).poll_id, following)
-        gold = voting.load_poll(CHAT, "2026-10-gold")
-        voting.record_vote(gold, "voter", [gold.approved[0]])
-        voting.close_and_announce(gold)
-        voting.save_poll(gold)
-        self.assertIsNone(vote_monthly.start_next_round(CHAT, gold))
-        # The last round decided keeps the page, with its result.
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, "2026-10-gold")
+            self.assertEqual(len(voting.page_polls(CHAT)), 3)
+        self.assertEqual(voting.page_poll(CHAT).group_label(), "Лучшая работа месяца · октябрь")
+
+    def test_an_ordinary_poll_is_the_page_on_its_own(self):
+        self._october()
+        self.assertEqual(len(voting.page_polls(CHAT)), 1)
+        self.assertIsNone(voting.page_polls(CHAT)[0].round)
 
     def test_a_round_somebody_voted_in_is_never_rebuilt_an_untouched_one_is(self):
         self._october()
@@ -445,7 +449,7 @@ class CommandTests(_Store):
         self.assertEqual(api.edits[0][2], {"inline_keyboard": []})   # nothing left to tap twice
         summary = api.edits[-1][1]
         self.assertIn("🥉 бронза — создано, 3 работы", summary)
-        self.assertIn("На странице сейчас: Лучшая работа месяца · октябрь · бронза", summary)
+        self.assertIn("На странице все раунды сразу: 🥉 бронза 🥈 серебро 🥇 золото", summary)
         for round_ in vote_monthly.ROUNDS:
             self.assertIsNotNone(voting.load_poll(CHAT, f"2026-10-{round_.key}"))
         _, _, buttons = api.sent[-1]
@@ -502,9 +506,13 @@ class CommandTests(_Store):
         self._october()
         voting.archive_all_polls(CHAT)
         vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
+        bronze = voting.load_poll(CHAT, "2026-10-bronze")
+        voting.record_vote(bronze, "a", ["402"])
+        voting.save_poll(bronze)
         text = bot_listener._vote_status_text(CHAT)
-        self.assertIn("Голосование: 🥉 Лучшая работа месяца · октябрь · бронза", text)
-        self.assertIn("Раунд: 2026-10-bronze", text)
+        self.assertIn("Голосование: Лучшая работа месяца · октябрь -- 3 раунда на странице сразу", text)
+        self.assertIn("🥉 бронза: открыто · проголосовало 1 чел. · лидер: Автор 402 (@user402) (1)", text)
+        self.assertIn("🥇 золото: открыто · проголосовало 0 чел.", text)
 
     def test_voters_are_told_which_round_it_is(self):
         self._october()
@@ -512,20 +520,77 @@ class CommandTests(_Store):
         vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
         api = self._type("/vote", user=STRANGER)
         self.assertTrue(api.sent[0][1].startswith(
-            "Голосование «Лучшая работа месяца · октябрь · бронза» 🥉:"))
+            "Голосование «Лучшая работа месяца · октябрь»: 🥉 🥈 🥇:"))
 
-    def test_closing_a_round_hands_the_page_to_the_next(self):
+    def _rounds(self):
         self._october()
+        voting.archive_all_polls(CHAT)
         vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
-        bronze = voting.load_poll(CHAT, "2026-10-bronze")
-        voting.record_vote(bronze, "a", ["402"])
-        voting.close_and_announce(bronze)
-        voting.save_poll(bronze)
-        following = asyncio.run(bot_listener._start_next_monthly_round(bronze, log=lambda *_: None))
-        self.assertEqual(following.poll_id, "2026-10-silver")
-        self.assertEqual(voting.latest_poll(CHAT).poll_id, "2026-10-silver")
-        weekly = voting.load_poll(CHAT, "2026-W43")
-        self.assertIsNone(asyncio.run(bot_listener._start_next_monthly_round(weekly, log=lambda *_: None)))
+
+    def _link_ballot(self, ids, user=STRANGER):
+        api = FakeApi()
+        message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": user}
+
+        async def verdict(*args, **kwargs):
+            return bot_listener.vote_eligibility.Verdict(is_member=True)
+
+        with patch.object(bot_listener, "_vote_verdict", verdict):
+            asyncio.run(bot_listener.handle_vote_link_ballot(
+                api, None, message, CHAT, voting.encode_ballot_link(ids), log=lambda *_: None))
+        return api
+
+    def test_one_browser_link_votes_in_every_round(self):
+        self._rounds()
+        api = self._link_ballot(["402", "391", "410"])
+        voter = str(STRANGER["id"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes[voter], ["402"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-silver").votes[voter], ["391"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-gold").votes[voter], ["410"])
+        text = api.sent[0][1]
+        self.assertIn("🥉 бронза — Автор 402 (@user402)", text)
+        self.assertIn("🥇 золото — Автор 410 (@user410)", text)
+
+    def test_a_link_for_one_round_keeps_the_others_ballots(self):
+        self._rounds()
+        self._link_ballot(["402", "391"])
+        self._link_ballot(["412"])
+        voter = str(STRANGER["id"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes[voter], ["412"])
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-silver").votes[voter], ["391"])
+        self.assertNotIn(voter, voting.load_poll(CHAT, "2026-10-gold").votes)
+
+    def test_a_link_keeps_each_rounds_own_rules(self):
+        self._rounds()
+        gold = voting.load_poll(CHAT, "2026-10-gold")
+        gold.open = False
+        voting.save_poll(gold)
+        api = self._link_ballot(["402", "412", "410"])   # two in bronze, one in a closed round
+        text = api.sent[0][1]
+        self.assertIn("🥉 бронза: можно выбрать не более 1", text)
+        self.assertIn("🥇 золото: голосование уже закрыто", text)
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes, {})
+
+    def test_the_picture_command_draws_every_round(self):
+        self._rounds()
+        drawn, sent = [], []
+
+        def render(poll, path, **kwargs):
+            drawn.append(poll.poll_id)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"jpeg")
+            return path
+
+        async def send_document_file(chat_id, path, caption=None, reply_to_message_id=None):
+            sent.append(caption)
+
+        api = FakeApi()
+        api.send_document_file = send_document_file
+        message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": ADMIN, "text": "/vote картинка"}
+        with patch.object(bot_listener.vote_image, "render_poll_image", render):
+            self._run(lambda tasks: bot_listener.handle_vote_command(
+                api, None, _cfg(), UTC, message, CHAT, "testbot", tasks, log=lambda *_: None))
+        self.assertEqual(drawn, ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
+        self.assertTrue(sent[0].startswith("🥉 бронза: "))
 
     def test_add_new_with_a_round_on_the_page_tops_up_the_weekly_vote(self):
         self._october()
@@ -596,10 +661,67 @@ class PageTests(_Store, AsyncTestCase):
     async def asyncTearDown(self):
         await self.client.close()
 
-    async def test_the_bronze_round_with_its_pictures_and_one_choice(self):
+    async def _get(self, path, user_id=2):
+        response = await self.client.get(path, headers={"X-Telegram-Init-Data": _init_data(user_id)})
+        return response.status, await response.json()
+
+    async def _post(self, path, body, user_id=2):
+        response = await self.client.post(path, json={"init_data": _init_data(user_id), **body})
+        return response.status, await response.json()
+
+    def _rounds(self):
         self._october()
         voting.archive_all_polls(CHAT)
         vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
+
+    async def test_one_response_carries_all_three_rounds(self):
+        self._rounds()
+        _, data = await self._get("/vote/api/poll")
+        self.assertEqual(data["group_title"], "Лучшая работа месяца · октябрь")
+        self.assertEqual([r["poll_id"] for r in data["rounds"]],
+                         ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
+        self.assertEqual([r["round"] for r in data["rounds"]], [
+            {"key": "bronze", "medal": 3, "name": "бронза", "badge": "🥉"},
+            {"key": "silver", "medal": 2, "name": "серебро", "badge": "🥈"},
+            {"key": "gold", "medal": 1, "name": "золото", "badge": "🥇"},
+        ])
+        self.assertEqual([len(r["entries"]) for r in data["rounds"]], [3, 4, 4])
+        self.assertEqual(data["poll_id"], "2026-10-bronze")   # where the page opens
+
+    async def test_each_round_takes_its_own_ballot_and_the_page_opens_on_the_next(self):
+        self._rounds()
+        status, answer = await self._post("/vote/api/ballot", {"poll_id": "2026-10-bronze", "choices": ["402"]})
+        self.assertEqual((status, answer["poll_id"]), (200, "2026-10-bronze"))
+        status, _ = await self._post("/vote/api/ballot", {"poll_id": "2026-10-silver", "choices": ["391"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes, {"2": ["402"]})
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-silver").votes, {"2": ["391"]})
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-gold").votes, {})
+        _, data = await self._get("/vote/api/poll")
+        self.assertEqual(data["poll_id"], "2026-10-gold")      # the round still to vote in
+        self.assertEqual([r["my_vote"] for r in data["rounds"]], [["402"], ["391"], []])
+        # The results a voter has earned are per round: none yet for gold.
+        self.assertEqual(["results" in r for r in data["rounds"]], [True, True, False])
+        _, asked = await self._get("/vote/api/poll?poll=2026-10-bronze")
+        self.assertEqual(asked["poll_id"], "2026-10-bronze")
+
+    async def test_a_ballot_for_a_poll_not_on_the_page_lands_nowhere(self):
+        self._rounds()
+        status, answer = await self._post("/vote/api/ballot", {"poll_id": "2026-W43", "choices": ["430"]})
+        self.assertEqual(status, 404)
+        self.assertIn("нет на странице", answer["error"])
+        self.assertEqual(voting.load_archived_poll(CHAT, "2026-W43").votes.get("2"), None)
+
+    async def test_the_browser_page_gets_every_round_too(self):
+        self._rounds()
+        response = await self.client.get("/vote/api/public")
+        data = await response.json()
+        self.assertEqual([r["poll_id"] for r in data["rounds"]],
+                         ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
+        self.assertEqual(data["group_title"], "Лучшая работа месяца · октябрь")
+
+    async def test_the_bronze_round_with_its_pictures_and_one_choice(self):
+        self._rounds()
         response = await self.client.get("/vote/api/poll", headers={"X-Telegram-Init-Data": _init_data(2)})
         poll = await response.json()
         self.assertEqual(poll["poll_id"], "2026-10-bronze")
@@ -616,6 +738,56 @@ class PageTests(_Store, AsyncTestCase):
         one = await self.client.post("/vote/api/ballot", json={"init_data": _init_data(2), "choices": ["402"]})
         self.assertEqual(one.status, 200)
         self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes, {"2": ["402"]})
+
+
+
+class AdminPageTests(_Store, AsyncTestCase):
+    """Each round is moderated and closed on its own."""
+
+    async def asyncSetUp(self):
+        self.announced = []
+
+        async def is_admin(user):
+            return user.get("id") == 1
+
+        async def announce(user, poll, standings):
+            self.announced.append(poll.poll_id)
+
+        app = vote_web.create_app(SimpleNamespace(telegram_bot_token=BOT_TOKEN), CHAT, is_admin,
+                                  announce=announce, log=lambda *_: None)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+        self._october()
+        voting.archive_all_polls(CHAT)
+        vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def _post(self, path, body, user_id=1):
+        response = await self.client.post(path, json={"init_data": _init_data(user_id), **body})
+        return response.status, await response.json()
+
+    async def test_closing_a_round_closes_that_round_only(self):
+        await self._post("/vote/api/ballot", {"poll_id": "2026-10-silver", "choices": ["401"]}, user_id=2)
+        status, answer = await self._post("/vote/api/announce", {"poll_id": "2026-10-silver"})
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["winner"]["id"], "401")
+        self.assertEqual(self.announced, ["2026-10-silver"])
+        self.assertEqual([p.open for p in voting.page_polls(CHAT)], [True, False, True])
+
+    async def test_moderating_a_round_changes_that_round_only(self):
+        status, _ = await self._post("/vote/api/moderate", {"poll_id": "2026-10-gold", "approved": ["400"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-gold").approved, ["400"])
+        self.assertEqual(len(voting.load_poll(CHAT, "2026-10-bronze").approved), 3)
+
+    async def test_admin_mode_shows_every_rounds_moderation(self):
+        response = await self.client.get("/vote/api/poll?mode=admin",
+                                         headers={"X-Telegram-Init-Data": _init_data(1)})
+        data = await response.json()
+        self.assertTrue(all(r["is_admin"] and "approved" in r for r in data["rounds"]))
+        self.assertEqual(data["poll_id"], "2026-10-bronze")
 
 
 if __name__ == "__main__":

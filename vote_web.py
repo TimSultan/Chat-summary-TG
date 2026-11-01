@@ -104,6 +104,24 @@ def _json_error(message: str, status: int = 400) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
+# Said when a request names a poll that is no longer on the page (a round cleared, a tab
+# left open across a new collect): it must never land in some other poll instead.
+_GONE = "этого голосования уже нет на странице -- обнови её"
+
+
+def _requested_poll(entry_name: str, body: dict | None) -> tuple[voting.Poll | None, web.Response | None]:
+    """The poll a write is for: the one its body names (`poll_id`, one of a month's rounds
+    on the page), or the page's own when it names none -- which is every request from a
+    page that predates the rounds. (poll, None), or (None, the error to answer with)."""
+    requested = (body or {}).get("poll_id")
+    if requested is not None and not isinstance(requested, str):
+        return None, _json_error("poll_id must be a string")
+    poll = voting.page_poll(entry_name, requested)
+    if poll is None:
+        return None, _json_error(_GONE if requested else "голосование ещё не создано", status=404)
+    return poll, None
+
+
 def _init_data_from(request: web.Request, body: dict | None = None) -> str:
     """Mini Apps send initData in a header on reads and in the body on writes; accept
     either so the client can use whichever fits the request."""
@@ -199,8 +217,8 @@ async def handle_poll(request: web.Request) -> web.Response:
     """
     user = await _authenticate(request)
     entry_name = request.app[_ENTRY_KEY]
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
+    polls = voting.page_polls(entry_name)
+    if not polls:
         return web.json_response({
             "poll_id": None, "entries": [], "is_admin": False, "can_moderate": False, "open": False,
         })
@@ -210,12 +228,47 @@ async def handle_poll(request: web.Request) -> web.Response:
     can_view_vote_stats = admin_mode and await request.app[_IS_STATS_ADMIN_KEY](user)
     verdict = await request.app[_ELIGIBILITY_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
+    views = [
+        _poll_view(poll, user, base, admin_mode, can_moderate, can_view_vote_stats, verdict)
+        for poll in polls
+    ]
+    if len(polls) == 1 and polls[0].round is None:
+        return web.json_response(views[0])
+    # A month's rounds: every one of them in this one response, so switching between
+    # them on the page is instant. The top level is the round the page opens on -- the
+    # one asked for, else the first this voter has still to vote in.
+    voter = str(user["id"])
+    requested = request.query.get("poll")
+    current = (
+        next((view for view in views if view["poll_id"] == requested), None)
+        or next((view for view, poll in zip(views, polls)
+                 if not admin_mode and poll.open and not poll.votes.get(voter)), None)
+        or views[0]
+    )
+    return web.json_response({
+        **current, "rounds": views, "group_title": polls[0].group_label(),
+    })
+
+
+def _round_payload(poll: voting.Poll) -> dict | None:
+    """Which of the month's rounds `poll` is, for the page's tabs -- None for any other."""
+    row = poll.round
+    if row is None:
+        return None
+    key, medal, name, badge = row
+    return {"key": key, "medal": medal, "name": name, "badge": badge}
+
+
+def _poll_view(poll: voting.Poll, user: dict, base: str, admin_mode: bool, can_moderate: bool,
+               can_view_vote_stats: bool, verdict: vote_eligibility.Verdict) -> dict:
+    """One poll as this caller may see it -- see handle_poll for what is withheld when."""
     visible = poll.entries if admin_mode else poll.approved_entries()
     winner = poll.winner()
     voted_already = str(user["id"]) in poll.votes
 
     payload = {
         "poll_id": poll.poll_id,
+        "round": _round_payload(poll),
         "chat": poll.entry,
         # What the contest is called: "Итоги недели", or a thematic contest's own title.
         "title": poll.label(),
@@ -244,7 +297,7 @@ async def handle_poll(request: web.Request) -> web.Response:
         # Only in admin mode, and only because the cropping page (BOARD_HTML) is the one
         # thing that reads it -- a voter's ballot has no use for how the export is framed.
         payload["crops"] = poll.crops
-    return web.json_response(payload)
+    return payload
 
 
 def _eligibility_payload(verdict: vote_eligibility.Verdict) -> dict:
@@ -293,9 +346,9 @@ async def handle_ballot(request: web.Request) -> web.Response:
     # Everything from here to save_poll is under voting.poll_lock so two ballots cannot
     # interleave between the load and the save and erase one another.
     async with voting.poll_lock:
-        poll = voting.latest_poll(entry_name)
-        if poll is None:
-            return _json_error("голосование ещё не создано", status=404)
+        poll, problem = _requested_poll(entry_name, body)
+        if problem is not None:
+            return problem
         if not poll.open:
             return _json_error("голосование закрыто", status=409)
         choices = body.get("choices")
@@ -329,6 +382,7 @@ async def handle_ballot(request: web.Request) -> web.Response:
     )
     return web.json_response({
         "ok": True,
+        "poll_id": poll_id,
         "my_vote": poll.votes[str(user["id"])],
         # Lets the page render the standings right after a vote without a second round
         # trip to /api/poll -- the voter has just earned the right to see them (see
@@ -392,9 +446,9 @@ async def handle_moderate(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут допускать работы", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
-        return _json_error("голосование ещё не создано", status=404)
+    poll, problem = _requested_poll(entry_name, body)
+    if problem is not None:
+        return problem
 
     approved = body.get("approved")
     if not isinstance(approved, list) or not all(isinstance(a, str) for a in approved):
@@ -444,9 +498,9 @@ async def handle_announce(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут подводить итоги", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
-        return _json_error("голосование ещё не создано", status=404)
+    poll, problem = _requested_poll(entry_name, body)
+    if problem is not None:
+        return problem
 
     result = voting.close_and_announce(poll)
     if result is None:
@@ -513,9 +567,9 @@ async def handle_crops(request: web.Request) -> web.Response:
 
     entry_name = request.app[_ENTRY_KEY]
     async with voting.poll_lock:
-        poll = voting.latest_poll(entry_name)
-        if poll is None:
-            return _json_error("голосование ещё не создано", status=404)
+        poll, problem = _requested_poll(entry_name, body)
+        if problem is not None:
+            return problem
         voting.set_crops(poll, crops)
         voting.save_poll(poll)
     request.app[_LOG_KEY](
@@ -548,9 +602,9 @@ async def handle_export(request: web.Request) -> web.Response:
 
     entry_name = request.app[_ENTRY_KEY]
     async with voting.poll_lock:
-        poll = voting.latest_poll(entry_name)
-        if poll is None:
-            return _json_error("голосование ещё не создано", status=404)
+        poll, problem = _requested_poll(entry_name, body)
+        if problem is not None:
+            return problem
         if isinstance(body.get("crops"), dict):
             voting.set_crops(poll, body["crops"])
             voting.save_poll(poll)
@@ -640,9 +694,9 @@ async def handle_clear(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут очищать голосование", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
-        return _json_error("голосование ещё не создано -- нечего очищать", status=404)
+    poll, problem = _requested_poll(entry_name, body)
+    if problem is not None:
+        return problem
 
     voting.delete_poll(entry_name, poll.poll_id)
     request.app[_LOG_KEY](f"[vote_web] {voting.display_name(user)} cleared poll {poll.poll_id}")
@@ -719,12 +773,21 @@ def _public_payload(entry_name: str, base: str, bot_username: str) -> dict:
     (see handle_poll). How many people have voted carries no such bias and goes out, as it
     does there. The works themselves were posted publicly in the chat, and their photos
     and avatars are already served without a check."""
-    poll = voting.latest_poll(entry_name)
-    if poll is None:
+    polls = voting.page_polls(entry_name)
+    if not polls:
         return {"poll_id": None, "open": False, "entries": [], "bot": bot_username}
+    views = [_public_view(poll, base, bot_username) for poll in polls]
+    if len(polls) == 1 and polls[0].round is None:
+        return views[0]
+    # A month's rounds, all of them: one link to the bot carries a choice from each.
+    return {**views[0], "rounds": views, "group_title": polls[0].group_label()}
+
+
+def _public_view(poll: voting.Poll, base: str, bot_username: str) -> dict:
     winner = poll.winner()
     return {
         "poll_id": poll.poll_id,
+        "round": _round_payload(poll),
         "title": poll.label(),
         "hashtag": poll.hashtag,
         "open": poll.open,
@@ -1151,6 +1214,42 @@ PAGE_HTML = """<!doctype html>
   .statsWeek { display: block; width: 100%; margin: 0 0 8px; padding: 9px 10px;
                border: 1px solid rgba(128,128,128,.45); border-radius: 8px;
                background: var(--bg); color: var(--fg); font: inherit; }
+
+  /* «Лучшая работа месяца»: three votes on one page, one tab each. Each round wears its
+     own medal: the tab, and while it is open the page's accent -- picks, outlines, bars,
+     banners -- so nobody wonders which of the three they are voting in. */
+  body[data-medal="bronze"] { --accent: #d4894a; --accent-fg: #1f1206; }
+  body[data-medal="silver"] { --accent: #b9c4cf; --accent-fg: #111820; }
+  body[data-medal="gold"]   { --accent: #e6b422; --accent-fg: #1d1600; }
+  .rounds { position: sticky; top: 0; z-index: 5; display: grid; gap: 6px;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            padding: 6px 12px 8px; background: var(--bg); }
+  .roundTab { --tone: #8a9aa9; --toneSoft: rgba(138,154,169,.12);
+              display: flex; flex-direction: column; align-items: center; gap: 1px;
+              min-width: 0; padding: 7px 4px 6px; border-radius: 12px; cursor: pointer;
+              border: 1px solid rgba(255,255,255,.1); background: var(--card);
+              color: var(--fg); font: inherit; transition: background .2s, border-color .2s; }
+  .roundTab[data-tone="bronze"] { --tone: #d4894a; --toneSoft: rgba(212,137,74,.18); }
+  .roundTab[data-tone="silver"] { --tone: #b9c4cf; --toneSoft: rgba(185,196,207,.16); }
+  .roundTab[data-tone="gold"]   { --tone: #e6b422; --toneSoft: rgba(230,180,34,.18); }
+  .roundTab .medal { font-size: 22px; line-height: 1.1; }
+  .roundTab .rname { font-size: 13px; font-weight: 600; }
+  .roundTab .rstate { max-width: 100%; overflow: hidden; text-overflow: ellipsis;
+                      white-space: nowrap; font-size: 11px; color: var(--muted); }
+  .roundTab.done .rstate { color: var(--tone); font-weight: 600; }
+  .roundTab.active { border-color: var(--tone); background: var(--toneSoft);
+                     box-shadow: inset 0 0 0 1px var(--tone); }
+  .roundTab.closed:not(.active) { opacity: .75; }
+  .doneCard { margin: 8px 12px 4px; padding: 14px 12px; border-radius: 12px; text-align: center;
+              background: linear-gradient(135deg, rgba(212,137,74,.22), rgba(185,196,207,.16), rgba(230,180,34,.24));
+              border: 1px solid rgba(230,180,34,.35); }
+  .doneCard .big { font-size: 26px; line-height: 1.2; }
+  .doneCard b { display: block; margin: 4px 0 2px; font-size: 15px; }
+  .doneCard span { color: var(--muted); font-size: 13px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .grid.swap { animation: roundIn .28s ease-out; }
+    @keyframes roundIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  }
 </style>
 </head>
 <body>
@@ -1158,6 +1257,12 @@ PAGE_HTML = """<!doctype html>
   <h1 id="title">Итоги недели</h1>
   <div class="sub" id="sub">Загружаю…</div>
 </header>
+<nav class="rounds" id="rounds" hidden aria-label="Раунды голосования"></nav>
+<div class="doneCard" id="doneCard" hidden>
+  <div class="big">🥉 🥈 🥇</div>
+  <b>Готово — ты проголосовал во всех раундах!</b>
+  <span>Спасибо. Передумаешь — выбери другую работу, пока голосование открыто.</span>
+</div>
 <div class="confirmBanner" id="confirmBanner" hidden>Голос принят</div>
 <div class="winner" id="winnerBanner" hidden></div>
 <div class="settings" id="settings" hidden>
@@ -1231,6 +1336,12 @@ const initData = (tg && tg.initData) || "";
 const JOIN_URL = "__JOIN_URL__";
 
 let poll = null;
+// Every poll the page shows. One, except for «Лучшая работа месяца»: its three rounds
+// (bronze, silver, gold), each its own vote -- `poll` is the one on screen, and always one
+// of these objects, so whatever updates it updates the round too.
+let rounds = [];
+let groupTitle = "";
+let advanceTimer = null;
 let picked = new Set();     // entry ids the voter chose (server-confirmed when allow_revote)
 let admitted = new Set();   // entry ids the admin admits (admin mode only)
 let confirmTimers = [];     // pending timeouts for the fading "Голос принят" banner
@@ -1368,9 +1479,11 @@ async function recheckEligibility() {
     if (!response.ok) return;
     const data = await response.json();
     const wasMember = poll.is_subscriber;
-    poll.is_subscriber = data.is_subscriber;
-    poll.can_vote = data.can_vote;
-    poll.vote_block = data.vote_block;
+    for (const round of rounds) {
+      round.is_subscriber = data.is_subscriber;
+      round.can_vote = data.can_vote;
+      round.vote_block = data.vote_block;
+    }
     if (wasMember === false && data.is_subscriber) {
       joinedNow = true;
       joinPending = false;
@@ -1441,16 +1554,19 @@ function renderWinnerBanner() {
   banner.hidden = false;
   banner.innerHTML =
     (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
-    '<div><div class="label">🏆 Победитель голосования</div>' +
+    '<div><div class="label">' + (poll.round
+      ? esc(poll.round.badge + " " + capital(poll.round.name) + " месяца")
+      : "🏆 Победитель голосования") + "</div>" +
     '<div class="name">' + esc(who(w)) + "</div></div>";
 }
 
 // Shows "Голос принят" for a couple of seconds, then fades it out -- the acceptance
 // confirmation both voting modes give on a successful ballot (see submitBallot).
-function showConfirmBanner() {
+function showConfirmBanner(text) {
   const banner = $("confirmBanner");
   confirmTimers.forEach(clearTimeout);
   confirmTimers = [];
+  banner.textContent = text || "Голос принят";
   banner.hidden = false;
   banner.classList.remove("fade");
   confirmTimers.push(setTimeout(() => banner.classList.add("fade"), 1600));
@@ -1499,6 +1615,11 @@ function updateAdminButtons() {
   announce.hidden = false;
   announce.disabled = false;
   announce.textContent = poll.open ? "Закрыть голосование и объявить победителя" : "Пересчитать победителя";
+  // One of the month's rounds: closing it closes that round only, so the button says which.
+  if (poll.round) {
+    announce.textContent = (poll.open ? "Подвести итоги: " : "Пересчитать: ") +
+      poll.round.badge + " " + poll.round.name;
+  }
   clear.hidden = false;
   clear.disabled = false;
 }
@@ -1679,8 +1800,10 @@ function syncPicks() {
 }
 
 function render() {
-  // A thematic contest is named on its own ballot, not as the weekly one.
+  // A thematic contest is named on its own ballot, not as the weekly one; the month's
+  // rounds by their month, the round itself being the tab.
   $("title").textContent = poll.title || "Итоги недели";
+  if (rounds.length > 1 && groupTitle) $("title").textContent = groupTitle;
   renderWinnerBanner();
   renderResults();
   updateAdminButtons();
@@ -1763,7 +1886,7 @@ function overCap(adding) {
 // immediately without a second /api/poll round trip.
 async function submitBallot(choices) {
   const response = await api("/api/ballot", {
-    method: "POST", body: JSON.stringify({ init_data: initData, choices }),
+    method: "POST", body: JSON.stringify({ init_data: initData, poll_id: poll.poll_id, choices }),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "не получилось");
@@ -1771,9 +1894,112 @@ async function submitBallot(choices) {
   poll.my_vote = data.my_vote;
   poll.results = data.results;
   poll.voter_count = data.voter_count;
-  poll.is_subscriber = data.is_subscriber;
+  for (const round of rounds) round.is_subscriber = data.is_subscriber;
   if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
   showConfirmBanner();
+}
+
+// ---- the month's rounds ----------------------------------------------------------------
+function capital(text) { return text ? text.charAt(0).toUpperCase() + text.slice(1) : ""; }
+function hasVoted(round) { return !!(round.my_vote && round.my_vote.length); }
+// Which places of the weeks each round is between.
+const ROUND_FIELD = { bronze: "третьи места недель", silver: "вторые места недель", gold: "победители недель" };
+
+function roundState(round) {
+  if (!round.open) return round.winner ? "итоги" : "закрыто";
+  if (round.is_admin) return "голосов: " + (round.voter_count || 0);
+  return hasVoted(round) ? "✓ голос учтён" : "не выбрано";
+}
+
+function renderRounds() {
+  const box = $("rounds");
+  const many = rounds.length > 1;
+  box.hidden = !many;
+  document.body.dataset.medal = poll && poll.round ? poll.round.key : "";
+  $("doneCard").hidden = !(many && !poll.is_admin && rounds.every((r) => !r.open || hasVoted(r)) &&
+                           rounds.some((r) => r.open && hasVoted(r)));
+  if (!many) return;
+  box.innerHTML = rounds.map((r) => {
+    const key = r.round ? r.round.key : "";
+    const classes = "roundTab" + (r === poll ? " active" : "") +
+      (r.open && !r.is_admin && hasVoted(r) ? " done" : "") + (r.open ? "" : " closed");
+    return '<button type="button" class="' + classes + '" data-round-tab="' + esc(r.poll_id) +
+      '" data-tone="' + esc(key) + '"' + (r === poll ? ' aria-current="true"' : "") + ">" +
+      '<span class="medal">' + esc(r.round ? r.round.badge : "🏅") + "</span>" +
+      '<span class="rname">' + esc(capital(r.round ? r.round.name : r.title)) + "</span>" +
+      '<span class="rstate">' + esc(roundState(r)) + "</span></button>";
+  }).join("");
+}
+
+function renderSub() {
+  const sub = $("sub");
+  const many = rounds.length > 1;
+  const where = many && poll.round
+    ? "Раунд " + (rounds.indexOf(poll) + 1) + " из " + rounds.length + " · " +
+      capital(poll.round.name) + ": " + (ROUND_FIELD[poll.round.key] || "") + " · "
+    : "";
+  if (poll.is_admin) {
+    sub.textContent = where +
+      "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
+    return;
+  }
+  const voted = hasVoted(poll);
+  let text;
+  if (many && !poll.open) text = "голосование закрыто";
+  else if (voted && !poll.allow_revote) text = "Твой голос зафиксирован — менять нельзя";
+  else if (voted) text = "Твой голос учтён — можно переголосовать";
+  else if (many) text = poll.max_choices === 1 ? "выбери одну работу" : "выбери понравившиеся работы";
+  else text = "Выбери понравившиеся работы";
+  sub.textContent = where + text + (poll.can_moderate ? " · модерация: /vote выбрать" : "");
+}
+
+function selectRound(id, options = {}) {
+  const next = rounds.find((r) => r.poll_id === id);
+  if (!next) return;
+  clearTimeout(advanceTimer);
+  if (!$("lens").hidden) closeLens();
+  if (!$("reel").hidden) closeReel();
+  poll = next;
+  picked = new Set(poll.my_vote || []);
+  admitted = new Set(poll.approved || []);
+  if (poll.is_admin) {
+    $("maxChoices").value = poll.max_choices || "";
+    $("allowRevote").checked = poll.allow_revote !== false;
+  }
+  if (!options.keepBanner) $("confirmBanner").hidden = true;
+  renderRounds();
+  renderSub();
+  render();
+  const grid = $("grid");
+  grid.classList.remove("swap");
+  void grid.offsetWidth;  // restarts the animation
+  grid.classList.add("swap");
+  window.scrollTo({ top: 0, behavior: options.smooth ? "smooth" : "auto" });
+}
+
+// After a ballot: the tabs catch up, and a FIRST vote in a round moves the voter on to the
+// next round they have still to vote in -- or, when that was the last, says they are done.
+// A changed or withdrawn vote stays put: they came back to this round on purpose.
+function afterBallot(votedBefore) {
+  if (rounds.length < 2) return;
+  renderRounds();
+  renderSub();
+  if (votedBefore || !hasVoted(poll)) return;
+  const from = rounds.indexOf(poll);
+  const ordered = rounds.slice(from + 1).concat(rounds.slice(0, from));
+  const next = ordered.find((r) => r.open && !hasVoted(r) && r.can_vote !== false);
+  const current = poll;
+  if (next) {
+    showConfirmBanner(capital(current.round.name) + ": голос принят → дальше " + next.round.badge + " " +
+                      next.round.name);
+    advanceTimer = setTimeout(() => {
+      if (poll === current) selectRound(next.poll_id, { keepBanner: true, smooth: true });
+    }, 900);
+  } else {
+    $("confirmBanner").hidden = true;
+    if (!$("reel").hidden) closeReel();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
 }
 
 // Opens the reel at the tapped work. Every entry is in it, so from here the rest of the
@@ -2138,8 +2364,11 @@ async function toggleAndSubmit(id) {
   const choices = [...nextSelection(id, adding)];
   if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
   ballotInFlight = true;
+  const votedBefore = hasVoted(poll);
+  let accepted = false;
   try {
     await submitBallot(choices);
+    accepted = true;
   } catch (e) {
     alert(String(e.message || e));
   } finally {
@@ -2147,6 +2376,7 @@ async function toggleAndSubmit(id) {
   }
   syncPicks();
   renderResults();
+  if (accepted) afterBallot(votedBefore);
 }
 
 async function onPickTap(id) {
@@ -2168,6 +2398,15 @@ async function onPickTap(id) {
 }
 
 document.addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-round-tab]");
+  if (tab) {
+    event.preventDefault();
+    if (tab.dataset.roundTab !== (poll && poll.poll_id)) {
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+      selectRound(tab.dataset.roundTab);
+    }
+    return;
+  }
   const profile = event.target.closest("[data-profile]");
   if (profile) {
     event.preventDefault();
@@ -2190,6 +2429,7 @@ async function saveModeration() {
   try {
     const body = {
       init_data: initData,
+      poll_id: poll.poll_id,
       approved: [...admitted],
       max_choices: $("maxChoices").value ? parseInt($("maxChoices").value, 10) : null,
       allow_revote: $("allowRevote").checked,
@@ -2220,9 +2460,11 @@ async function finalizeBallot() {
   go.disabled = true;
   const original = go.textContent;
   go.textContent = "Отправляю…";
+  const votedBefore = hasVoted(poll);
   try {
     await submitBallot([...picked]);
     render();
+    afterBallot(votedBefore);
   } catch (e) {
     go.textContent = String(e.message || e);
     setTimeout(() => { go.textContent = original; go.disabled = false; }, 2500);
@@ -2251,8 +2493,9 @@ $("statsButton").addEventListener("click", async () => {
 
 $("announce").addEventListener("click", async () => {
   const button = $("announce");
+  const which = poll.round ? " раунда «" + poll.round.name + "» (остальные раунды останутся открытыми)" : "";
   if (!confirm(
-    "Закрыть голосование и подвести итоги? Дальше голосовать будет нельзя. " +
+    "Закрыть голосование" + which + " и подвести итоги? Дальше голосовать в нём будет нельзя. " +
     "Итоги придут черновиком в личку -- в чат ничего не уйдёт без твоего подтверждения."
   )) return;
   button.disabled = true;
@@ -2260,13 +2503,14 @@ $("announce").addEventListener("click", async () => {
   button.textContent = "Подвожу итоги…";
   try {
     const response = await api("/api/announce", {
-      method: "POST", body: JSON.stringify({ init_data: initData }),
+      method: "POST", body: JSON.stringify({ init_data: initData, poll_id: poll.poll_id }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
     poll.open = false;
     poll.winner = data.winner;
     renderWinnerBanner();  // shows the banner right away, without touching this button's text
+    renderRounds();
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
     // Nothing has been posted anywhere at this point: the bot only puts a DRAFT of the
     // results in the admin's DM, and the chat sees them once "Отправить" is pressed there.
@@ -2293,11 +2537,22 @@ $("clear").addEventListener("click", async () => {
   button.textContent = "Очищаю…";
   try {
     const response = await api("/api/clear", {
-      method: "POST", body: JSON.stringify({ init_data: initData }),
+      method: "POST", body: JSON.stringify({ init_data: initData, poll_id: poll.poll_id }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+    if (rounds.length > 1) {
+      // One round of the month's: the others stay, and the page moves to the first of them.
+      const cleared = poll;
+      rounds = rounds.filter((r) => r !== cleared);
+      button.textContent = "🗑 Очистить голосование";
+      button.disabled = false;
+      selectRound(rounds[0].poll_id);
+      showConfirmBanner("Раунд «" + (cleared.round ? cleared.round.name : cleared.title) + "» убран в архив");
+      return;
+    }
+    rounds = [];
     poll = { poll_id: null, entries: [], is_admin: true, can_moderate: true, open: false, is_subscriber: true };
     picked = new Set();
     admitted = new Set();
@@ -2330,7 +2585,9 @@ $("clear").addEventListener("click", async () => {
     const response = await api("/api/poll" + (mode ? "?mode=" + encodeURIComponent(mode) : ""));
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось загрузить");
-    poll = data;
+    rounds = data.rounds && data.rounds.length ? data.rounds : [data];
+    groupTitle = data.group_title || "";
+    poll = rounds.find((r) => r.poll_id === data.poll_id) || rounds[0];
     if (!poll.poll_id) {
       $("sub").textContent = "";
       $("msg").hidden = false;
@@ -2342,21 +2599,11 @@ $("clear").addEventListener("click", async () => {
     admitted = new Set(poll.approved || []);
     $("settings").hidden = !poll.is_admin;
     if (poll.is_admin) {
-      $("sub").textContent =
-        "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
       $("maxChoices").value = poll.max_choices || "";
       $("allowRevote").checked = poll.allow_revote !== false;
-    } else {
-      const voted = poll.my_vote && poll.my_vote.length;
-      if (voted && !poll.allow_revote) {
-        $("sub").textContent = "Твой голос зафиксирован — менять нельзя";
-      } else {
-        $("sub").textContent = voted ? "Твой голос учтён — можно переголосовать" : "Выбери понравившиеся работы";
-      }
-      if (poll.can_moderate) {
-        $("sub").textContent += " · модерация: /vote выбрать";
-      }
     }
+    renderRounds();
+    renderSub();
     render();
   } catch (e) {
     $("sub").textContent = "";
@@ -2514,6 +2761,7 @@ BOARD_HTML = """<!doctype html>
 <header>
   <h1>Кадрирование итогов</h1>
   <div class="sub" id="sub">Загружаю…</div>
+  <div id="roundLinks" hidden style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px"></div>
 </header>
 <div class="tools" id="tools" hidden>
   <button class="chip" id="allFit">Все: вписать</button>
@@ -2581,6 +2829,7 @@ let natural = {};     // id -> {w, h}: learned from each photo as it loads
 let dirty = false;    // something changed since the last successful save
 let editing = null;   // id of the work the editor is open on
 let columns = 3;      // how many works per row, here AND in the exported picture
+let pollId = null;    // which poll this is: one of the month's rounds has a page of its own
 
 const $ = (id) => document.getElementById(id);
 
@@ -2908,7 +3157,7 @@ async function save() {
   try {
     const response = await api("/api/crops", {
       method: "POST",
-      body: JSON.stringify({ init_data: initData, crops: payloadCrops() }),
+      body: JSON.stringify({ init_data: initData, poll_id: pollId, crops: payloadCrops() }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
@@ -2942,7 +3191,7 @@ $("export").addEventListener("click", async () => {
     // "Сохранить" was never pressed -- the server stores them as part of the same request.
     const response = await api("/api/export", {
       method: "POST",
-      body: JSON.stringify({ init_data: initData, crops: payloadCrops(), columns: columns }),
+      body: JSON.stringify({ init_data: initData, poll_id: pollId, crops: payloadCrops(), columns: columns }),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
@@ -2982,9 +3231,20 @@ window.addEventListener("beforeunload", (event) => {
   try {
     // mode=admin is what makes the server send `results` (the ranked board) and `crops` at
     // all -- and it only obeys it for a real administrator, whoever asks (see handle_poll).
-    const response = await api("/api/poll?mode=admin");
+    // ?poll= picks one of the month's rounds; each is framed and exported on its own.
+    const wanted = new URLSearchParams(location.search).get("poll");
+    const response = await api("/api/poll?mode=admin" + (wanted ? "&poll=" + encodeURIComponent(wanted) : ""));
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось загрузить");
+    pollId = data.poll_id;
+    if (data.rounds && data.rounds.length > 1) {
+      const links = $("roundLinks");
+      links.hidden = false;
+      links.innerHTML = data.rounds.map((r) =>
+        '<a class="chip' + (r.poll_id === data.poll_id ? " on" : "") + '" style="text-decoration:none" href="?poll=' +
+        encodeURIComponent(r.poll_id) + '">' + esc((r.round ? r.round.badge + " " + r.round.name : r.title)) + "</a>"
+      ).join("");
+    }
     if (!data.poll_id) {
       $("sub").textContent = "";
       $("msg").hidden = false;
@@ -3180,6 +3440,27 @@ BROWSER_HTML = """<!doctype html>
            border-radius: 999px; background: #0e161e; font-size: 13px; white-space: nowrap;
            box-shadow: 0 6px 20px rgba(0,0,0,.4); transition: opacity .25s, transform .25s; }
   .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  /* «Лучшая работа месяца»: its three rounds as tabs, each in its medal's colour, which
+     the whole page takes on while that round is open. */
+  body[data-medal="bronze"] { --accent: #d4894a; --accent-soft: rgba(212,137,74,.18); --accent-fg: #1f1206; }
+  body[data-medal="silver"] { --accent: #b9c4cf; --accent-soft: rgba(185,196,207,.16); --accent-fg: #111820; }
+  body[data-medal="gold"]   { --accent: #e6b422; --accent-soft: rgba(230,180,34,.18); --accent-fg: #1d1600; }
+  .rounds { position: sticky; top: 0; z-index: 5; display: grid; gap: 8px;
+            grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 10px 16px; background: var(--bg); }
+  .roundTab { --tone: #8a9aa9; --toneSoft: rgba(138,154,169,.12);
+              display: flex; flex-direction: column; align-items: center; gap: 1px; min-width: 0;
+              padding: 8px 4px; border-radius: var(--radius); border: 1px solid var(--line);
+              background: var(--card); color: var(--fg); cursor: pointer; }
+  .roundTab[data-tone="bronze"] { --tone: #d4894a; --toneSoft: rgba(212,137,74,.18); }
+  .roundTab[data-tone="silver"] { --tone: #b9c4cf; --toneSoft: rgba(185,196,207,.16); }
+  .roundTab[data-tone="gold"]   { --tone: #e6b422; --toneSoft: rgba(230,180,34,.18); }
+  .roundTab .medal { font-size: 24px; line-height: 1.1; }
+  .roundTab .rname { font-size: 14px; font-weight: 600; }
+  .roundTab .rstate { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                      font-size: 11px; color: var(--muted); }
+  .roundTab.done .rstate { color: var(--tone); font-weight: 600; }
+  .roundTab.active { border-color: var(--tone); background: var(--toneSoft); box-shadow: inset 0 0 0 1px var(--tone); }
+  .chosen .round { flex: none; font-size: 18px; }
   @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
   @keyframes rise { from { transform: translateY(40px); opacity: 0; } to { transform: none; opacity: 1; } }
   @media (prefers-reduced-motion: reduce) {
@@ -3195,10 +3476,11 @@ BROWSER_HTML = """<!doctype html>
     <p class="lead">Версия для браузера — для тех, у кого голосование не открывается в Telegram.</p>
   </header>
   <div class="steps" id="steps">
-    <div class="step"><b>1</b><span>Нажмите «Выбрать» под понравившимися работами. Нажмите на фото, чтобы рассмотреть.</span></div>
+    <div class="step"><b>1</b><span id="stepOne">Нажмите «Выбрать» под понравившимися работами. Нажмите на фото, чтобы рассмотреть.</span></div>
     <div class="step"><b>2</b><span>Нажмите «Отправить голос» внизу.</span></div>
     <div class="step"><b>3</b><span>Откроется Telegram, чат с ботом — нажмите «Запустить». Голос засчитается от вашего аккаунта.</span></div>
   </div>
+  <nav class="rounds" id="rounds" hidden aria-label="Раунды голосования"></nav>
   <div class="facts" id="facts"></div>
   <div class="notice" id="notice" hidden></div>
   <div class="grid" id="grid"></div>
@@ -3245,6 +3527,11 @@ const $ = (id) => document.getElementById(id);
 let poll = null;
 let picked = new Set();
 let toastTimer = null;
+// The month's three rounds, when that is what is on: `poll` is the round on screen, and
+// each round keeps its own choice. One link to the bot then carries all of them.
+let rounds = [];
+const picksByRound = {};
+let advanceTimer = null;
 
 // The same start payload voting.encode_ballot_link builds -- a test runs both and
 // compares them. Telegram allows [A-Za-z0-9_-] and 64 characters in one.
@@ -3279,12 +3566,13 @@ function plural(n, one, few, many) {
 
 // Picks survive a reload of the page, per poll. Browser storage can be missing or refuse
 // (private windows), and the page must work the same without it.
-function storageKey() { return "vote-web-picks:" + (poll && poll.poll_id); }
+function storageKey(round) { const r = round || poll; return "vote-web-picks:" + (r && r.poll_id); }
 function savePicks() { try { localStorage.setItem(storageKey(), JSON.stringify([...picked])); } catch (e) {} }
-function loadPicks() {
+function loadPicks(round) {
+  const r = round || poll;
   try {
-    const raw = JSON.parse(localStorage.getItem(storageKey()) || "[]");
-    const known = new Set(poll.entries.map((e) => e.id));
+    const raw = JSON.parse(localStorage.getItem(storageKey(r)) || "[]");
+    const known = new Set(r.entries.map((e) => e.id));
     return new Set(raw.filter((id) => known.has(id)));
   } catch (e) { return new Set(); }
 }
@@ -3397,12 +3685,84 @@ function syncPicks() {
 
 function renderBar() {
   const bar = $("bar");
+  if (rounds.length > 1) {
+    const open = rounds.filter((r) => r.open && r.entries.length);
+    const done = open.filter((r) => picksOf(r).size).length;
+    bar.hidden = !open.length;
+    $("count").innerHTML = "Выбрано<b>" + done + " из " + open.length + " " +
+      plural(open.length, "раунда", "раундов", "раундов") + "</b>";
+    $("send").disabled = done === 0;
+    $("send").textContent = !done ? "Выберите работы" : done < open.length ? "Отправить выбранное" : "Отправить голос";
+    return;
+  }
   bar.hidden = !poll || !poll.entries.length || !poll.open;
   const n = picked.size;
   const cap = poll && poll.max_choices;
   $("count").innerHTML = "Выбрано<b>" + n + (cap ? " из " + cap : "") + "</b>";
   $("send").disabled = n === 0;
   $("send").textContent = n ? "Отправить голос" : "Выберите работы";
+}
+
+// ---------------------------------------------------------------- the rounds
+function capital(text) { return text ? text.charAt(0).toUpperCase() + text.slice(1) : ""; }
+function picksOf(round) { return picksByRound[round.poll_id] || new Set(); }
+
+function renderRounds() {
+  const box = $("rounds");
+  const many = rounds.length > 1;
+  box.hidden = !many;
+  document.body.dataset.medal = poll && poll.round ? poll.round.key : "";
+  if (!many) return;
+  box.innerHTML = rounds.map((r) => {
+    const key = r.round ? r.round.key : "";
+    const chosen = r.open && picksOf(r).size > 0;
+    const state = !r.open ? "закрыто" : chosen ? "✓ выбрано" : "не выбрано";
+    return '<button type="button" class="roundTab' + (r === poll ? " active" : "") + (chosen ? " done" : "") +
+      '" data-round-tab="' + esc(r.poll_id) + '" data-tone="' + esc(key) + '">' +
+      '<span class="medal">' + esc(r.round ? r.round.badge : "🏅") + "</span>" +
+      '<span class="rname">' + esc(capital(r.round ? r.round.name : r.title)) + "</span>" +
+      '<span class="rstate">' + state + "</span></button>";
+  }).join("");
+}
+
+function renderClosedNotice() {
+  if (poll.open) { $("notice").hidden = true; return; }
+  const w = poll.winner;
+  showNotice(rounds.length > 1 ? capital(poll.round.name) + ": голосование закрыто" : "Голосование закрыто",
+    "Спасибо всем, кто голосовал.",
+    w ? '<div class="winner" style="margin-top:12px">' +
+        (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
+        '<div><div class="hint">Победитель</div><b>' + esc(displayName(w)) + "</b></div></div>" : "");
+}
+
+function selectRound(id) {
+  const next = rounds.find((r) => r.poll_id === id);
+  if (!next) return;
+  clearTimeout(advanceTimer);
+  poll = next;
+  picked = picksOf(poll);
+  renderRounds();
+  renderClosedNotice();
+  renderFacts();
+  renderGrid();
+  renderReel();
+  renderBar();
+  const top = $("rounds").getBoundingClientRect().top + window.scrollY - 4;
+  if (window.scrollY > top) window.scrollTo({ top: top, behavior: "smooth" });
+}
+
+// A first choice in a round moves on to the next round still without one.
+function advanceFrom(current) {
+  const from = rounds.indexOf(current);
+  const ordered = rounds.slice(from + 1).concat(rounds.slice(0, from));
+  const next = ordered.find((r) => r.open && r.entries.length && !picksOf(r).size);
+  if (!next) { toast("Выбор есть во всех раундах — отправьте голос"); return; }
+  toast(capital(current.round.name) + ": готово → дальше " + next.round.badge + " " + next.round.name);
+  advanceTimer = setTimeout(() => {
+    if (poll !== current) return;
+    if (layers.length) closeTop();
+    selectRound(next.poll_id);
+  }, 700);
 }
 
 function showNotice(title, text, extraHtml) {
@@ -3414,29 +3774,52 @@ function showNotice(title, text, extraHtml) {
 // --------------------------------------------------------------------- choosing
 function togglePick(id) {
   if (!canPick()) return;
+  const before = picked.size;
   const cap = poll.max_choices;
   if (picked.has(id)) picked.delete(id);
   else if (cap === 1) picked = new Set([id]);      // one work: a tap moves the choice
   else if (cap && picked.size >= cap) { toast("Можно выбрать не более " + cap); return; }
   else picked.add(id);
   if (navigator.vibrate) { try { navigator.vibrate(8); } catch (e) {} }
+  picksByRound[poll.poll_id] = picked;
   savePicks();
   syncPicks();
+  if (rounds.length > 1) {
+    renderRounds();
+    if (!before && picked.size) advanceFrom(poll);
+  }
 }
 
 // ------------------------------------------------------------------ sending it
 function chosenInOrder() { return poll.entries.filter((e) => picked.has(e.id)); }
 
+// Every round's choice, round by round: the bot sorts each work back into its round.
+function chosenEverywhere() {
+  const chosen = [];
+  for (const r of rounds) {
+    if (!r.open) continue;
+    for (const e of r.entries) if (picksOf(r).has(e.id)) chosen.push({ entry: e, round: r });
+  }
+  return chosen;
+}
+
 function openSend() {
-  const chosen = chosenInOrder();
+  const many = rounds.length > 1;
+  const pairs = many ? chosenEverywhere() : chosenInOrder().map((e) => ({ entry: e, round: null }));
+  const chosen = pairs.map((pair) => pair.entry);
   if (!chosen.length) return;
   const payload = ballotPayload(chosen.map((e) => e.id));
   const bot = poll.bot;
   const linkable = bot && payload.length <= LINK_LIMIT;
-  $("sendCount").textContent = "Ваш выбор: " + chosen.length + " " + plural(chosen.length, "работа", "работы", "работ");
-  $("chosen").innerHTML = chosen.map((e) =>
-    '<div class="row">' + (e.photos[0] ? '<img src="' + esc(e.photos[0]) + '" alt="">' : "") +
-    "<span>" + esc(displayName(e)) + "</span></div>").join("");
+  const open = rounds.filter((r) => r.open && r.entries.length).length;
+  const done = new Set(pairs.map((pair) => pair.round)).size;
+  $("sendCount").textContent = many
+    ? (done < open ? "Выбор есть в " + done + " из " + open + " раундов — остальные можно отправить потом." : "Ваш выбор во всех раундах:")
+    : "Ваш выбор: " + chosen.length + " " + plural(chosen.length, "работа", "работы", "работ");
+  $("chosen").innerHTML = pairs.map((pair) =>
+    '<div class="row">' + (pair.round && pair.round.round ? '<span class="round">' + esc(pair.round.round.badge) + "</span>" : "") +
+    (pair.entry.photos[0] ? '<img src="' + esc(pair.entry.photos[0]) + '" alt="">' : "") +
+    "<span>" + esc(displayName(pair.entry)) + "</span></div>").join("");
   const link = $("sendLink");
   link.hidden = !linkable;
   link.href = linkable ? "https://t.me/" + encodeURIComponent(bot) + "?start=" + payload : "#";
@@ -3580,6 +3963,8 @@ window.addEventListener("resize", () => { if (!$("lens").hidden) lensFit(); });
 $("lensClose").addEventListener("click", closeTop);
 
 document.addEventListener("click", (event) => {
+  const tab = event.target.closest("[data-round-tab]");
+  if (tab) { if (tab.dataset.roundTab !== poll.poll_id) selectRound(tab.dataset.roundTab); return; }
   const zoom = event.target.closest("[data-zoom]");
   if (zoom) { openLens(zoom.dataset.zoom); return; }
   const open = event.target.closest("[data-open]");
@@ -3600,8 +3985,11 @@ if (window.ResizeObserver) {
   try {
     const response = await fetch(PREFIX + "/api/public", { cache: "no-store" });
     if (!response.ok) throw new Error("Сервер ответил " + response.status);
-    poll = await response.json();
-    if (poll.title) $("eyebrow").textContent = `Голосование · ${poll.title}`;
+    const data = await response.json();
+    rounds = data.rounds && data.rounds.length ? data.rounds : [data];
+    poll = rounds.find((r) => r.open && r.entries.length) || rounds[0];
+    const title = rounds.length > 1 && data.group_title ? data.group_title : poll.title;
+    if (title) $("eyebrow").textContent = `Голосование · ${title}`;
   } catch (e) {
     $("steps").hidden = true;
     showNotice("Не получилось загрузить работы", "Обновите страницу через минуту.");
@@ -3612,15 +4000,15 @@ if (window.ResizeObserver) {
     showNotice("Голосование ещё не началось", "Работы появятся здесь, как только их допустят к голосованию.");
     return;
   }
-  picked = poll.open ? loadPicks() : new Set();
-  if (!poll.open) {
-    $("steps").hidden = true;
-    const w = poll.winner;
-    showNotice("Голосование закрыто", "Спасибо всем, кто голосовал.",
-      w ? '<div class="winner" style="margin-top:12px">' +
-          (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
-          '<div><div class="hint">Победитель</div><b>' + esc(displayName(w)) + "</b></div></div>" : "");
+  for (const r of rounds) picksByRound[r.poll_id] = r.open ? loadPicks(r) : new Set();
+  picked = picksOf(poll);
+  if (rounds.length > 1) {
+    $("stepOne").textContent = "Выберите по одной работе в каждом раунде: " +
+      rounds.map((r) => r.round.badge + " " + r.round.name).join(", ") + ". Нажмите на фото, чтобы рассмотреть.";
   }
+  if (!rounds.some((r) => r.open)) $("steps").hidden = true;
+  renderRounds();
+  renderClosedNotice();
   renderFacts();
   renderGrid();
   renderReel();

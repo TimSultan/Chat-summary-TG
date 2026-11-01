@@ -15,11 +15,9 @@ September's rounds were run on 22 September, so the week of 27 September never h
 monthly round and goes into October's. The administrator sees the list and can tick a
 week in or out before anything is created (plan_month, then create_rounds).
 
-ONE ROUND AT A TIME. The voting page shows one poll, voting.latest_poll's, so the three
-rounds are created together and run as a queue -- bronze, then silver, then gold. Bronze
-is created newest, so it is the one the page opens; when a round is closed,
-start_next_round makes the next one the newest, so the page moves on to it, and the last
-one closed stays on the page with its result.
+ALL THREE AT ONCE. The rounds are created together and the voting page shows them
+together (voting.page_polls): a voter goes through bronze, silver and gold on one page,
+one ballot each, and an administrator closes each round on its own.
 
 Everything here is synchronous and touches the disk: the bot runs it in a worker thread.
 """
@@ -56,12 +54,8 @@ class Round:
     badge: str
 
 
-# The order the page runs them in. Every week's place `tier` goes into that round.
-ROUNDS = (
-    Round("bronze", 3, "бронза", "🥉"),
-    Round("silver", 2, "серебро", "🥈"),
-    Round("gold", 1, "золото", "🥇"),
-)
+# The order the page lists them in. Every week's place `tier` goes into that round.
+ROUNDS = tuple(Round(*row) for row in voting.MONTHLY_ROUNDS)
 _ROUND_ID = re.compile(r"^(\d{4})-(\d{2})-(bronze|silver|gold)$")
 
 
@@ -376,8 +370,8 @@ def create_rounds(entry: str, plan: MonthPlan, weeks: list[Week], now: datetime 
         if not entries:
             results.append(RoundResult(round_, state.poll_id, "empty", without_photos=without_photos))
             continue
-        # The queue is the creation order: the bronze round newest, so the page opens it,
-        # then silver, then gold (see start_next_round).
+        # Bronze newest, so it is the round latest_poll names -- the page shows all three
+        # either way (voting.page_polls).
         created_at = existing.created_at if existing else (now - timedelta(seconds=position)).isoformat()
         poll = voting.Poll(
             poll_id=state.poll_id, entry=entry, created_at=created_at, entries=entries,
@@ -392,22 +386,3 @@ def create_rounds(entry: str, plan: MonthPlan, weeks: list[Week], now: datetime 
                                    works=len(entries), without_photos=without_photos))
     return results
 
-
-def start_next_round(entry: str, closed: voting.Poll) -> voting.Poll | None:
-    """After `closed` -- a monthly round -- has been decided, hands the page to the next
-    round of the same month that is still open, and returns it (None when there is none).
-
-    Making it the newest is all it takes: of the polls people can vote in the page opens
-    the newest (voting.latest_poll). Without it the gold round, created oldest, would end
-    the month with the page showing bronze's result. Callers hold voting.poll_lock."""
-    parsed = parse_round_id(closed.poll_id)
-    if parsed is None or not closed.is_monthly:
-        return None
-    year, month, round_ = parsed
-    for later in ROUNDS[ROUNDS.index(round_) + 1:]:
-        poll = voting.load_poll(entry, round_poll_id(year, month, later))
-        if poll is not None and poll.open and poll.approved:
-            voting.make_current(poll)
-            voting.save_poll(poll)
-            return poll
-    return None
