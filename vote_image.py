@@ -406,6 +406,9 @@ def render_standings_image(
     # canvas is), so it's measured against a throwaway one-pixel image.
     probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
     title_font, subtitle_font = _font(TITLE_SIZE, bold=True), _font(SUBTITLE_SIZE)
+    if title:
+        # A contest's own title can be longer than "Итоги недели": cut, never cropped.
+        title = _ellipsize(probe, title, title_font, width_for(columns) - 2 * MARGIN)
     title_height = _text_size(probe, title, title_font)[1] if title else 0
     subtitle_height = _text_size(probe, subtitle, subtitle_font)[1] if subtitle else 0
     header_height = 0
@@ -450,18 +453,20 @@ def render_standings_image(
 
 
 def render_poll_image(
-    poll, out_path, title: str = "Итоги недели", subtitle: str = "", columns: int = COLUMNS,
+    poll, out_path, title: str | None = None, subtitle: str = "", columns: int = COLUMNS,
 ) -> Path:
     """render_standings_image for a whole voting.Poll: its own tally, its own photos.
 
     Only ADMITTED entries appear, because tally() only ranks those -- the export is a
-    picture of the vote, not of everything that was ever nominated.
+    picture of the vote, not of everything that was ever nominated. The title is the
+    contest's own name unless one is given: "Итоги недели" for the weekly vote, the
+    round's for a monthly one.
     """
     return render_standings_image(
         poll.tally(),
         voting.media_path(poll.entry, poll.poll_id),
         out_path,
-        title=title,
+        title=poll.label() if title is None else title,
         subtitle=subtitle,
         crops=poll.crops,
         columns=columns,

@@ -196,9 +196,12 @@ except Exception:  # noqa: BLE001
 try:
     import hall_of_fame
     import hall_web
+    # The month's rounds are built from the hall's records of the weeks, so they stand or
+    # fall with it.
+    import vote_monthly
 except Exception:  # noqa: BLE001
     HALL_IMPORT_ERROR = traceback.format_exc()
-    hall_of_fame = hall_web = None
+    hall_of_fame = hall_web = vote_monthly = None
 try:
     import seabattle
 except Exception:  # noqa: BLE001
@@ -539,6 +542,15 @@ VOTE_CHAT_WORDS = frozenset({"chat", "объявление", "announce"})
 # deliberately not offered to voters: it shows every vote count at once, which is exactly
 # what the page withholds from somebody who hasn't voted yet.
 VOTE_IMAGE_WORDS = frozenset({"картинка", "картинку", "изображение", "image", "png"})
+# "/vote месяц" -- «Лучшая работа месяца»: three votes (bronze, silver, gold) between the
+# weeks' third, second and first places, built from their records in the Hall of Fame
+# (vote_monthly.py). A screen in the DM picks the month -- this one or the one before --
+# and the weeks; its "Создать" makes all three rounds, which the page shows together.
+# "/vote месяц 10.2026" opens a given month. Every button carries the month, the ticked
+# weeks as a bit mask and a fingerprint of the list they were ticked on, so the screen
+# holds no server state.
+VOTE_MONTH_WORDS = ("итоги месяца", "месяц", "month")
+VOTE_MONTH_CALLBACK_PREFIX = "votemonth"
 VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 # The draft is written in the admin's DM but is almost never meant to stay there, so the
 # finished text is not sent anywhere until they say where it goes: the main chat, the
@@ -661,6 +673,7 @@ VOTE_ACTIONS = {
     # and a button that renders it is shorter than a menu that asks first.
     "image4": "/vote картинка 4",
     "clear": "/vote очистить",
+    "month": "/vote месяц",
 }
 
 # "Закрыть голосование и объявить победителя" in the Mini App no longer announces anything
@@ -5390,6 +5403,9 @@ async def handle_vote_link_ballot(
     subscribed = verdict.is_member
 
     voter_id = str(user["id"])
+    if len(voting.page_polls(entry)) > 1:
+        await _record_link_ballot_in_rounds(reply, entry, user, choices, subscribed, log=log)
+        return
     async with voting.poll_lock:
         poll = voting.latest_poll(entry)
         if poll is None:
@@ -5434,6 +5450,55 @@ async def handle_vote_link_ballot(
     await reply("\n".join(lines))
 
 
+async def _record_link_ballot_in_rounds(reply, entry: str, user: dict, choices: list[str],
+                                        subscribed: bool, log=print) -> None:
+    """The browser page's one link for the month's rounds: every chosen work goes to the
+    round it is in, and each round records its own ballot under its own rules -- a round
+    with nothing chosen keeps whatever ballot this voter already has there."""
+    voter_id = str(user["id"])
+    recorded, refused, events = [], [], []
+    async with voting.poll_lock:
+        polls = voting.page_polls(entry)
+        claimed: set[str] = set()
+        for poll in polls:
+            mine = [c for c in choices if c in set(poll.approved) and c not in claimed]
+            if not mine:
+                continue
+            claimed.update(mine)
+            name = f"{poll.badge} {poll.round[2] if poll.round else poll.label()}"
+            if not poll.open:
+                refused.append(f"{name}: голосование уже закрыто")
+                continue
+            if not poll.allow_revote and poll.votes.get(voter_id):
+                refused.append(f"{name}: голос уже есть, менять нельзя")
+                continue
+            if poll.max_choices and len(mine) > poll.max_choices:
+                refused.append(f"{name}: можно выбрать не более {poll.max_choices}")
+                continue
+            voting.record_vote(poll, user["id"], mine, subscriber=subscribed)
+            voting.save_poll(poll)
+            by_id = {e.entry_id: e for e in poll.entries}
+            recorded.append(f"{name} — " + ", ".join(voting.who(by_id[c]) for c in mine))
+            events.append((poll.poll_id, list(poll.votes[voter_id])))
+    for poll_id, ballot in events:
+        vote_audit.record_vote_event(
+            entry, system="v1", poll_id=poll_id, voter_id=user["id"],
+            name=voting.display_name(user), username=user.get("username"),
+            choices=ballot, is_member=subscribed, via="link", log=log,
+        )
+    log(f"[bot_listener] link ballot from {user.get('username') or voter_id}: {len(recorded)} round(s)")
+    if not recorded and not refused:
+        await reply("Этих работ больше нет в голосовании -- откройте страницу заново и выберите ещё раз.")
+        return
+    lines = ["Спасибо! Ваш голос учтён:", *recorded] if recorded else ["Голос не записан."]
+    if refused:
+        lines += ["", "Не записано:", *refused]
+    if len(claimed) < len(choices):
+        lines += ["", f"Работ, которых уже нет в голосовании, пропущено: {len(choices) - len(claimed)}."]
+    lines += ["", "Передумаете -- выберите заново на странице и отправьте ещё раз: новый голос заменит прежний."]
+    await reply("\n".join(lines))
+
+
 def _vote_group_button_url(cfg, bot_username: str | None) -> str | None:
     """What the vote button links to in a message that lands in a GROUP. A web_app button
     is private-chat only -- Telegram rejects one posted to a group outright -- so a group
@@ -5454,6 +5519,17 @@ def _vote_group_button_url(cfg, bot_username: str | None) -> str | None:
 _VOTE_MEDALS = ("🥇", "🥈", "🥉")
 
 
+def _vote_heading(entry: str) -> str:
+    """What a voter is told the vote is: the weekly one, unless the page is running one
+    of the month's rounds, which is named."""
+    polls = voting.page_polls(entry)
+    if len(polls) > 1:
+        return f"Голосование «{polls[0].group_label()}»: " + " ".join(p.badge for p in polls)
+    if polls and polls[0].is_monthly:
+        return f"Голосование «{polls[0].label()}» {polls[0].badge}".rstrip()
+    return "Голосование за итоги недели"
+
+
 def _vote_who(entry) -> str:
     return f"{entry.author_name} (@{entry.author_username})" if entry.author_username else entry.author_name
 
@@ -5461,17 +5537,32 @@ def _vote_who(entry) -> str:
 def _vote_status_text(entry: str) -> str:
     """The "current standings" block shared by an administrator's bare /vote status
     message and (implicitly, via the same shape) the winner announcement -- top 3 with
-    medals, or an explanation of why there's nothing to show yet."""
-    poll = voting.latest_poll(entry)
+    medals, or an explanation of why there's nothing to show yet. The month's rounds,
+    all on the page at once, get a line each."""
+    polls = voting.page_polls(entry)
+    if len(polls) > 1:
+        lines = [f"Голосование: {polls[0].group_label()} -- {len(polls)} раунда на странице сразу", ""]
+        for poll in polls:
+            top = poll.tally()[:1]
+            leader = f" · лидер: {_vote_who(top[0][0])} ({top[0][1]})" if top and top[0][1] > 0 else ""
+            lines.append(
+                f"{poll.badge} {poll.round[2]}: {'открыто' if poll.open else 'закрыто'} · "
+                f"проголосовало {len(poll.votes)} чел.{leader}"
+            )
+        lines += ["", "Итоги каждого раунда подводятся отдельно: в модерации переключи вкладку."]
+        return "\n".join(lines)
+    poll = polls[0] if polls else None
     if poll is None:
         return "Голосование ещё не создано."
     # The week is named because there can now be more than one poll in play: собрать has
     # a button per week, and the panel's other buttons all act on whichever one this is.
     lines = [
-        f"Неделя: {poll.poll_id} · Проголосовало: {len(poll.votes)} чел. · "
+        f"{'Раунд' if poll.is_monthly else 'Неделя'}: {poll.poll_id} · Проголосовало: {len(poll.votes)} чел. · "
         f"{'открыто' if poll.open else 'закрыто'}"
     ]
-    if not poll.is_weekly:
+    if poll.is_monthly:
+        lines.insert(0, f"Голосование: {poll.badge} {poll.label()}")
+    elif not poll.is_weekly:
         # A thematic contest's poll id ends in a slug nobody can read: say which it is.
         lines.insert(0, f"Конкурс: {poll.label()} ({poll.hashtag})")
     top = poll.tally()[:3]
@@ -6130,6 +6221,280 @@ def _vote_image_columns(argument: str) -> int | None:
     if match and match.group("word") in VOTE_IMAGE_WORDS:
         return vote_image.clamp_columns(match.group("columns"))
     return None
+
+
+# ------------------------------------------------- "/vote месяц": the month's rounds
+
+
+def _ru_works(count: int) -> str:
+    tail_two, tail_one = count % 100, count % 10
+    if 11 <= tail_two <= 14 or tail_one == 0 or tail_one >= 5:
+        return f"{count} работ"
+    return f"{count} работа" if tail_one == 1 else f"{count} работы"
+
+
+def _vote_month_default(today: date) -> tuple[int, int]:
+    """The month the screen opens on: the one just ended early in a month, when its
+    rounds are what is due, and this one from the middle on."""
+    if today.day <= 15:
+        return vote_monthly.previous_month(today.year, today.month)
+    return today.year, today.month
+
+
+def _parse_vote_month_argument(text: str, today: date) -> tuple[int, int] | None:
+    """'10.2026', '10.26', '2026-10' or '10' (this year) -> (year, month); None when it
+    is not a month or is one still to come."""
+    text = (text or "").strip()
+    match = (re.fullmatch(r"(\d{4})-(\d{1,2})", text) or re.fullmatch(r"(\d{1,2})[./](\d{2,4})", text)
+             or re.fullmatch(r"(\d{1,2})", text))
+    if match is None:
+        return None
+    parts = match.groups()
+    if len(parts) == 1:
+        year, month = today.year, int(parts[0])
+    elif len(parts[0]) == 4:
+        year, month = int(parts[0]), int(parts[1])
+    else:
+        month, year = int(parts[0]), int(parts[1])
+        year += 2000 if year < 100 else 0
+    if not 1 <= month <= 12 or (year, month) > (today.year, today.month):
+        return None
+    return year, month
+
+
+def _vote_month_callback_data(action: str, year: int, month: int, user_id,
+                              mask: int | None = None, fingerprint: str = "-") -> str:
+    """votemonth:<action>:<YYYYMM>:<mask in hex, or - for the default>:<fingerprint>:<user>"""
+    mask_text = "-" if mask is None else format(mask, "x")
+    return f"{VOTE_MONTH_CALLBACK_PREFIX}:{action}:{year:04d}{month:02d}:{mask_text}:{fingerprint}:{user_id}"
+
+
+def _parse_vote_month_callback(data: str) -> tuple[str, int, int, int | None, str, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 6 or parts[0] != VOTE_MONTH_CALLBACK_PREFIX:
+        return None
+    action, stamp, mask_text, fingerprint, user_text = parts[1:]
+    if action not in ("m", "go", "x") or not re.fullmatch(r"\d{6}", stamp):
+        return None
+    if fingerprint != "-" and not re.fullmatch(r"[0-9a-f]{4}", fingerprint):
+        return None
+    try:
+        mask = None if mask_text == "-" else int(mask_text, 16)
+        return action, int(stamp[:4]), int(stamp[4:]), mask, fingerprint, int(user_text)
+    except ValueError:
+        return None
+
+
+def _vote_month_name(year: int, month: int) -> str:
+    return f"{_RU_MONTHS[month - 1]} {year}"
+
+
+def _vote_month_round_line(state, works: int) -> str:
+    head = f"{state.round.badge} {state.round.name}"
+    status = state.status
+    if status == "voting":
+        return f"{head} — идёт голосование, {voting.votes_label(len(state.poll.votes))}: не трогаю"
+    if status == "closed":
+        return f"{head} — итоги подведены: не трогаю"
+    if status == "recorded":
+        return f"{head} — уже проведено (есть на Доске почёта)"
+    line = f"{head} — {_ru_works(works) if works else 'нет работ'}"
+    return line + (" (уже создано, обновлю)" if status == "pending" else "")
+
+
+def _vote_month_screen(entry: str, tz, today: date, year: int, month: int, user_id,
+                       mask: int | None = None, fingerprint: str = "-", note: str = "") -> tuple[str, dict]:
+    """The month's weeks with their medallists, which of them go in (each a tick button),
+    how far each round has got, and "Создать". Reads the hall and every live poll, so it
+    is called in a worker thread."""
+    plan = vote_monthly.plan_month(entry, year, month, tz)
+    if fingerprint != "-" and fingerprint != plan.fingerprint():
+        mask = None
+        note = note or "Список недель изменился -- проверь отметки ещё раз."
+    if mask is not None:
+        mask &= (1 << len(plan.weeks)) - 1
+    else:
+        mask = plan.default_mask()
+    chosen = plan.selected(mask)
+    current = plan.fingerprint()
+    previous_name = vote_monthly.MONTH_NAMES_GENITIVE[vote_monthly.previous_month(year, month)[1] - 1]
+
+    lines = [f"🏅 Итоги месяца · {_vote_month_name(year, month)}"]
+    if note:
+        lines += ["", note]
+    lines += [
+        "",
+        "Три отдельных голосования: 🥉 бронза — третьи места недель, 🥈 серебро — вторые, "
+        "🥇 золото — первые. Недели — по воскресеньям месяца; фото и имена берутся из итогов недель.",
+        "",
+    ]
+    if plan.weeks:
+        lines.append("Недели:")
+        for index, week in enumerate(plan.weeks):
+            mark = "✅" if mask >> index & 1 else "⬜"
+            origin = f" — неделя {previous_name}, в итоги {previous_name} не попала" if week.carried else (
+                f" — неделя {previous_name}" if (week.sunday.year, week.sunday.month) != (year, month) else "")
+            lines.append(f"{mark} {week.sunday:%d.%m}{origin}")
+            lines.append("    " + " · ".join(
+                f"{medal} {week.medals[tier].author_name[:24]}"
+                for tier, medal in zip((1, 2, 3), _VOTE_MEDALS) if tier in week.medals
+            ))
+    else:
+        lines.append(
+            "На Доске почёта нет закрытых недель этого месяца с призёрами. Неделя попадает "
+            "туда, когда её голосование закрыто."
+        )
+    for sunday in plan.running:
+        lines.append(f"⏳ {sunday:%d.%m} — голосование недели ещё идёт, призёров пока нет")
+
+    buildable = False
+    lines += ["", "Голосования:"]
+    for state in plan.rounds:
+        works = sum(1 for week in chosen if state.round.tier in week.medals)
+        buildable = buildable or (state.can_build and works > 0)
+        lines.append(_vote_month_round_line(state, works))
+    lines += ["", "На странице все три сразу, вкладками: проголосовал в одном раунде — страница сама "
+                  "переходит к следующему."]
+    shown = plan.shown
+    if (shown is not None and shown.open and shown.approved and not shown.is_monthly and buildable):
+        lines.append(
+            f"⚠️ Сейчас на странице идёт «{shown.label()}» ({shown.poll_id}, "
+            f"{voting.votes_label(len(shown.votes))}): пока идут голосования месяца, его там не будет."
+        )
+
+    rows = []
+    months = [vote_monthly.previous_month(today.year, today.month), (today.year, today.month)]
+    rows.append([
+        {"text": ("✓ " if (y, m) == (year, month) else "") + _RU_MONTHS[m - 1],
+         "callback_data": _vote_month_callback_data("m", y, m, user_id)}
+        for y, m in months
+    ])
+    toggles = [
+        {"text": f"{'✅' if mask >> index & 1 else '⬜'} {week.sunday:%d.%m}",
+         "callback_data": _vote_month_callback_data("m", year, month, user_id, mask ^ (1 << index), current)}
+        for index, week in enumerate(plan.weeks)
+    ]
+    rows += [toggles[i:i + 3] for i in range(0, len(toggles), 3)]
+    if buildable:
+        fresh = all(state.status == "missing" for state in plan.rounds)
+        rows.append([{"text": "🏅 Создать голосования" if fresh else "🔄 Обновить голосования",
+                      "callback_data": _vote_month_callback_data("go", year, month, user_id, mask, current)}])
+    rows.append([{"text": "✖️ Закрыть", "callback_data": _vote_month_callback_data("x", year, month, user_id)}])
+    return "\n".join(lines), {"inline_keyboard": rows}
+
+
+def _vote_month_create(entry: str, tz, year: int, month: int, mask: int | None, fingerprint: str) -> str | None:
+    """Creates the rounds and says how it went -- or None when the list of weeks is no
+    longer the one the administrator ticked (the screen is then shown again). Disk work
+    under voting.poll_lock, which the caller holds: run in a worker thread."""
+    plan = vote_monthly.plan_month(entry, year, month, tz)
+    if fingerprint != plan.fingerprint():
+        return None
+    weeks = plan.selected(None if mask is None else mask & ((1 << len(plan.weeks)) - 1))
+    results = vote_monthly.create_rounds(entry, plan, weeks)
+    lines = [f"🏅 Голосования за {vote_monthly.MONTH_NAMES[month - 1]} {year}:"]
+    skipped = []
+    for result in results:
+        head = f"{result.round.badge} {result.round.name}"
+        lines.append({
+            "created": f"{head} — создано, {_ru_works(result.works)}",
+            "rebuilt": f"{head} — обновлено, {_ru_works(result.works)}",
+            "kept": f"{head} — уже идёт или проведено: не трогал",
+            "empty": f"{head} — не создано: ни у одной отмеченной недели нет этого места",
+        }[result.outcome])
+        skipped += result.without_photos
+    if skipped:
+        lines += ["", "Без фото, поэтому не попали: " + ", ".join(skipped)
+                  + ". Верни фото командой /hall импорт и нажми «Обновить голосования»."]
+    shown = voting.page_polls(entry)
+    if len(shown) > 1:
+        lines += ["", "На странице все раунды сразу: " + " ".join(f"{p.badge} {p.round[2]}" for p in shown) + "."]
+    elif shown:
+        lines += ["", f"На странице сейчас: {shown[0].label()}."]
+    if shown and shown[0].is_monthly:
+        lines.append(
+            "Все работы уже допущены. Объяви голосование (📣 Объявление в /vote). Итоги каждого "
+            "раунда подводятся отдельно: в модерации переключи вкладку и закрой голосование."
+        )
+    return "\n".join(lines)
+
+
+async def handle_vote_month_callback(
+    api: TelegramBotAPI, telethon_client, cfg, tz, callback: dict, entry: str | None, log=print,
+) -> None:
+    """Every tap on the "/vote месяц" screen. Choosing a month or ticking a week redraws it
+    in place; "Создать" checks the administrator again -- the button is theirs, but the
+    role may have gone since -- and makes the rounds. Bound to whoever asked, like the
+    date picker."""
+    parsed = _parse_vote_month_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, year, month, mask, fingerprint, target_user_id = parsed
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != target_user_id:
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    trigger = callback.get("message") or {}
+    chat = trigger.get("chat") or {}
+    today = datetime.now(tz).date()
+
+    async def show(text: str, markup: dict | None) -> None:
+        try:
+            await api.edit_message_text(chat.get("id"), trigger.get("message_id"), text,
+                                        reply_markup=markup or {"inline_keyboard": []})
+        except Exception as e:
+            log(f"[bot_listener] could not redraw the monthly vote screen: {e}")
+
+    if action == "x":
+        await show("Итоги месяца: закрыто, ничего не создано.", None)
+        return
+    if not entry or vote_monthly is None:
+        await show("Итоги месяца сейчас недоступны: не работает Доска почёта.", None)
+        return
+    if not 1 <= month <= 12 or (year, month) > (today.year, today.month):
+        year, month = today.year, today.month
+        mask, fingerprint = None, "-"
+    if action == "m":
+        await show(*await asyncio.to_thread(
+            _vote_month_screen, entry, tz, today, year, month, target_user_id, mask, fingerprint,
+        ))
+        return
+
+    admin_chat_id = await _resolve_chat_id(telethon_client, entry, {}, log=log)
+    if admin_chat_id is None or not await _can_manage_chat(api, admin_chat_id, clicker, entry):
+        await show("Создавать голосования могут только администраторы.", None)
+        return
+    # The buttons go first, so a second tap has nothing left to press.
+    await show(f"Создаю голосования за {vote_monthly.MONTH_NAMES[month - 1]} {year}…", None)
+    try:
+        async with voting.poll_lock:
+            summary = await asyncio.to_thread(_vote_month_create, entry, tz, year, month, mask, fingerprint)
+    except Exception:
+        log(f"[bot_listener] creating the monthly vote failed:\n{traceback.format_exc()}")
+        await show("Не получилось создать голосования -- смотри логи.", None)
+        return
+    if summary is None:
+        await show(*await asyncio.to_thread(
+            _vote_month_screen, entry, tz, today, year, month, target_user_id, None, "-",
+            "Пока ты выбирал, закрылась ещё одна неделя -- проверь отметки и нажми «Создать» ещё раз.",
+        ))
+        return
+    log(f"[bot_listener] {clicker.get('username') or target_user_id} built the monthly vote for {year}-{month:02d}")
+    await show(summary, None)
+    page_url = _vote_page_url(cfg)
+    if page_url:
+        try:
+            await api.send_message(
+                chat.get("id"), "Голосование месяца:", parse_mode=None,
+                reply_markup={"inline_keyboard": [[
+                    {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": page_url}},
+                    {"text": "🛠 Модерация", "web_app": {"url": f"{page_url}?mode=admin"}},
+                ]]},
+            )
+        except Exception as e:
+            log(f"[bot_listener] could not send the monthly vote buttons: {e}")
 
 
 def _vote_action_callback_data(action: str, chat_id, user_id) -> str:
@@ -7630,6 +7995,59 @@ async def handle_votelog_command(api: TelegramBotAPI, telethon_client, message: 
     await reply("Детали по каждому голосу — в CSV.", document=path)
 
 
+async def _send_vote_image(api, reply, chat_id, message: dict, entry: str, poll, image_columns: int,
+                           named: bool = False, log=print) -> None:
+    """Renders one poll's standings as a picture and sends it as a file -- "/vote
+    картинка". `named` says which of the month's rounds it is in every reply."""
+    label = f"{poll.badge} {poll.round[2]}: " if named and poll.round else ""
+    standings = poll.tally()
+    if not standings:
+        await reply(f"{label}{'к' if label else 'К'} голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
+        return
+
+    await reply(
+        f"{label}Рисую картинку: {len(standings)} работ, {image_columns} в ряд. "
+        "Это займёт несколько секунд."
+    )
+    subtitle = (
+        f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
+        f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
+    )
+    try:
+        # In a thread: Pillow decodes, scales and re-encodes every photo in the poll,
+        # which is seconds of straight CPU work -- on the event loop it would stall
+        # every other chat the bot is serving for the whole render.
+        path = await asyncio.to_thread(
+            vote_image.render_poll_image,
+            poll,
+            voting.export_image_path(entry, poll.poll_id, image_columns),
+            subtitle=subtitle,
+            columns=image_columns,
+        )
+    except Exception:
+        log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
+        await reply("Не получилось нарисовать картинку -- смотри логи.")
+        return
+    log(
+        f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} "
+        f"({image_columns} columns, {path.stat().st_size} bytes)"
+    )
+
+    # As a document, not a photo: Telegram re-encodes photos and refuses one past
+    # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
+    # exactly that shape (see bot_api.send_document_file). The file stays on disk
+    # either way -- the send is a copy, not the save.
+    try:
+        await api.send_document_file(
+            chat_id, path,
+            caption=f"{label}Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
+            reply_to_message_id=message["message_id"],
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to send the vote image: {e}")
+        await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -7711,6 +8129,7 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
+    month_argument = None
     collect_only_new = False
     collect_dates = None
     collect_theme_text = ""
@@ -7745,6 +8164,12 @@ async def handle_vote_command(
                 " ".join(argument.split())[len(collect_word):]
             )
         wants_collect = collect_only_new or collect_dates is not None
+        month_word = next(
+            (word for word in VOTE_MONTH_WORDS if normalized == word or normalized.startswith(word + " ")),
+            None,
+        )
+        if month_word is not None:
+            month_argument = normalized[len(month_word):].strip()
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
@@ -7779,6 +8204,25 @@ async def handle_vote_command(
             return False
         return True
 
+    if month_argument is not None:
+        if not await require_admin_in_dm("Создавать голосования за итоги месяца могут только администраторы."):
+            return
+        if vote_monthly is None:
+            await reply("Итоги месяца сейчас недоступны: не работает Доска почёта, из которой берутся недели.")
+            return
+        today = datetime.now(tz).date()
+        if month_argument:
+            chosen = _parse_vote_month_argument(month_argument, today)
+            if chosen is None:
+                await reply("Не понял месяц. Напиши так: /vote месяц 10.2026 -- или просто /vote месяц.")
+                return
+        else:
+            chosen = _vote_month_default(today)
+        await reply(*await asyncio.to_thread(
+            _vote_month_screen, entry, tz, today, chosen[0], chosen[1], user.get("id"),
+        ))
+        return
+
     if wants_collect:
         theme_parts = voting.parse_theme_text(collect_theme_text) if collect_theme_text else None
         if collect_theme_text and theme_parts is None:
@@ -7798,6 +8242,10 @@ async def handle_vote_command(
             theme = voting.remember_theme(entry, tag, title or None, badge or None)
         elif collect_only_new:
             shown_poll = voting.latest_poll(entry)
+            if shown_poll is not None and shown_poll.is_monthly:
+                # A monthly round's works are the weeks' medallists, never the chat's posts:
+                # with one on the page, "добавить" tops up the weekly vote.
+                shown_poll = None
             theme = voting.theme_for(entry, shown_poll.hashtag if shown_poll else voting.CONTEST_HASHTAG)
             if shown_poll is not None and not shown_poll.is_weekly:
                 theme.title = theme.title or shown_poll.title
@@ -8001,56 +8449,14 @@ async def handle_vote_command(
     if wants_image:
         if not await require_admin_in_dm("Рендерить картинку итогов могут только администраторы."):
             return
-        poll = voting.latest_poll(entry)
-        if poll is None:
+        polls = voting.page_polls(entry)
+        if not polls:
             await reply("Голосование ещё не создано -- нечего рисовать. Сначала /vote собрать.")
             return
-        standings = poll.tally()
-        if not standings:
-            await reply("К голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
-            return
-
-        await reply(
-            f"Рисую картинку: {len(standings)} работ, {image_columns} в ряд. "
-            "Это займёт несколько секунд."
-        )
-        subtitle = (
-            f"Проголосовало: {len(poll.votes)} чел. · работ: {len(standings)} · "
-            f"{'голосование открыто' if poll.open else 'голосование закрыто'}"
-        )
-        try:
-            # In a thread: Pillow decodes, scales and re-encodes every photo in the poll,
-            # which is seconds of straight CPU work -- on the event loop it would stall
-            # every other chat the bot is serving for the whole render.
-            path = await asyncio.to_thread(
-                vote_image.render_poll_image,
-                poll,
-                voting.export_image_path(entry, poll.poll_id, image_columns),
-                subtitle=subtitle,
-                columns=image_columns,
-            )
-        except Exception:
-            log(f"[bot_listener] rendering the vote image failed:\n{traceback.format_exc()}")
-            await reply("Не получилось нарисовать картинку -- смотри логи.")
-            return
-        log(
-            f"[bot_listener] rendered vote image for poll {poll.poll_id}: {path} "
-            f"({image_columns} columns, {path.stat().st_size} bytes)"
-        )
-
-        # As a document, not a photo: Telegram re-encodes photos and refuses one past
-        # 10000px of width+height or a 20:1 side ratio, and a board of a whole contest is
-        # exactly that shape (see bot_api.send_document_file). The file stays on disk
-        # either way -- the send is a copy, not the save.
-        try:
-            await api.send_document_file(
-                chat_id, path,
-                caption="Итоги голосования одной картинкой. Файлом, чтобы Telegram не сжимал.",
-                reply_to_message_id=message["message_id"],
-            )
-        except Exception as e:
-            log(f"[bot_listener] failed to send the vote image: {e}")
-            await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+        # The month's rounds are three votes on the page at once: a picture for each.
+        for poll in polls:
+            await _send_vote_image(api, reply, chat_id, message, entry, poll, image_columns,
+                                   named=len(polls) > 1, log=log)
         return
 
     # Bare "/vote": the actual ballot, for everyone -- an administrator gets this too,
@@ -8098,6 +8504,11 @@ async def handle_vote_command(
                             "text": "📣 Объявление",
                             "callback_data": _vote_action_callback_data("chat", chat_id, admin_user_id),
                         },
+                        # The month's three rounds, from the weeks' medallists (/vote месяц).
+                        *([{
+                            "text": "🏅 Итоги месяца",
+                            "callback_data": _vote_action_callback_data("month", chat_id, admin_user_id),
+                        }] if vote_monthly is not None else []),
                     ],
                     [
                         {
@@ -8134,7 +8545,7 @@ async def handle_vote_command(
             # browser is the way out of both.
             browser_url = _vote_browser_url(cfg)
             await reply(
-                "Голосование за итоги недели:" + (
+                _vote_heading(entry) + ":" + (
                     f"\n\nЕсли кнопка не открывается -- проголосуйте в браузере: {browser_url}"
                     if browser_url else ""
                 ),
@@ -8159,8 +8570,8 @@ async def handle_vote_command(
     # announcement: the owner wants nothing in the group but the vote itself, so "Если Бот
     # не работает" stays in the DM, where this button leads anyway.
     await reply(
-        "Голосование за итоги недели:" if cfg.vote_miniapp_short_name
-        else "Голосование за итоги недели -- открывается в личке с ботом:",
+        f"{_vote_heading(entry)}:" if cfg.vote_miniapp_short_name
+        else f"{_vote_heading(entry)} -- открывается в личке с ботом:",
         reply_markup={"inline_keyboard": [
             [{"text": VOTE_OPEN_BUTTON_TEXT, "url": group_url}],
         ]},
@@ -12664,6 +13075,8 @@ async def _dispatch_update(
                 api, telethon_client, cfg, callback, home_chat_ref, bot_username,
                 background_tasks, log=log,
             )
+        elif callback_data.startswith(f"{VOTE_MONTH_CALLBACK_PREFIX}:"):
+            await handle_vote_month_callback(api, telethon_client, cfg, tz, callback, home_chat_ref, log=log)
         elif callback_data.startswith(f"{VOTE_DATE_CALLBACK_PREFIX}:"):
             await handle_vote_date_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, bot_username,

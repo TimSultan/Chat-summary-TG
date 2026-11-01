@@ -72,13 +72,14 @@ WEEKLY_BADGE = "🏆"
 
 # "Работа месяца": three rounds a month (bronze, silver, gold) that re-ran the weeks'
 # third, second and first places. Each round crowns one winner with the round's own medal
-# (Contest.tier), so they are neither weekly contests nor thematic ones.
-MONTHLY_HASHTAG = "#итогимесяца"
+# (Contest.tier), so they are neither weekly contests nor thematic ones. The bot runs them
+# itself now (vote_monthly.py); the ones from before it are in the archive.
+MONTHLY_HASHTAG = voting.MONTHLY_HASHTAG
 
 # The contests run in the channel before the bot existed (albums and Telegram polls),
 # checked by the administrators and kept in the repository: import_archive writes them in.
 ARCHIVE_DIR = Path(__file__).resolve().parent / "hall_archive"
-MEDAL_TIERS = (1, 2, 3)
+MEDAL_TIERS = voting.MEDAL_TIERS
 
 # The leaderboard's points, agreed with the administrators. One gold = two silvers = three
 # bronzes. The month's medals are worth half as much again: its rounds are run between the
@@ -293,8 +294,12 @@ class Contest:
 
 
 def _tier(value) -> int:
-    tier = _int_or_none(value)
-    return tier if tier in MEDAL_TIERS else 0
+    return voting.clean_tier(value)
+
+
+def _poll_tier(hashtag: str, tier) -> int:
+    """The medal a recorded poll crowns its winner with: only a monthly round has one."""
+    return _tier(tier) if hashtag == MONTHLY_HASHTAG else 0
 
 
 # One writer at a time: recording runs in worker threads (the close of a vote, an import),
@@ -441,6 +446,7 @@ def record_poll(poll: "voting.Poll", standings: list | None = None, closed_at: s
             closed_at=closed_at or datetime.now(timezone.utc).isoformat(),
             voters=len(poll.votes),
             sources=voting.photo_dirs(poll.entry, poll.poll_id), crops=poll.crops,
+            tier=_poll_tier(poll.hashtag, poll.tier),
         )
 
 
@@ -487,16 +493,18 @@ def import_history(entry: str) -> dict:
                 ), int(row.get("votes") or 0)))
             if not standings:
                 continue
+            hashtag = (voting.normalize_hashtag(record.get("hashtag"))
+                       or (poll.hashtag if poll else voting.CONTEST_HASHTAG))
             contest = _record(
                 entry, poll_id, standings,
-                hashtag=(voting.normalize_hashtag(record.get("hashtag"))
-                         or (poll.hashtag if poll else voting.CONTEST_HASHTAG)),
+                hashtag=hashtag,
                 title=record.get("title") or (poll.title if poll else ""),
                 badge=record.get("badge") or (poll.badge if poll else ""),
                 created_at=record.get("created_at") or (poll.created_at if poll else ""),
                 closed_at=record.get("announced_at") or "",
                 voters=int(record.get("voters") or 0),
                 sources=voting.photo_dirs(entry, poll_id), crops=poll.crops if poll else {},
+                tier=_poll_tier(hashtag, record.get("tier") or (poll.tier if poll else 0)),
             )
             recorded.add(poll_id)
             added += 1
@@ -512,6 +520,7 @@ def import_history(entry: str) -> dict:
                 entry, poll_id, poll.tally(), hashtag=poll.hashtag, title=poll.title,
                 badge=poll.badge, created_at=poll.created_at, closed_at=poll.created_at,
                 voters=len(poll.votes), sources=voting.photo_dirs(entry, poll_id), crops=poll.crops,
+                tier=_poll_tier(poll.hashtag, poll.tier),
             )
             recorded.add(poll_id)
             added += 1
