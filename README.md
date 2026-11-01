@@ -1093,6 +1093,28 @@ page that changes shape depending on who opens it:
   the loaded font genuinely has no glyph for, detected by comparing each character's
   bitmap against the one an unassigned codepoint draws. A name left with nothing promotes
   the `@tag` to its line rather than printing a blank card.
+- **`/vote месяц`** (DM, administrators only, also the "🏅 Итоги месяца" button in the
+  admin menu) builds «Лучшая работа месяца»: **three separate votes** — 🥉 бронза between
+  every week's third place, 🥈 серебро between the second places, 🥇 золото between the
+  winners (`vote_monthly.py`). The works, their photos, the administrator's framing, the
+  authors and captions all come from the weeks' records in the Hall of Fame, so nothing is
+  read from the chat again and a week cleared from `/vote` still counts. A week belongs to
+  the month of the Sunday its vote was held on (the Sunday nearest the vote's start, so a
+  vote collected on Monday is still the Sunday before); a week of the month before comes in
+  too when it ended after that month's rounds began — September's rounds were run on
+  22 September, so the week of 27 September goes into October's. The screen opens on the
+  month just ended until the 15th and on the current month after it, offers both, lists
+  the weeks with their medallists as tick buttons, and only "🏅 Создать голосования"
+  writes anything (`/vote месяц 10.2026` opens a given month). Every work is admitted, the
+  vote is open and takes **one choice**, as the channel's own monthly polls did (the
+  moderation screen can change both). The page shows one poll at a time, so the rounds run
+  **in turn**: bronze first; closing a round from the moderation screen hands the page to
+  the next (`vote_monthly.start_next_round`), and the last one closed stays there with its
+  result. Each round is an ordinary poll under `#итогимесяца` (ids like `2026-10-bronze`,
+  the same as the archived rounds), so announcing, the board picture and the results draft
+  work as for any vote; its winner takes the round's own medal in the Hall of Fame
+  (`Poll.tier` → `Contest.tier`). Pressing the button again rebuilds only rounds nobody has
+  voted in yet — that is how a late week gets in — and never touches one with votes.
 - **`/vote очистить`** (DM, administrators only) takes every poll off the page --
   entries, votes, admitted flags, photos, settings -- behind a tap-to-confirm inline
   button. The next `/vote собрать` then starts a genuinely fresh poll rather than

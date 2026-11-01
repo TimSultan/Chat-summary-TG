@@ -47,6 +47,11 @@ CONTEST_HASHTAG = "#итогинедели"
 # What the weekly contest is called wherever a contest needs a name (the Hall of Fame, the
 # status panel). A thematic contest is called by the title its administrator gave it.
 WEEKLY_CONTEST_TITLE = "Итоги недели"
+# "Работа месяца": three rounds a month (bronze, silver, gold) between the weeks' third,
+# second and first places -- see vote_monthly.py. A round is an ordinary poll under this
+# hashtag whose winner takes the round's own medal (Poll.tier).
+MONTHLY_HASHTAG = "#итогимесяца"
+MEDAL_TIERS = (1, 2, 3)
 
 # A collection covers whole CONTEST WEEKS -- from Monday 00:00 local through the moment of
 # collecting -- rather than a rolling number of days. A rolling window's reach depends on
@@ -629,6 +634,15 @@ def export_image_path(entry: str, poll_id: str, columns: int = 3) -> Path:
     return export_dir() / f"{_poll_key(entry)}_{poll_id}{variant}.jpg"
 
 
+def clean_tier(value) -> int:
+    """1, 2 or 3 -- a monthly round's medal -- or 0 for anything else."""
+    try:
+        tier = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return tier if tier in MEDAL_TIERS else 0
+
+
 @dataclass
 class Poll:
     poll_id: str
@@ -674,10 +688,18 @@ class Poll:
     # without a lookup. Empty for the weekly contest.
     title: str = ""
     badge: str = ""
+    # 0 for an ordinary contest, whose first three places take gold, silver and bronze.
+    # 1, 2 or 3 for a monthly round, whose WINNER alone takes that medal -- the bronze
+    # round's winner is the month's bronze (vote_monthly; hall_of_fame.Contest.tier).
+    tier: int = 0
 
     @property
     def is_weekly(self) -> bool:
         return is_weekly_hashtag(self.hashtag)
+
+    @property
+    def is_monthly(self) -> bool:
+        return self.hashtag == MONTHLY_HASHTAG
 
     def label(self) -> str:
         """"Итоги недели", or the thematic contest's title (its hashtag if untitled)."""
@@ -700,6 +722,7 @@ class Poll:
             "hashtag": self.hashtag,
             "title": self.title,
             "badge": self.badge,
+            "tier": self.tier,
         }
 
     @classmethod
@@ -730,6 +753,7 @@ class Poll:
             hashtag=normalize_hashtag(raw.get("hashtag")) or CONTEST_HASHTAG,
             title=str(raw.get("title") or "")[:THEME_TITLE_MAX_LENGTH],
             badge=str(raw.get("badge") or "")[:THEME_BADGE_MAX_LENGTH],
+            tier=clean_tier(raw.get("tier")),
         )
 
     def approved_entries(self) -> list[Entry]:
@@ -987,6 +1011,8 @@ def build_poll(
     if source is not None:
         poll.hashtag = normalize_hashtag(source.hashtag) or CONTEST_HASHTAG
         poll.title, poll.badge = source.title, source.badge
+    if theme is None and existing is not None:
+        poll.tier = existing.tier
     if existing is None:
         return poll
 
@@ -1213,9 +1239,12 @@ _RESULTS_NOBODY = "В этот раз голосов не набрал никт�
 
 
 def results_header(poll: "Poll | None" = None) -> str:
-    """The weekly contest's dictated header, or the thematic contest's own name."""
+    """The weekly contest's dictated header, or the thematic contest's own name -- or the
+    monthly round's, which is a vote between the weeks' medallists, not a contest."""
     if poll is None or poll.is_weekly:
         return _RESULTS_HEADER
+    if poll.is_monthly:
+        return f"Результаты голосования «{poll.label()}»:"
     return f"Результаты конкурса «{poll.label()}»:"
 
 
@@ -1284,6 +1313,7 @@ def save_results(poll: Poll, standings: list[tuple[Entry, int]], text: str) -> P
         "hashtag": poll.hashtag,
         "title": poll.title,
         "badge": poll.badge,
+        "tier": poll.tier,
         "standings": [
             {
                 "place": place,

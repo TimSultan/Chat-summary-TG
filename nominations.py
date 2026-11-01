@@ -278,8 +278,9 @@ def v1_collection(entry: str) -> tuple[list[tuple[voting.Entry, "voting.Poll"]],
     being voted in and a newer one collected but not yet moderated -- and both are works
     somebody posted for the contest. Read-only, like everything here that touches v1.
     """
+    # Not a monthly round: its works are earlier weeks' medallists, not this week's posts.
     polls = [poll for poll in (voting.load_poll(entry, poll_id) for poll_id in voting.poll_ids(entry))
-             if poll is not None]
+             if poll is not None and not poll.is_monthly]
     polls.sort(key=lambda poll: poll.created_at, reverse=True)
     works, seen, admitted = [], set(), set()
     for poll in polls:
