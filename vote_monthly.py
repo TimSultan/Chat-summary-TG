@@ -105,25 +105,45 @@ def nearest_sunday(day: date) -> date:
     return day + timedelta(days=7 - since_sunday)
 
 
-def week_sunday(contest: hall_of_fame.Contest, tz) -> date | None:
-    """The Sunday a weekly contest's vote was held on.
+def _id_sunday(poll_id: str) -> date | None:
+    """The Sunday of the ISO week a poll id names ("2026-W43" -> 25 October)."""
+    week = re.match(r"^(\d{4})-W(\d{2})", poll_id or "")
+    if week is None:
+        return None
+    try:
+        return date.fromisocalendar(int(week.group(1)), int(week.group(2)), 7)
+    except ValueError:
+        return None
 
-    Read from when the vote was put together, not from its id: the id is the ISO week of
-    the collect, and a vote collected on the Monday after its week ends carries the NEXT
-    week's number. The vote is run around the turn of the week, so the Sunday nearest to
-    its start is the one it belongs to. The id's own Sunday is the fallback for a record
-    without a usable time."""
-    held = _local_date(contest.created_at, tz)
+
+def vote_sunday(poll_id: str, created_at: str, tz, closed_at: str = "") -> date | None:
+    """The Sunday a weekly vote was held on -- the earlier of two readings that can each
+    only come out late, never early:
+
+    - the Sunday nearest to `created_at`. The vote is run around the turn of the week, so
+      that is its Sunday -- but created_at moves on with every re-collect, and a top-up on
+      a Thursday would read as the Sunday after;
+    - the Sunday of the week the poll id names. The id is fixed by the FIRST collect, but
+      it is that day's ISO week, so a vote first collected on the Monday after its week
+      carries the next week's number.
+
+    The closing time is the last resort, for a record with neither."""
+    readings = []
+    held = _local_date(created_at, tz)
     if held is not None:
-        return nearest_sunday(held)
-    week = re.match(r"^(\d{4})-W(\d{2})", contest.contest_id or "")
-    if week is not None:
-        try:
-            return date.fromisocalendar(int(week.group(1)), int(week.group(2)), 7)
-        except ValueError:
-            pass
-    closed = _local_date(contest.closed_at, tz)
+        readings.append(nearest_sunday(held))
+    named = _id_sunday(poll_id)
+    if named is not None:
+        readings.append(named)
+    if readings:
+        return min(readings)
+    closed = _local_date(closed_at, tz)
     return nearest_sunday(closed) if closed is not None else None
+
+
+def week_sunday(contest: hall_of_fame.Contest, tz) -> date | None:
+    """The Sunday a weekly contest's vote was held on (vote_sunday)."""
+    return vote_sunday(contest.contest_id, contest.created_at, tz, contest.closed_at)
 
 
 # ------------------------------------------------------------------------- the plan
@@ -214,8 +234,7 @@ def _running_weeks(entry: str, hall: hall_of_fame.Hall, year: int, month: int, t
         poll = voting.load_poll(entry, poll_id)
         if poll is None or not poll.is_weekly or not poll.open or not poll.approved:
             continue
-        held = _local_date(poll.created_at, tz)
-        sunday = nearest_sunday(held) if held is not None else None
+        sunday = vote_sunday(poll.poll_id, poll.created_at, tz)
         if sunday is not None and (sunday.year, sunday.month) == (year, month):
             sundays.add(sunday)
     return sorted(sundays)

@@ -188,13 +188,14 @@ class BrowserPageTests(_Storage, AsyncTestCase):
     async def test_a_crowd_of_requests_reads_the_disk_once(self):
         _seed()
         calls = []
-        real = voting.latest_poll
+        real = voting._all_polls
 
         def counting(entry):
             calls.append(entry)
             return real(entry)
 
-        with patch.object(voting, "latest_poll", counting):
+        # The read every poll file costs -- what the page's data comes from.
+        with patch.object(voting, "_all_polls", counting):
             for _ in range(5):
                 await self._public()
         self.assertEqual(len(calls), 1)

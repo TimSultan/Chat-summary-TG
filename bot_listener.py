@@ -5465,7 +5465,7 @@ async def _record_link_ballot_in_rounds(reply, entry: str, user: dict, choices: 
             if not mine:
                 continue
             claimed.update(mine)
-            name = f"{poll.badge} {poll.round[2] if poll.round else poll.label()}"
+            name = f"{poll.badge} {poll.round[2]}" if poll.round else poll.label()
             if not poll.open:
                 refused.append(f"{name}: голосование уже закрыто")
                 continue
@@ -5524,7 +5524,9 @@ def _vote_heading(entry: str) -> str:
     of the month's rounds, which is named."""
     polls = voting.page_polls(entry)
     if len(polls) > 1:
-        return f"Голосование «{polls[0].group_label()}»: " + " ".join(p.badge for p in polls)
+        badges = "".join(p.badge for p in polls if p.round)
+        week = " и итоги недели" if any(not p.round for p in polls) else ""
+        return f"Голосование «{polls[0].group_label()}» {badges}{week}"
     if polls and polls[0].is_monthly:
         return f"Голосование «{polls[0].label()}» {polls[0].badge}".rstrip()
     return "Голосование за итоги недели"
@@ -5539,17 +5541,17 @@ def _vote_status_text(entry: str) -> str:
     message and (implicitly, via the same shape) the winner announcement -- top 3 with
     medals, or an explanation of why there's nothing to show yet. The month's rounds,
     all on the page at once, get a line each."""
-    polls = voting.page_polls(entry)
+    polls = voting.page_polls(entry, include_pending=True)
     if len(polls) > 1:
-        lines = [f"Голосование: {polls[0].group_label()} -- {len(polls)} раунда на странице сразу", ""]
+        rounds = [poll for poll in polls if poll.round]
+        lines = [f"Голосование: {polls[0].group_label()} -- раундов на странице: {len(rounds)}", ""]
         for poll in polls:
             top = poll.tally()[:1]
             leader = f" · лидер: {_vote_who(top[0][0])} ({top[0][1]})" if top and top[0][1] > 0 else ""
-            lines.append(
-                f"{poll.badge} {poll.round[2]}: {'открыто' if poll.open else 'закрыто'} · "
-                f"проголосовало {len(poll.votes)} чел.{leader}"
-            )
-        lines += ["", "Итоги каждого раунда подводятся отдельно: в модерации переключи вкладку."]
+            name = f"{poll.badge} {poll.round[2]}" if poll.round else f"🏆 {poll.label()} ({poll.poll_id})"
+            state = ("открыто" if poll.approved else "ждёт модерации") if poll.open else "закрыто"
+            lines.append(f"{name}: {state} · проголосовало {len(poll.votes)} чел.{leader}")
+        lines += ["", "У каждого голосования своя вкладка в модерации, и итоги подводятся отдельно."]
         return "\n".join(lines)
     poll = polls[0] if polls else None
     if poll is None:
@@ -6358,8 +6360,8 @@ def _vote_month_screen(entry: str, tz, today: date, year: int, month: int, user_
     shown = plan.shown
     if (shown is not None and shown.open and shown.approved and not shown.is_monthly and buildable):
         lines.append(
-            f"⚠️ Сейчас на странице идёт «{shown.label()}» ({shown.poll_id}, "
-            f"{voting.votes_label(len(shown.votes))}): пока идут голосования месяца, его там не будет."
+            f"Сейчас идёт «{shown.label()}» ({voting.votes_label(len(shown.votes))}): оно останется "
+            "на странице своей вкладкой рядом с раундами, голоса не пропадут."
         )
 
     rows = []
@@ -6408,7 +6410,8 @@ def _vote_month_create(entry: str, tz, year: int, month: int, mask: int | None, 
                   + ". Верни фото командой /hall импорт и нажми «Обновить голосования»."]
     shown = voting.page_polls(entry)
     if len(shown) > 1:
-        lines += ["", "На странице все раунды сразу: " + " ".join(f"{p.badge} {p.round[2]}" for p in shown) + "."]
+        lines += ["", "На странице все раунды сразу: " + " ".join(f"{p.badge} {p.round[2]}" for p in shown if p.round)
+                  + "".join(f", и рядом своей вкладкой «{p.label()}»" for p in shown if not p.round) + "."]
     elif shown:
         lines += ["", f"На странице сейчас: {shown[0].label()}."]
     if shown and shown[0].is_monthly:
@@ -7999,7 +8002,7 @@ async def _send_vote_image(api, reply, chat_id, message: dict, entry: str, poll,
                            named: bool = False, log=print) -> None:
     """Renders one poll's standings as a picture and sends it as a file -- "/vote
     картинка". `named` says which of the month's rounds it is in every reply."""
-    label = f"{poll.badge} {poll.round[2]}: " if named and poll.round else ""
+    label = (f"{poll.badge} {poll.round[2]}: " if poll.round else f"{poll.label()}: ") if named else ""
     standings = poll.tally()
     if not standings:
         await reply(f"{label}{'к' if label else 'К'} голосованию ещё не допущена ни одна работа -- рисовать нечего. /vote выбрать.")
@@ -8377,6 +8380,10 @@ async def handle_vote_command(
         # the admin opens модерация, sees a different week, and concludes the collect
         # failed -- and, worse, might clear a live vote trying to fix it.
         shown = voting.latest_poll(entry)
+        if any(p.poll_id == poll_id for p in voting.page_polls(entry, include_pending=True)):
+            # Beside the month's rounds it has a tab of its own (voting.page_polls): on the
+            # page as much as anything is, so there is nothing to wait for.
+            shown = poll
         # A different hashtag's vote is "другой конкурс", not "другая неделя" -- it may well
         # be this very week. Either way closing it is what hands the page over: a closed
         # vote ranks with a pending one and the newer wins (voting._ballot_rank), whereas
@@ -8933,12 +8940,14 @@ async def send_vote_results_draft(
     text = _vote_results_text(standings, header=voting.results_header(poll) if thematic else None)
     _save_vote_results(poll, standings, text, log=log)
 
-    # One live draft per admin, plus the usual TTL sweep -- a second "подведи итоги" in the
-    # same DM abandons the first draft rather than leaving two sets of buttons that would
-    # post the same results twice.
+    # One live draft per admin AND poll, plus the usual TTL sweep -- a second "подведи итоги"
+    # of the same poll abandons the first draft rather than leaving two sets of buttons
+    # that would post the same results twice. Another poll's draft stays: the month's three
+    # rounds are closed one after another, and each needs its own Отправить.
     for old_flow_id, old_flow in list(vote_result_flows.items()):
+        same_poll = getattr(old_flow.get("poll"), "poll_id", None) == poll.poll_id
         if (
-            old_flow.get("chat_id") == chat_id
+            (old_flow.get("chat_id") == chat_id and same_poll)
             or time.monotonic() - old_flow["created_at"] > VOTE_RESULT_FLOW_TTL_SECONDS
         ):
             vote_result_flows.pop(old_flow_id, None)
@@ -9029,9 +9038,10 @@ async def handle_vote_result_callback(
 
     if action == "edit":
         try:
+            which = flow["poll"].label() if getattr(flow.get("poll"), "is_monthly", False) else ""
             prompt = await api.send_message(
                 flow["chat_id"],
-                "Пришли новый текст итогов ответом на это сообщение.",
+                f"Пришли новый текст итогов{f' «{which}»' if which else ''} ответом на это сообщение.",
                 parse_mode=None,
                 reply_markup={"force_reply": True, "selective": True},
             )

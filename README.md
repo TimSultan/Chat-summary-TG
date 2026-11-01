@@ -1099,8 +1099,10 @@ page that changes shape depending on who opens it:
   winners (`vote_monthly.py`). The works, their photos, the administrator's framing, the
   authors and captions all come from the weeks' records in the Hall of Fame, so nothing is
   read from the chat again and a week cleared from `/vote` still counts. A week belongs to
-  the month of the Sunday its vote was held on (the Sunday nearest the vote's start, so a
-  vote collected on Monday is still the Sunday before); a week of the month before comes in
+  the month of the Sunday its vote was held on -- the earlier of the Sunday nearest the
+  vote's last collect and the Sunday of the week its id names, since each can only read late
+  (a vote first collected on Monday carries next week's id; a Thursday top-up moves the
+  collect time); a week of the month before comes in
   too when it ended after that month's rounds began — September's rounds were run on
   22 September, so the week of 27 September goes into October's. The screen opens on the
   month just ended until the 15th and on the current month after it, offers both, lists
@@ -1115,7 +1117,13 @@ page that changes shape depending on who opens it:
   a "Готово" card says so (a changed vote stays put). Every write names its round
   (`poll_id` in the body) and is refused with 404 if that poll is not on the page, so a tab
   left open can never vote in some other poll. In moderation each tab is moderated and
-  closed on its own ("Подвести итоги: 🥉 бронза"), each with its own results draft. The
+  closed on its own ("Подвести итоги: 🥉 бронза"), each with its own results draft (a
+  draft is replaced only by another close of the same poll). **The week's own vote stays
+  on the page** as a fourth tab, 🏆 Неделя, while the rounds run -- the month's rounds and
+  the weekly vote fall in the same days, and neither may push the other off; moderation
+  also shows a week collected but not yet admitted there. Auto-advance only follows a
+  one-choice round, never the week, where one tap is not the whole ballot. Once every round
+  is closed the page is what it always was. The
   browser page has the same tabs and builds **one** `/start vote-…` link carrying a choice
   from every round; the bot sorts each work back into its round and records each ballot
   under that round's own rules. "/vote картинка" draws a picture per round, the cropping

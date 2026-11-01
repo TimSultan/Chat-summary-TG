@@ -129,6 +129,12 @@ class WeekTests(unittest.TestCase):
                                        created_at="2026-10-26T08:00:00+00:00")
         self.assertEqual(vote_monthly.week_sunday(contest, UTC), date(2026, 10, 25))
 
+    def test_a_top_up_on_thursday_keeps_the_week_its_id_names(self):
+        """created_at moves on with every re-collect; the id is fixed by the first one."""
+        contest = hall_of_fame.Contest(contest_id="2026-W43", entry=CHAT,
+                                       created_at="2026-10-29T08:00:00+00:00")
+        self.assertEqual(vote_monthly.week_sunday(contest, UTC), date(2026, 10, 25))
+
     def test_without_a_time_the_ids_own_sunday_is_used(self):
         contest = hall_of_fame.Contest(contest_id="2026-W43", entry=CHAT)
         self.assertEqual(vote_monthly.week_sunday(contest, UTC), date(2026, 10, 25))
@@ -241,6 +247,46 @@ class CreateTests(_Store):
             voting.save_poll(poll)
             self.assertEqual(len(voting.page_polls(CHAT)), 3)
         self.assertEqual(voting.page_poll(CHAT).group_label(), "Лучшая работа месяца · октябрь")
+
+    def _live_week(self, approved=True):
+        """This week's vote, being voted in (or only collected) while the rounds run --
+        collected last, as a collect makes it (voting.make_current)."""
+        poll = voting.Poll(poll_id="2026-W45", entry=CHAT, created_at="2026-11-01T12:00:00+00:00",
+                           entries=[_entry(901), _entry(902)])
+        media = voting.media_path(CHAT, "2026-W45")
+        media.mkdir(parents=True, exist_ok=True)
+        for entry in poll.entries:
+            for name in entry.media:
+                Image.new("RGB", (64, 64)).save(media / name)
+        if approved:
+            voting.set_approved(poll, ["901", "902"])
+            voting.record_vote(poll, "77", ["901"])
+        voting.save_poll(poll)
+        return poll
+
+    def test_the_weeks_own_vote_keeps_a_tab_beside_the_rounds(self):
+        self._october()
+        self._create()
+        self._live_week()
+        self.assertEqual([p.poll_id for p in voting.page_polls(CHAT)],
+                         ["2026-10-bronze", "2026-10-silver", "2026-10-gold", "2026-W45"])
+        self.assertEqual(voting.page_poll(CHAT, "2026-W45").votes, {"77": ["901"]})
+
+    def test_a_week_still_in_moderation_is_a_tab_for_the_moderators_only(self):
+        self._october()
+        self._create()
+        self._live_week(approved=False)
+        self.assertEqual(len(voting.page_polls(CHAT)), 3)
+        self.assertEqual(voting.page_polls(CHAT, include_pending=True)[-1].poll_id, "2026-W45")
+
+    def test_once_the_rounds_are_over_the_week_has_the_page_again(self):
+        self._october()
+        self._create()
+        self._live_week()
+        for poll in voting.page_polls(CHAT)[:3]:
+            poll.open = False
+            voting.save_poll(poll)
+        self.assertEqual([p.poll_id for p in voting.page_polls(CHAT)], ["2026-W45"])
 
     def test_an_ordinary_poll_is_the_page_on_its_own(self):
         self._october()
@@ -510,7 +556,7 @@ class CommandTests(_Store):
         voting.record_vote(bronze, "a", ["402"])
         voting.save_poll(bronze)
         text = bot_listener._vote_status_text(CHAT)
-        self.assertIn("Голосование: Лучшая работа месяца · октябрь -- 3 раунда на странице сразу", text)
+        self.assertIn("Голосование: Лучшая работа месяца · октябрь -- раундов на странице: 3", text)
         self.assertIn("🥉 бронза: открыто · проголосовало 1 чел. · лидер: Автор 402 (@user402) (1)", text)
         self.assertIn("🥇 золото: открыто · проголосовало 0 чел.", text)
 
@@ -520,7 +566,7 @@ class CommandTests(_Store):
         vote_monthly.create_rounds(CHAT, plan := vote_monthly.plan_month(CHAT, 2026, 10, UTC), plan.selected())
         api = self._type("/vote", user=STRANGER)
         self.assertTrue(api.sent[0][1].startswith(
-            "Голосование «Лучшая работа месяца · октябрь»: 🥉 🥈 🥇:"))
+            "Голосование «Лучшая работа месяца · октябрь» 🥉🥈🥇:"))
 
     def _rounds(self):
         self._october()
@@ -591,6 +637,50 @@ class CommandTests(_Store):
                 api, None, _cfg(), UTC, message, CHAT, "testbot", tasks, log=lambda *_: None))
         self.assertEqual(drawn, ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
         self.assertTrue(sent[0].startswith("🥉 бронза: "))
+
+    def test_each_closed_round_keeps_its_own_results_draft(self):
+        """Closing bronze and then silver must not take the bronze draft's buttons away."""
+        self._rounds()
+        flows = {}
+        api = FakeApi()
+        polls = voting.page_polls(CHAT)
+        for poll in polls:
+            voting.record_vote(poll, "a", [poll.approved[0]])
+            voting.close_and_announce(poll)
+            asyncio.run(bot_listener.send_vote_results_draft(
+                api, ADMIN, poll, poll.tally(), -100, flows, log=lambda *_: None))
+        self.assertEqual(sorted(f["poll"].poll_id for f in flows.values()),
+                         ["2026-10-bronze", "2026-10-gold", "2026-10-silver"])
+        self.assertIn("Результаты голосования «Лучшая работа месяца · октябрь · бронза»:", api.sent[0][1])
+        # The same round closed again replaces its own draft, and only that one.
+        asyncio.run(bot_listener.send_vote_results_draft(
+            api, ADMIN, polls[0], polls[0].tally(), -100, flows, log=lambda *_: None))
+        self.assertEqual(len(flows), 3)
+
+    def test_a_week_collected_while_the_rounds_run_goes_straight_to_its_tab(self):
+        self._rounds()
+
+        async def collect_entries(**kwargs):
+            return [_entry(901)]
+
+        with patch.object(voting, "collect_entries", collect_entries), \
+                patch.object(bot_listener, "_current_vote_poll_id", lambda tz: "2026-W45"):
+            api = self._type("/vote собрать 26.10 01.11")
+        reply = api.sent[-1][1]
+        self.assertIn("Новых заявок: 1", reply)
+        self.assertNotIn("открыт пока другой конкурс", reply)
+        self.assertEqual(voting.page_polls(CHAT, include_pending=True)[-1].poll_id, "2026-W45")
+
+    def test_the_status_and_heading_name_the_week_beside_the_rounds(self):
+        self._rounds()
+        week = voting.Poll(poll_id="2026-W45", entry=CHAT, created_at="2026-11-01T09:00:00+00:00",
+                           entries=[_entry(901)])
+        voting.set_approved(week, ["901"])
+        voting.save_poll(week)
+        self.assertEqual(bot_listener._vote_heading(CHAT),
+                         "Голосование «Лучшая работа месяца · октябрь» 🥉🥈🥇 и итоги недели")
+        self.assertIn("🏆 Итоги недели (2026-W45): открыто · проголосовало 0 чел.",
+                      bot_listener._vote_status_text(CHAT))
 
     def test_add_new_with_a_round_on_the_page_tops_up_the_weekly_vote(self):
         self._october()
@@ -711,6 +801,19 @@ class PageTests(_Store, AsyncTestCase):
         self.assertEqual(status, 404)
         self.assertIn("нет на странице", answer["error"])
         self.assertEqual(voting.load_archived_poll(CHAT, "2026-W43").votes.get("2"), None)
+
+    async def test_the_weeks_vote_is_a_fourth_tab_and_takes_its_own_ballot(self):
+        self._rounds()
+        week = voting.Poll(poll_id="2026-W45", entry=CHAT, created_at="2026-11-01T09:00:00+00:00",
+                           entries=[_entry(901), _entry(902)])
+        voting.set_approved(week, ["901", "902"])
+        voting.save_poll(week)
+        _, data = await self._get("/vote/api/poll")
+        self.assertEqual([r["poll_id"] for r in data["rounds"]][-1], "2026-W45")
+        self.assertIsNone(data["rounds"][-1]["round"])
+        status, _ = await self._post("/vote/api/ballot", {"poll_id": "2026-W45", "choices": ["901", "902"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(voting.load_poll(CHAT, "2026-W45").votes, {"2": ["901", "902"]})
 
     async def test_the_browser_page_gets_every_round_too(self):
         self._rounds()
