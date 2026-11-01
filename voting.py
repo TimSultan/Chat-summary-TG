@@ -993,26 +993,56 @@ def latest_poll(entry: str) -> Poll | None:
     return min(polls, key=_ballot_rank)
 
 
-def page_polls(entry: str) -> list[Poll]:
-    """Every poll the voting page shows at once, in the order it lists them.
+def _month_rounds(polls: list[Poll], month: str) -> list[Poll]:
+    """`month`'s rounds among `polls`, bronze, silver, gold."""
+    by_id = {poll.poll_id: poll for poll in polls if poll.is_monthly}
+    return [by_id[f"{month}-{row[0]}"] for row in MONTHLY_ROUNDS if f"{month}-{row[0]}" in by_id]
 
-    Normally one: latest_poll's. When that is one of a month's rounds, it is all of that
-    month's rounds still on disk, bronze, silver, gold -- three votes a voter goes through
-    on the same page, each its own poll with its own ballots and its own close."""
-    shown = latest_poll(entry)
-    if shown is None:
+
+def _round_month(poll: Poll) -> str | None:
+    match = _MONTHLY_ROUND_ID.match(poll.poll_id or "") if poll.is_monthly else None
+    return match.group(1) if match else None
+
+
+def page_polls(entry: str, include_pending: bool = False) -> list[Poll]:
+    """Every poll the voting page shows at once, in the order it lists them (one tab each).
+
+    Normally one: latest_poll's. While a month's rounds are being voted in, it is all of
+    that month's rounds -- bronze, silver, gold, each its own poll with its own ballots
+    and its own close -- and, as a tab of its own after them, the weekly (or thematic)
+    vote that would otherwise be on the page, when one is being voted in too: the month's
+    rounds and the week's vote run in the same days, and neither may push the other off.
+    `include_pending` (the moderation screen) also counts a collected week nobody has
+    admitted anything in yet, so it can be moderated beside the rounds.
+
+    Once none of the rounds is open any more, the page is what it always was: latest_poll's
+    poll, and its month's rounds when that is one of them, results and all."""
+    polls = _all_polls(entry)
+    if not polls:
         return []
-    match = _MONTHLY_ROUND_ID.match(shown.poll_id or "") if shown.is_monthly else None
-    if match is None:
-        return [shown]
-    rounds = [load_poll(entry, f"{match.group(1)}-{row[0]}") for row in MONTHLY_ROUNDS]
-    return [poll for poll in rounds if poll is not None and poll.is_monthly] or [shown]
+    live_months: dict[str, str] = {}
+    for poll in polls:
+        month = _round_month(poll)
+        if month is not None and poll.open and poll.approved:
+            live_months[month] = max(live_months.get(month, ""), poll.created_at)
+    if not live_months:
+        shown = min(polls, key=_ballot_rank)
+        month = _round_month(shown)
+        return (_month_rounds(polls, month) if month else []) or [shown]
+    month = max(live_months, key=lambda key: (live_months[key], key))
+    tabs = _month_rounds(polls, month)
+    others = [poll for poll in polls if not poll.is_monthly]
+    if others:
+        week = min(others, key=_ballot_rank)
+        if week.open and (week.approved or (include_pending and week.entries)):
+            tabs.append(week)
+    return tabs
 
 
-def page_poll(entry: str, poll_id: str | None = None) -> Poll | None:
+def page_poll(entry: str, poll_id: str | None = None, include_pending: bool = False) -> Poll | None:
     """One of page_polls: the one named, or the first when none is. None for a poll that
     is not on the page -- a request naming it must not reach any other poll on disk."""
-    polls = page_polls(entry)
+    polls = page_polls(entry, include_pending)
     if not poll_id:
         return polls[0] if polls else None
     return next((poll for poll in polls if poll.poll_id == poll_id), None)

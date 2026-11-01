@@ -109,14 +109,16 @@ def _json_error(message: str, status: int = 400) -> web.Response:
 _GONE = "этого голосования уже нет на странице -- обнови её"
 
 
-def _requested_poll(entry_name: str, body: dict | None) -> tuple[voting.Poll | None, web.Response | None]:
-    """The poll a write is for: the one its body names (`poll_id`, one of a month's rounds
-    on the page), or the page's own when it names none -- which is every request from a
-    page that predates the rounds. (poll, None), or (None, the error to answer with)."""
+def _requested_poll(entry_name: str, body: dict | None,
+                    moderating: bool = False) -> tuple[voting.Poll | None, web.Response | None]:
+    """The poll a write is for: the one its body names (`poll_id`, one of the tabs on the
+    page), or the page's own when it names none -- which is every request from a page that
+    predates the tabs. `moderating` (an administrator's write) reaches the tabs only
+    moderation shows too. (poll, None), or (None, the error to answer with)."""
     requested = (body or {}).get("poll_id")
     if requested is not None and not isinstance(requested, str):
         return None, _json_error("poll_id must be a string")
-    poll = voting.page_poll(entry_name, requested)
+    poll = voting.page_poll(entry_name, requested, include_pending=moderating)
     if poll is None:
         return None, _json_error(_GONE if requested else "голосование ещё не создано", status=404)
     return poll, None
@@ -217,14 +219,16 @@ async def handle_poll(request: web.Request) -> web.Response:
     """
     user = await _authenticate(request)
     entry_name = request.app[_ENTRY_KEY]
-    polls = voting.page_polls(entry_name)
+    can_moderate = await request.app[_IS_ADMIN_KEY](user)
+    admin_mode = can_moderate and request.query.get("mode") == "admin"
+    # Moderation also gets a collected week nobody has admitted anything in yet, beside
+    # the month's rounds (voting.page_polls).
+    polls = voting.page_polls(entry_name, include_pending=admin_mode)
     if not polls:
         return web.json_response({
             "poll_id": None, "entries": [], "is_admin": False, "can_moderate": False, "open": False,
         })
 
-    can_moderate = await request.app[_IS_ADMIN_KEY](user)
-    admin_mode = can_moderate and request.query.get("mode") == "admin"
     can_view_vote_stats = admin_mode and await request.app[_IS_STATS_ADMIN_KEY](user)
     verdict = await request.app[_ELIGIBILITY_KEY](user)
     base = request.app[_ROUTE_PREFIX_KEY]
@@ -446,7 +450,7 @@ async def handle_moderate(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут допускать работы", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll, problem = _requested_poll(entry_name, body)
+    poll, problem = _requested_poll(entry_name, body, moderating=True)
     if problem is not None:
         return problem
 
@@ -498,7 +502,7 @@ async def handle_announce(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут подводить итоги", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll, problem = _requested_poll(entry_name, body)
+    poll, problem = _requested_poll(entry_name, body, moderating=True)
     if problem is not None:
         return problem
 
@@ -567,7 +571,7 @@ async def handle_crops(request: web.Request) -> web.Response:
 
     entry_name = request.app[_ENTRY_KEY]
     async with voting.poll_lock:
-        poll, problem = _requested_poll(entry_name, body)
+        poll, problem = _requested_poll(entry_name, body, moderating=True)
         if problem is not None:
             return problem
         voting.set_crops(poll, crops)
@@ -602,7 +606,7 @@ async def handle_export(request: web.Request) -> web.Response:
 
     entry_name = request.app[_ENTRY_KEY]
     async with voting.poll_lock:
-        poll, problem = _requested_poll(entry_name, body)
+        poll, problem = _requested_poll(entry_name, body, moderating=True)
         if problem is not None:
             return problem
         if isinstance(body.get("crops"), dict):
@@ -694,7 +698,7 @@ async def handle_clear(request: web.Request) -> web.Response:
         return _json_error("только администраторы могут очищать голосование", status=403)
 
     entry_name = request.app[_ENTRY_KEY]
-    poll, problem = _requested_poll(entry_name, body)
+    poll, problem = _requested_poll(entry_name, body, moderating=True)
     if problem is not None:
         return problem
 
@@ -1260,7 +1264,7 @@ PAGE_HTML = """<!doctype html>
 <nav class="rounds" id="rounds" hidden aria-label="Раунды голосования"></nav>
 <div class="doneCard" id="doneCard" hidden>
   <div class="big">🥉 🥈 🥇</div>
-  <b>Готово — ты проголосовал во всех раундах!</b>
+  <b id="doneTitle">Готово — ты проголосовал во всех раундах!</b>
   <span>Спасибо. Передумаешь — выбери другую работу, пока голосование открыто.</span>
 </div>
 <div class="confirmBanner" id="confirmBanner" hidden>Голос принят</div>
@@ -1803,7 +1807,7 @@ function render() {
   // A thematic contest is named on its own ballot, not as the weekly one; the month's
   // rounds by their month, the round itself being the tab.
   $("title").textContent = poll.title || "Итоги недели";
-  if (rounds.length > 1 && groupTitle) $("title").textContent = groupTitle;
+  if (rounds.length > 1 && groupTitle && poll.round) $("title").textContent = groupTitle;
   renderWinnerBanner();
   renderResults();
   updateAdminButtons();
@@ -1904,11 +1908,16 @@ function capital(text) { return text ? text.charAt(0).toUpperCase() + text.slice
 function hasVoted(round) { return !!(round.my_vote && round.my_vote.length); }
 // Which places of the weeks each round is between.
 const ROUND_FIELD = { bronze: "третьи места недель", silver: "вторые места недель", gold: "победители недель" };
+// A tab that is not one of the month's rounds: the week's own vote, running beside them.
+const WEEKLY_TAG = "#итогинедели";
+function tabBadge(r) { return r.round ? r.round.badge : (r.hashtag === WEEKLY_TAG ? "🏆" : "🏅"); }
+function tabName(r) { return r.round ? capital(r.round.name) : (r.hashtag === WEEKLY_TAG ? "Неделя" : (r.title || "Конкурс")); }
 
 function roundState(round) {
   if (!round.open) return round.winner ? "итоги" : "закрыто";
   if (round.is_admin) return "голосов: " + (round.voter_count || 0);
-  return hasVoted(round) ? "✓ голос учтён" : "не выбрано";
+  // Four tabs leave no room for the long form on a phone.
+  return hasVoted(round) ? (rounds.length > 3 ? "✓ учтён" : "✓ голос учтён") : "не выбрано";
 }
 
 function renderRounds() {
@@ -1918,15 +1927,18 @@ function renderRounds() {
   document.body.dataset.medal = poll && poll.round ? poll.round.key : "";
   $("doneCard").hidden = !(many && !poll.is_admin && rounds.every((r) => !r.open || hasVoted(r)) &&
                            rounds.some((r) => r.open && hasVoted(r)));
+  $("doneTitle").textContent = "Готово — ты проголосовал во всех " +
+    (rounds.every((r) => r.round) ? "раундах!" : "голосованиях!");
   if (!many) return;
+  box.style.gridTemplateColumns = "repeat(" + rounds.length + ", minmax(0, 1fr))";
   box.innerHTML = rounds.map((r) => {
     const key = r.round ? r.round.key : "";
     const classes = "roundTab" + (r === poll ? " active" : "") +
       (r.open && !r.is_admin && hasVoted(r) ? " done" : "") + (r.open ? "" : " closed");
     return '<button type="button" class="' + classes + '" data-round-tab="' + esc(r.poll_id) +
       '" data-tone="' + esc(key) + '"' + (r === poll ? ' aria-current="true"' : "") + ">" +
-      '<span class="medal">' + esc(r.round ? r.round.badge : "🏅") + "</span>" +
-      '<span class="rname">' + esc(capital(r.round ? r.round.name : r.title)) + "</span>" +
+      '<span class="medal">' + esc(tabBadge(r)) + "</span>" +
+      '<span class="rname">' + esc(tabName(r)) + "</span>" +
       '<span class="rstate">' + esc(roundState(r)) + "</span></button>";
   }).join("");
 }
@@ -1934,10 +1946,11 @@ function renderRounds() {
 function renderSub() {
   const sub = $("sub");
   const many = rounds.length > 1;
+  const monthRounds = rounds.filter((r) => r.round);
   const where = many && poll.round
-    ? "Раунд " + (rounds.indexOf(poll) + 1) + " из " + rounds.length + " · " +
+    ? "Раунд " + (monthRounds.indexOf(poll) + 1) + " из " + monthRounds.length + " · " +
       capital(poll.round.name) + ": " + (ROUND_FIELD[poll.round.key] || "") + " · "
-    : "";
+    : "";  // any other tab: its own name is the title already
   if (poll.is_admin) {
     sub.textContent = where +
       "Режим модератора · заявок " + poll.entries.length + " · проголосовало " + (poll.voter_count || 0);
@@ -1977,9 +1990,10 @@ function selectRound(id, options = {}) {
   window.scrollTo({ top: 0, behavior: options.smooth ? "smooth" : "auto" });
 }
 
-// After a ballot: the tabs catch up, and a FIRST vote in a round moves the voter on to the
-// next round they have still to vote in -- or, when that was the last, says they are done.
-// A changed or withdrawn vote stays put: they came back to this round on purpose.
+// After a ballot: the tabs catch up, and a FIRST vote in a one-choice round moves the voter
+// on to the next tab they have still to vote in -- or, when that was the last, says they
+// are done. A changed or withdrawn vote stays put: they came back on purpose. So does a
+// vote that may name several works (the week's): one tap is not the whole ballot there.
 function afterBallot(votedBefore) {
   if (rounds.length < 2) return;
   renderRounds();
@@ -1989,9 +2003,10 @@ function afterBallot(votedBefore) {
   const ordered = rounds.slice(from + 1).concat(rounds.slice(0, from));
   const next = ordered.find((r) => r.open && !hasVoted(r) && r.can_vote !== false);
   const current = poll;
+  if (next && current.max_choices !== 1) return;
   if (next) {
-    showConfirmBanner(capital(current.round.name) + ": голос принят → дальше " + next.round.badge + " " +
-                      next.round.name);
+    showConfirmBanner(tabName(current) + ": голос принят → дальше " + tabBadge(next) + " " +
+                      tabName(next).toLowerCase());
     advanceTimer = setTimeout(() => {
       if (poll === current) selectRound(next.poll_id, { keepBanner: true, smooth: true });
     }, 900);
@@ -2549,7 +2564,7 @@ $("clear").addEventListener("click", async () => {
       button.textContent = "🗑 Очистить голосование";
       button.disabled = false;
       selectRound(rounds[0].poll_id);
-      showConfirmBanner("Раунд «" + (cleared.round ? cleared.round.name : cleared.title) + "» убран в архив");
+      showConfirmBanner("«" + tabName(cleared) + "» убрано в архив");
       return;
     }
     rounds = [];
@@ -3689,8 +3704,8 @@ function renderBar() {
     const open = rounds.filter((r) => r.open && r.entries.length);
     const done = open.filter((r) => picksOf(r).size).length;
     bar.hidden = !open.length;
-    $("count").innerHTML = "Выбрано<b>" + done + " из " + open.length + " " +
-      plural(open.length, "раунда", "раундов", "раундов") + "</b>";
+    const unit = rounds.every((r) => r.round) ? ["раунда", "раундов", "раундов"] : ["голосования", "голосований", "голосований"];
+    $("count").innerHTML = "Выбрано<b>" + done + " из " + open.length + " " + plural(open.length, ...unit) + "</b>";
     $("send").disabled = done === 0;
     $("send").textContent = !done ? "Выберите работы" : done < open.length ? "Отправить выбранное" : "Отправить голос";
     return;
@@ -3706,6 +3721,10 @@ function renderBar() {
 // ---------------------------------------------------------------- the rounds
 function capital(text) { return text ? text.charAt(0).toUpperCase() + text.slice(1) : ""; }
 function picksOf(round) { return picksByRound[round.poll_id] || new Set(); }
+// A tab that is not one of the month's rounds: the week's own vote, running beside them.
+const WEEKLY_TAG = "#итогинедели";
+function tabBadge(r) { return r.round ? r.round.badge : (r.hashtag === WEEKLY_TAG ? "🏆" : "🏅"); }
+function tabName(r) { return r.round ? capital(r.round.name) : (r.hashtag === WEEKLY_TAG ? "Неделя" : (r.title || "Конкурс")); }
 
 function renderRounds() {
   const box = $("rounds");
@@ -3713,14 +3732,15 @@ function renderRounds() {
   box.hidden = !many;
   document.body.dataset.medal = poll && poll.round ? poll.round.key : "";
   if (!many) return;
+  box.style.gridTemplateColumns = "repeat(" + rounds.length + ", minmax(0, 1fr))";
   box.innerHTML = rounds.map((r) => {
     const key = r.round ? r.round.key : "";
     const chosen = r.open && picksOf(r).size > 0;
     const state = !r.open ? "закрыто" : chosen ? "✓ выбрано" : "не выбрано";
     return '<button type="button" class="roundTab' + (r === poll ? " active" : "") + (chosen ? " done" : "") +
       '" data-round-tab="' + esc(r.poll_id) + '" data-tone="' + esc(key) + '">' +
-      '<span class="medal">' + esc(r.round ? r.round.badge : "🏅") + "</span>" +
-      '<span class="rname">' + esc(capital(r.round ? r.round.name : r.title)) + "</span>" +
+      '<span class="medal">' + esc(tabBadge(r)) + "</span>" +
+      '<span class="rname">' + esc(tabName(r)) + "</span>" +
       '<span class="rstate">' + state + "</span></button>";
   }).join("");
 }
@@ -3728,7 +3748,7 @@ function renderRounds() {
 function renderClosedNotice() {
   if (poll.open) { $("notice").hidden = true; return; }
   const w = poll.winner;
-  showNotice(rounds.length > 1 ? capital(poll.round.name) + ": голосование закрыто" : "Голосование закрыто",
+  showNotice(rounds.length > 1 ? tabName(poll) + ": голосование закрыто" : "Голосование закрыто",
     "Спасибо всем, кто голосовал.",
     w ? '<div class="winner" style="margin-top:12px">' +
         (w.photos[0] ? '<img src="' + esc(w.photos[0]) + '" alt="">' : "") +
@@ -3756,8 +3776,9 @@ function advanceFrom(current) {
   const from = rounds.indexOf(current);
   const ordered = rounds.slice(from + 1).concat(rounds.slice(0, from));
   const next = ordered.find((r) => r.open && r.entries.length && !picksOf(r).size);
-  if (!next) { toast("Выбор есть во всех раундах — отправьте голос"); return; }
-  toast(capital(current.round.name) + ": готово → дальше " + next.round.badge + " " + next.round.name);
+  if (!next) { toast("Выбор есть везде — отправьте голос"); return; }
+  if (current.max_choices !== 1) return;   // several works may be chosen here: stay
+  toast(tabName(current) + ": готово → дальше " + tabBadge(next) + " " + tabName(next).toLowerCase());
   advanceTimer = setTimeout(() => {
     if (poll !== current) return;
     if (layers.length) closeTop();
@@ -3814,10 +3835,10 @@ function openSend() {
   const open = rounds.filter((r) => r.open && r.entries.length).length;
   const done = new Set(pairs.map((pair) => pair.round)).size;
   $("sendCount").textContent = many
-    ? (done < open ? "Выбор есть в " + done + " из " + open + " раундов — остальные можно отправить потом." : "Ваш выбор во всех раундах:")
+    ? (done < open ? "Выбор есть в " + done + " из " + open + " — остальное можно отправить потом." : "Ваш выбор везде:")
     : "Ваш выбор: " + chosen.length + " " + plural(chosen.length, "работа", "работы", "работ");
   $("chosen").innerHTML = pairs.map((pair) =>
-    '<div class="row">' + (pair.round && pair.round.round ? '<span class="round">' + esc(pair.round.round.badge) + "</span>" : "") +
+    '<div class="row">' + (pair.round ? '<span class="round">' + esc(tabBadge(pair.round)) + "</span>" : "") +
     (pair.entry.photos[0] ? '<img src="' + esc(pair.entry.photos[0]) + '" alt="">' : "") +
     "<span>" + esc(displayName(pair.entry)) + "</span></div>").join("");
   const link = $("sendLink");
@@ -4003,8 +4024,8 @@ if (window.ResizeObserver) {
   for (const r of rounds) picksByRound[r.poll_id] = r.open ? loadPicks(r) : new Set();
   picked = picksOf(poll);
   if (rounds.length > 1) {
-    $("stepOne").textContent = "Выберите по одной работе в каждом раунде: " +
-      rounds.map((r) => r.round.badge + " " + r.round.name).join(", ") + ". Нажмите на фото, чтобы рассмотреть.";
+    $("stepOne").textContent = "Выберите работы на каждой вкладке: " +
+      rounds.map((r) => tabBadge(r) + " " + tabName(r).toLowerCase()).join(", ") + ". Нажмите на фото, чтобы рассмотреть.";
   }
   if (!rounds.some((r) => r.open)) $("steps").hidden = true;
   renderRounds();
