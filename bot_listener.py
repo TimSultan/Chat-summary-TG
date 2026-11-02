@@ -3346,7 +3346,6 @@ async def handle_via_cleaner_callback(
 # grants credits (/tripocredits); the owner never needs any.
 
 TRIPO_OWNER_ONLY = "Начислять кредиты Tripo может только владелец бота."
-TRIPO_NOT_CONFIGURED = "Не настроен адрес image generator web: задай переменную TRIPO_WEB_URL."
 # Tasks a "Проверить результат" / "Новая ссылка" press is already working on, so a
 # double-tap does not download and send the same model twice.
 _TRIPO_CHECKING: set[str] = set()
@@ -3457,9 +3456,6 @@ async def handle_tripo_command(
     if not owner and tripo.remember_user(actor)["credits"] < 1:
         # Balance first, then where to get more -- the same two lines the panel opens with.
         await reply(tripo.no_credits_text(), parse_mode="HTML")
-        return
-    if not tripo.web_endpoint():
-        await reply(TRIPO_NOT_CONFIGURED)
         return
 
     previous = tripo_flows.pop(actor["id"], None)
@@ -3661,8 +3657,6 @@ async def _tripo_run(
 
     try:
         endpoint = tripo.web_endpoint()
-        if not endpoint:
-            raise tripo.TripoWebError(TRIPO_NOT_CONFIGURED)
         await show("Готовлю фото…")
         images = {view: await api.download_file(file_id) for view, file_id in views.items()}
         encoded = await asyncio.to_thread(tripo.prepare_images, images)
@@ -3791,8 +3785,6 @@ async def _tripo_check_task(api: TelegramBotAPI, chat_id, task_id: str, links_on
     running when the bot restarted: Tripo finished it, and charged for it, regardless."""
     try:
         endpoint = tripo.web_endpoint()
-        if not endpoint:
-            raise tripo.TripoWebError(TRIPO_NOT_CONFIGURED)
         async with aiohttp.ClientSession() as session:
             client = tripo.TripoWebClient(session, endpoint, tripo.api_key())
             result = await client.status(task_id)

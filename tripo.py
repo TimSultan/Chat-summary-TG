@@ -6,10 +6,10 @@ the one that node sends with these settings: model v3.1, Ultra geometry, and eve
 else off -- no texture, PBR, quad mesh, parts or rig. The only choice left to make in
 Telegram is the polygon budget.
 
-Configured from the environment, read when used so a missing value costs this command
-and nothing else:
+Configured from the environment, read when used:
 
-    TRIPO_WEB_URL   where image generator web is deployed (https://….vercel.app)
+    TRIPO_WEB_URL   where image generator web is deployed. Optional: defaults to its
+                    Railway service (DEFAULT_WEB_URL).
     TRIPO_API_KEY   Tripo secret (tsk_…). Optional when that deployment has its own
                     TRIPO_API_KEY.
 
@@ -70,6 +70,20 @@ SUBMIT_BACKOFF_SECONDS = (1, 2, 4, 8, 16, 32, 32, 32)
 
 IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 
+# image generator web runs on Railway since 31 October 2026. It used to run on Vercel, which
+# it no longer uses, so a TRIPO_WEB_URL still naming a *.vercel.app address is stale.
+DEFAULT_WEB_URL = "https://image-generator-production-7a78.up.railway.app"
+RETIRED_WEB_HOST = ".vercel.app"
+
+# A status read normally answers at once. The one that finds the task finished first copies
+# the model to the web app's storage (Tripo's own links expire), which for a 2M-face GLB
+# can take a while.
+STATUS_TIMEOUT_SECONDS = 180
+
+MISSING_KEY_TEXT = (
+    "нет ключа Tripo. Задай TRIPO_API_KEY боту или сервису image generator на Railway"
+)
+
 
 class TripoWebError(Exception):
     def __init__(self, message: str, status: int | None = None):
@@ -84,11 +98,13 @@ class TripoTaskFailed(TripoWebError):
 # --------------------------------------------------------------------------- settings
 
 
-def web_endpoint() -> str | None:
-    """/api/model3d on the configured deployment. A full endpoint URL is accepted too."""
+def web_endpoint() -> str:
+    """/api/model3d on the configured deployment, or on the Railway one when none is set
+    or the setting still names the retired Vercel deployment. A full endpoint URL is
+    accepted too."""
     base = (os.getenv("TRIPO_WEB_URL") or "").strip().rstrip("/")
-    if not base:
-        return None
+    if not base or RETIRED_WEB_HOST in base.lower():
+        base = DEFAULT_WEB_URL
     return base if base.endswith("/api/model3d") else f"{base}/api/model3d"
 
 
@@ -601,7 +617,12 @@ class TripoWebClient:
         if not isinstance(data, dict):
             data = {"error": str(data)[:300]}
         if status >= 400:
-            raise TripoWebError(data.get("error") or f"HTTP {status}", status)
+            message = str(data.get("error") or f"HTTP {status}")
+            # Neither the bot nor the deployment has a key: say where to put one, not the
+            # web app's "Add it in Settings".
+            if status == 400 and "api key required" in message.lower():
+                message = MISSING_KEY_TEXT
+            raise TripoWebError(message, status)
         return data
 
     async def submit(self, payload: dict, sleep=asyncio.sleep, on_wait=None) -> str:
@@ -622,7 +643,9 @@ class TripoWebClient:
             return task_id
 
     async def status(self, task_id: str) -> dict:
-        return await self._post({"provider": "tripo", "action": "status", "taskId": task_id}, timeout=30)
+        return await self._post(
+            {"provider": "tripo", "action": "status", "taskId": task_id}, timeout=STATUS_TIMEOUT_SECONDS,
+        )
 
     async def download(self, url: str, path: Path, limit: int = MODEL_DOWNLOAD_LIMIT) -> int:
         """Stream a Tripo file to disk. Returns its size."""
