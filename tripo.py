@@ -75,11 +75,6 @@ IMAGE_MIME_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
 DEFAULT_WEB_URL = "https://image-generator-production-7a78.up.railway.app"
 RETIRED_WEB_HOST = ".vercel.app"
 
-# A status read normally answers at once. The one that finds the task finished first copies
-# the model to the web app's storage (Tripo's own links expire), which for a 2M-face GLB
-# can take a while.
-STATUS_TIMEOUT_SECONDS = 180
-
 MISSING_KEY_TEXT = (
     "нет ключа Tripo. Задай TRIPO_API_KEY боту или сервису image generator на Railway"
 )
@@ -643,9 +638,7 @@ class TripoWebClient:
             return task_id
 
     async def status(self, task_id: str) -> dict:
-        return await self._post(
-            {"provider": "tripo", "action": "status", "taskId": task_id}, timeout=STATUS_TIMEOUT_SECONDS,
-        )
+        return await self._post({"provider": "tripo", "action": "status", "taskId": task_id}, timeout=30)
 
     async def download(self, url: str, path: Path, limit: int = MODEL_DOWNLOAD_LIMIT) -> int:
         """Stream a Tripo file to disk. Returns its size."""
