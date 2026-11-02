@@ -119,7 +119,25 @@ class _AlwaysAdmin:
         return self.allowed
 
 
-class DraftAsksWhereItGoesTests(unittest.TestCase):
+class _EmptyBotUsers:
+    """The list of who has the bot started (bot_users.py), empty and in a temporary
+    directory -- the "📬 Всем в личку" button reads its count, and the real one lives
+    in the working directory, where any other test that sends the bot a DM writes."""
+
+    def setUp(self):
+        import tempfile
+        import bot_users
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        dir_patch = patch.object(bot_users, "_dir", lambda: Path(self._tmp.name))
+        dir_patch.start()
+        self.addCleanup(dir_patch.stop)
+        registries = patch.dict(bot_users._REGISTRIES, clear=True)
+        registries.start()
+        self.addCleanup(registries.stop)
+
+
+class DraftAsksWhereItGoesTests(_EmptyBotUsers, unittest.TestCase):
     def _feed(self, text, cfg=None, flows=None, admin=True):
         api = FakeApi()
         flows = {"f1": _flow()} if flows is None else flows
@@ -139,12 +157,14 @@ class DraftAsksWhereItGoesTests(unittest.TestCase):
     def test_all_three_destinations_are_offered_when_the_second_group_is_configured(self):
         api, _, _ = self._feed("Текст")
         labels = [b["text"] for row in api.sent[0]["reply_markup"]["inline_keyboard"] for b in row]
-        self.assertEqual(labels, ["📣 В чат", "🎨 В Папку художников", "📣 В оба", "Отмена"])
+        self.assertEqual(
+            labels, ["📣 В чат", "🎨 В Папку художников", "📣 В оба", "📬 Всем в личку (0)", "Отмена"],
+        )
 
     def test_without_a_second_group_only_the_main_chat_is_offered(self):
         api, _, _ = self._feed("Текст", cfg=_cfg(extra=None))
         labels = [b["text"] for row in api.sent[0]["reply_markup"]["inline_keyboard"] for b in row]
-        self.assertEqual(labels, ["📣 В чат", "Отмена"])
+        self.assertEqual(labels, ["📣 В чат", "📬 Всем в личку (0)", "Отмена"])
 
     def test_cancelling_at_the_text_step_drops_the_draft(self):
         api, flows, _ = self._feed("отмена")
@@ -260,7 +280,7 @@ class DestinationCallbackTests(unittest.TestCase):
         self.assertEqual(api.posts_to(MAIN_CHAT_ID), [])
 
 
-class ArenaAnnouncementTests(unittest.TestCase):
+class ArenaAnnouncementTests(_EmptyBotUsers, unittest.TestCase):
     """The arena drafts its announcement through this same flow, tagged "arena". Only the
     button changes -- and it has to, or a duel announcement would send everybody to v1."""
 

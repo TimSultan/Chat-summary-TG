@@ -1165,6 +1165,32 @@ page that changes shape depending on who opens it:
   into the DM, where the real `web_app` button is waiting one tap away. The same rule
   governs the button a bare `/vote` leaves in a group.
 
+  One more destination, "📬 Всем в личку (N)", sends the same text to everybody who has
+  the bot started, each in their own DM -- with a `web_app` button this time, since every
+  one of those is a private chat. It asks once more ("✅ Да, разослать") before anything
+  goes out, then runs in the background at 20 messages a second (waiting out Telegram's
+  "Too Many Requests" when it comes), rewriting one progress message as it goes, and ends
+  with how many arrived, who turned out to have blocked the bot, and any other failure.
+  One mailing or check at a time.
+- **`/vote люди`** (DM, administrators only, the "👥 Кто активировал бота" button) lists
+  who has the bot started and who blocked it. Telegram gives a bot no such list, so the
+  bot keeps one (`bot_users.py`, `DATA_DIR/bot_users/users.json`): anything somebody does
+  in the DM puts them on it, a `my_chat_member` update says when they block or unblock
+  it, and every mailing records what came back. **`/vote проверить`** ("🔍 Проверить всех
+  из чата") finds the people who started the bot before the list existed: it asks
+  Telegram about everybody the stats have seen in the chat and everybody who ever voted,
+  with `sendChatAction` -- which sends nothing, but fails for anyone who never pressed
+  Start or has blocked the bot, and says which. Muting is invisible to a bot (Telegram
+  reports nothing and a muted chat accepts messages as usual), so the list says so rather
+  than guessing. A list too long for one message arrives as a `.txt` file.
+- **`/vote админам`** (DM, administrators only, the "📢 Админам" button) sends a plain
+  note to the other administrators -- text, or a picture with or without a caption. The
+  admin's own message is what goes out (`copyMessage`), so formatting survives; it is
+  first copied back as a preview with "✅ Отправить (N)" / "Отмена" and the names of who
+  gets it: the tracked chat's administrators (people, not bots) and `/badgeadmin`
+  managers, less the sender. The report names anybody it did not reach and why -- most
+  often an administrator who never pressed Start.
+
 Which of these opens is decided server-side by a `?mode=admin` marker on the page's own
 URL, checked against a real admin lookup on every request (`handle_poll`) -- not by trusting
 whichever button the client happened to tap, so the moderation payload (full entry list,

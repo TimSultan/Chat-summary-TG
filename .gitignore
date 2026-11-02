@@ -8,6 +8,9 @@ cache/
 history/
 export/
 voting/
+# Who has the bot started (bot_users.py) -- personal data, and written by any test that
+# sends the bot a DM.
+bot_users/
 .venv/
 *.log
 *.session_string*
