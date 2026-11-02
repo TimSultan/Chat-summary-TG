@@ -8570,15 +8570,11 @@ async def handle_vote_command(
                         }] if vote_monthly is not None else []),
                     ],
                     [
-                        # Who would get "📣 Объявление" → "📬 Всем в личку" (bot_users.py),
-                        # and a plain note to the other administrators.
+                        # Who would get "📣 Объявление" → "📬 Всем в личку" (bot_users.py).
+                        # "/vote админам" has no button here on purpose: it is typed.
                         {
                             "text": "👥 Кто активировал бота",
                             "callback_data": _vote_action_callback_data("people", chat_id, admin_user_id),
-                        },
-                        {
-                            "text": "📢 Админам",
-                            "callback_data": _vote_action_callback_data("admins", chat_id, admin_user_id),
                         },
                     ],
                     [

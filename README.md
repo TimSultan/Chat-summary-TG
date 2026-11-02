@@ -1183,7 +1183,7 @@ page that changes shape depending on who opens it:
   Start or has blocked the bot, and says which. Muting is invisible to a bot (Telegram
   reports nothing and a muted chat accepts messages as usual), so the list says so rather
   than guessing. A list too long for one message arrives as a `.txt` file.
-- **`/vote админам`** (DM, administrators only, the "📢 Админам" button) sends a plain
+- **`/vote админам`** (DM, administrators only, typed -- it has no panel button) sends a plain
   note to the other administrators -- text, or a picture with or without a caption. The
   admin's own message is what goes out (`copyMessage`), so formatting survives; it is
   first copied back as a preview with "✅ Отправить (N)" / "Отмена" and the names of who
