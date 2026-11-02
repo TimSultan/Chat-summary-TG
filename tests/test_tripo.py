@@ -272,8 +272,16 @@ class SettingsTests(unittest.TestCase):
         for value in ("https://gen.example.app", "https://gen.example.app/", "https://gen.example.app/api/model3d"):
             with patch.dict(os.environ, {"TRIPO_WEB_URL": value}):
                 self.assertEqual(tripo.web_endpoint(), "https://gen.example.app/api/model3d")
-        with patch.dict(os.environ, {"TRIPO_WEB_URL": " "}):
-            self.assertIsNone(tripo.web_endpoint())
+
+    def test_without_an_address_it_uses_the_railway_deployment(self):
+        railway = f"{tripo.DEFAULT_WEB_URL}/api/model3d"
+        self.assertTrue(railway.startswith("https://") and ".up.railway.app/" in railway)
+        for value in (" ", "", "https://old-gen.vercel.app", "https://OLD-GEN.VERCEL.APP/api/model3d"):
+            with patch.dict(os.environ, {"TRIPO_WEB_URL": value}):
+                self.assertEqual(tripo.web_endpoint(), railway, value)
+        with patch.dict(os.environ):
+            os.environ.pop("TRIPO_WEB_URL", None)
+            self.assertEqual(tripo.web_endpoint(), railway)
 
 
 class PhotoTests(unittest.TestCase):
@@ -445,11 +453,15 @@ class TripoBotTests(AsyncTestCase):
         self.assertTrue(flow["unlimited"])
         self.assertTrue(self.api.panels()[-1]["text"].startswith("Кредиты: без ограничений"))
 
-    async def test_without_the_web_address_it_says_what_to_set(self):
-        with patch.dict(os.environ, {"TRIPO_WEB_URL": ""}):
-            await bot_listener.handle_tripo_command(self.api, _command(), self.flows, self.tasks)
-        self.assertEqual(self.api.sent[-1]["text"], bot_listener.TRIPO_NOT_CONFIGURED)
-        self.assertEqual(self.flows, {})
+    async def test_without_a_tripo_key_anywhere_it_says_where_to_put_one(self):
+        # What the Railway deployment answers when it has no TRIPO_API_KEY and the bot sent none.
+        self.web.submit_errors = [(400, {"error": "Tripo API key required. Add it in Settings."})]
+        await self.stranger_ready(1)
+        await self.press("tripo:go", presser=STRANGER)
+        failure = [e for e in self.api.edits if "Не получилось" in e["text"]][-1]["text"]
+        self.assertIn("TRIPO_API_KEY", failure)
+        self.assertNotIn("Settings", failure)
+        self.assertEqual(tripo.balance(STRANGER["id"]), 1)
 
     async def test_a_stranger_cannot_press_somebody_elses_panel(self):
         await self.open_panel()
