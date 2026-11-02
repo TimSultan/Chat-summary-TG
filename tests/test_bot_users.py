@@ -539,14 +539,16 @@ class VoteCommandTests(_Registry, unittest.TestCase):
         asyncio.run(go())
         return api
 
-    def test_the_panel_has_the_list_and_the_admins_note(self):
+    def test_the_panel_has_the_list_but_no_admins_note_button(self):
+        """The owner asked for the "📢 Админам" button to go; "/vote админам" stays typed."""
         with patch.object(bot_listener.voting, "latest_poll", lambda entry: None):
             api = self._vote("/vote")
         data = {b["text"]: b.get("callback_data") for b in _buttons(api.sent[0]["reply_markup"])}
         self.assertEqual(data["👥 Кто активировал бота"],
                          bot_listener._vote_action_callback_data("people", DM, ADMIN["id"]))
-        self.assertEqual(data["📢 Админам"],
-                         bot_listener._vote_action_callback_data("admins", DM, ADMIN["id"]))
+        self.assertNotIn("📢 Админам", data)
+        self.assertNotIn(bot_listener._vote_action_callback_data("admins", DM, ADMIN["id"]),
+                         data.values())
 
     def test_the_list_names_who_has_it_and_who_blocked_it(self):
         self.seed({"1": "active", "2": "blocked"},
