@@ -26,6 +26,17 @@ from errors import ChatSummaryError
 CAPTION_LIMIT = 1024
 
 
+def _api_error(method: str, data: dict) -> ChatSummaryError:
+    """The error for a call Telegram refused. Carries Telegram's error_code and, for a
+    "Too Many Requests", its retry_after in seconds -- what a mailing to many people
+    (bot_users.deliver) needs in order to wait instead of losing everybody after the limit.
+    The message stays exactly what it always was, so nothing that reads it changes."""
+    error = ChatSummaryError(f"Telegram Bot API {method} failed: {data.get('description', data)}")
+    error.error_code = data.get("error_code")
+    error.retry_after = (data.get("parameters") or {}).get("retry_after")
+    return error
+
+
 class TelegramBotAPI:
     def __init__(self, token: str, session: aiohttp.ClientSession):
         if not token or not token.strip():
@@ -45,9 +56,7 @@ class TelegramBotAPI:
             raise ChatSummaryError(f"Telegram Bot API request failed ({method}): {e}") from e
 
         if not data.get("ok"):
-            raise ChatSummaryError(
-                f"Telegram Bot API {method} failed: {data.get('description', data)}"
-            )
+            raise _api_error(method, data)
         return data["result"]
 
     async def _upload(self, method: str, form: aiohttp.FormData, _http_timeout: float = 60.0) -> object:
@@ -63,9 +72,7 @@ class TelegramBotAPI:
             raise ChatSummaryError(f"Telegram Bot API upload failed ({method}): {e}") from e
 
         if not data.get("ok"):
-            raise ChatSummaryError(
-                f"Telegram Bot API {method} failed: {data.get('description', data)}"
-            )
+            raise _api_error(method, data)
         return data["result"]
 
     async def get_me(self) -> dict:
@@ -114,8 +121,12 @@ class TelegramBotAPI:
             # chat where the bot is an administrator -- it carries the moderator's ✍️
             # delete (see bot_listener.handle_moderator_reaction). chat_member is the same
             # kind: joins and leaves, which the voting rule's 24 hours are measured from
-            # (see vote_eligibility.JoinLog).
-            allowed_updates=["message", "callback_query", "message_reaction", "chat_member"],
+            # (see vote_eligibility.JoinLog). my_chat_member is somebody blocking or
+            # unblocking the bot in their DM -- the "заблокировали" of the /vote panel's
+            # list of who has the bot started (see bot_users.py).
+            allowed_updates=[
+                "message", "callback_query", "message_reaction", "chat_member", "my_chat_member",
+            ],
         )
 
     async def send_message(
@@ -145,6 +156,18 @@ class TelegramBotAPI:
         if reply_to_message_id is not None:
             params["reply_parameters"] = {"message_id": reply_to_message_id, "allow_sending_without_reply": True}
         return await self._call("sendMessage", **params)
+
+    async def copy_message(
+        self, chat_id, from_chat_id, message_id: int, reply_markup: dict | None = None,
+    ) -> dict:
+        """Send a copy of an existing message -- text with its formatting, a picture with
+        its caption -- without the "Переслано от" header a forward would carry. How a
+        note an administrator wrote in the DM reaches the other administrators exactly as
+        they wrote it (see bot_listener's "/vote админам"). Returns the new MessageId."""
+        return await self._call(
+            "copyMessage", chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id,
+            reply_markup=reply_markup,
+        )
 
     async def send_photo(
         self,

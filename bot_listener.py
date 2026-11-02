@@ -77,6 +77,7 @@ import aiohttp
 from telethon import utils as tl_utils
 
 import admin_menu
+import bot_users
 import cabinet
 import button_builder
 import donations
@@ -559,7 +560,26 @@ VOTE_CHAT_FLOW_TTL_SECONDS = 10 * 60
 # is pressed, so unlike every other force-reply flow here the entry is popped on the
 # button, not on the reply.
 VOTE_CHAT_DEST_CALLBACK_PREFIX = "votechatdest"
-VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "cancel")
+# "dm" is everybody who has the bot started (bot_users.py), each in their own DM. It asks
+# once more before anything goes out -- "dmyes" -- because that is hundreds of messages
+# nobody can take back, where a group post is one the admin can delete.
+VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "dm", "dmyes", "cancel")
+# "/vote люди" -- the list of who has the bot started and who blocked it (bot_users.py),
+# with the check that finds the people who started it before the list existed ("/vote
+# проверить"). DM and admin-only like the rest of the panel: it names people.
+VOTE_PEOPLE_WORDS = frozenset({"люди", "кто", "подписчики", "people", "users"})
+VOTE_CHECK_WORDS = frozenset({"проверить", "проверка", "check"})
+# "/vote админам" -- a plain message to the administrators, in their DMs: text, or a
+# picture with or without a caption. No vote button: it is a note between the people who
+# run the chat, not an announcement. Drafted through the same force-reply flow as
+# "/vote chat" (tagged with this system), then previewed exactly as it will arrive.
+VOTE_ADMINS_WORDS = frozenset({"админам", "админы", "admins"})
+ADMIN_NOTICE_SYSTEM = "admins"
+VOTE_ADMINS_CALLBACK_PREFIX = "voteadmins"
+VOTE_ADMINS_ACTIONS = ("send", "cancel")
+# A Telegram message's own length limit, less a margin: past it the list of people goes
+# as a file instead of a message.
+BOT_USERS_LIST_INLINE_LIMIT = 3900
 # Buttons on an administrator's bare-/vote status message for собрать/chat/картинка/
 # очистить -- unlike "Открыть голосование"/"Модерация", those are bot ACTIONS, not Mini
 # App pages, so they can't be a web_app button; tapping one runs the exact same code path
@@ -674,6 +694,9 @@ VOTE_ACTIONS = {
     "image4": "/vote картинка 4",
     "clear": "/vote очистить",
     "month": "/vote месяц",
+    "people": "/vote люди",
+    "check": "/vote проверить",
+    "admins": "/vote админам",
 }
 
 # "Закрыть голосование и объявить победителя" in the Mini App no longer announces anything
@@ -8075,7 +8098,14 @@ async def handle_vote_command(
     - "/vote chat" (DM, admin-only) drafts an announcement -- asks for the text via a
       force-reply, then asks where it goes (main chat, the second group, or both) and
       posts that text plus the vote button there (see handle_vote_chat_text_input and
-      handle_vote_chat_destination_callback).
+      handle_vote_chat_destination_callback). One of the destinations is "📬 Всем в
+      личку": everybody who has the bot started (bot_users.py), each in their own DM.
+    - "/vote люди" (DM, admin-only) lists who has the bot started and who blocked it;
+      "/vote проверить" asks Telegram about everybody the bot has seen, to fill that
+      list with the people who started it before it existed (see _check_bot_users).
+    - "/vote админам" (DM, admin-only) sends a plain note -- text, or a picture with or
+      without a caption -- to the other administrators, after a preview (see
+      _take_admin_notice and handle_vote_admins_callback).
     - "/vote картинка" (DM, admin-only) renders the standings as one tall picture
       (vote_image.py), saves it under the poll's own exports directory and sends it back
       as a file.
@@ -8124,6 +8154,7 @@ async def handle_vote_command(
         return
 
     wants_collect = wants_moderate = wants_clear = wants_chat = wants_image = False
+    wants_people = wants_check = wants_admins = False
     month_argument = None
     collect_only_new = False
     collect_dates = None
@@ -8168,6 +8199,9 @@ async def handle_vote_command(
         wants_moderate = normalized in VOTE_MODERATE_WORDS
         wants_clear = normalized in VOTE_CLEAR_WORDS
         wants_chat = normalized in VOTE_CHAT_WORDS
+        wants_people = normalized in VOTE_PEOPLE_WORDS
+        wants_check = normalized in VOTE_CHECK_WORDS
+        wants_admins = normalized in VOTE_ADMINS_WORDS
         requested_columns = _vote_image_columns(normalized)
         wants_image = requested_columns is not None
         if requested_columns is not None:
@@ -8445,6 +8479,32 @@ async def handle_vote_command(
         )
         return
 
+    if wants_people:
+        if not await require_admin_in_dm("Список тех, кто запустил бота, видят только администраторы."):
+            return
+        await _send_bot_users_list(api, chat_id, user.get("id"), tz, reply, log=log)
+        return
+
+    if wants_check:
+        if not await require_admin_in_dm("Проверять, у кого запущен бот, могут только администраторы."):
+            return
+        if not _start_bot_users_job(
+            background_tasks, lambda: _check_bot_users(api, chat_id, user.get("id"), entry, log=log),
+        ):
+            await reply(BOT_USERS_JOB_BUSY_TEXT)
+        return
+
+    if wants_admins:
+        if not await require_admin_in_dm("Писать админам через бота могут только администраторы."):
+            return
+        await _start_announcement_draft(
+            vote_chat_flows, reply, telethon_client, chat_id, user, entry, ADMIN_NOTICE_SYSTEM,
+            "Что отправить админам? Ответь на это сообщение текстом -- или картинкой "
+            "(подпись по желанию). Перед отправкой покажу, как это будет выглядеть.",
+            log=log,
+        )
+        return
+
     if wants_image:
         if not await require_admin_in_dm("Рендерить картинку итогов могут только администраторы."):
             return
@@ -8508,6 +8568,18 @@ async def handle_vote_command(
                             "text": "🏅 Итоги месяца",
                             "callback_data": _vote_action_callback_data("month", chat_id, admin_user_id),
                         }] if vote_monthly is not None else []),
+                    ],
+                    [
+                        # Who would get "📣 Объявление" → "📬 Всем в личку" (bot_users.py),
+                        # and a plain note to the other administrators.
+                        {
+                            "text": "👥 Кто активировал бота",
+                            "callback_data": _vote_action_callback_data("people", chat_id, admin_user_id),
+                        },
+                        {
+                            "text": "📢 Админам",
+                            "callback_data": _vote_action_callback_data("admins", chat_id, admin_user_id),
+                        },
                     ],
                     [
                         {
@@ -8614,6 +8686,11 @@ async def handle_vote_chat_text_input(
     if found is None:
         return False
     flow_id, flow = found
+    if flow.get("system") == ADMIN_NOTICE_SYSTEM:
+        # "/vote админам" shares the draft convention but takes a picture as well as text,
+        # and goes to a preview rather than a destination picker.
+        await _take_admin_notice(api, message, flow_id, flow, vote_chat_flows, log=log)
+        return True
 
     text = (message.get("text") or "").strip()
     if text.lower() in ("/cancel", "отмена"):
@@ -8659,6 +8736,12 @@ async def handle_vote_chat_text_input(
         destinations.append([{
             "text": "📣 В оба", "callback_data": _vote_chat_dest_callback_data("both", flow_id),
         }])
+    # Everybody who has the bot started, each in their own DM. The count is on the button
+    # so the admin sees the reach before tapping; the tap still asks once more.
+    destinations.append([{
+        "text": f"📬 Всем в личку ({await _bot_users_active_count(log=log)})",
+        "callback_data": _vote_chat_dest_callback_data("dm", flow_id),
+    }])
     destinations.append([{
         "text": "Отмена", "callback_data": _vote_chat_dest_callback_data("cancel", flow_id),
     }])
@@ -8705,6 +8788,7 @@ async def handle_vote_chat_destination_callback(
     vote_chat_flows: dict[str, dict],
     bot_username: str | None,
     log=print,
+    background_tasks: set | None = None,
 ) -> None:
     """Posts a drafted "/vote chat" announcement once the admin picks where it goes, or
     drops it on "Отмена". Either way the flow is finished with here -- this is where the
@@ -8714,6 +8798,11 @@ async def handle_vote_chat_destination_callback(
     calls, and a bot that has been kicked from one of them must still get the announcement
     into the other rather than failing the whole thing. The report back to the admin names
     both sides so a silent half-delivery is impossible.
+
+    "📬 Всем в личку" ("dm") is the exception to finishing here: it only asks whether to
+    send to that many people, and keeps the draft for the answer ("dmyes" or "cancel").
+    The mailing itself runs in `background_tasks` -- hundreds of messages at Telegram's
+    pace would otherwise hold up every other update -- or is awaited when none is given.
     """
     parsed = _parse_vote_chat_dest_callback(callback.get("data"))
     if parsed is None:
@@ -8736,15 +8825,38 @@ async def handle_vote_chat_destination_callback(
     # round trips plus the re-verification below, and a button that waits for all of them
     # sits spinning on the presser's screen for the whole time.
     await api.answer_callback_query(callback["id"])
-    vote_chat_flows.pop(flow_id, None)
 
     dm_chat_id = flow["chat_id"]
 
-    async def report(text: str) -> None:
+    async def report(text: str, reply_markup=None) -> None:
         try:
-            await api.send_message(dm_chat_id, text, parse_mode=None)
+            await api.send_message(dm_chat_id, text, parse_mode=None, reply_markup=reply_markup)
         except Exception as e:
             log(f"[bot_listener] failed to report the vote announcement result: {e}")
+
+    if destination == "dm":
+        # Nothing is sent yet: the draft lives on, with a fresh TTL, for the answer.
+        flow["created_at"] = time.monotonic()
+        count = await _bot_users_active_count(log=log)
+        if not count:
+            await report(
+                "В списке пока никого: бот ещё не знает, у кого он запущен. Открой "
+                "/vote → «👥 Кто активировал бота» → «🔍 Проверить всех из чата» -- и "
+                "выбери «📬 Всем в личку» ещё раз. Черновик пока жив."
+            )
+            return
+        await report(
+            f"Разослать это объявление в личку {count} {_ru_people(count)}, у которых "
+            "запущен бот? Каждый получит текст и кнопку голосования. Отменить разосланное "
+            "будет нельзя.",
+            reply_markup={"inline_keyboard": [
+                [{"text": f"✅ Да, разослать ({count})",
+                  "callback_data": _vote_chat_dest_callback_data("dmyes", flow_id)}],
+                [{"text": "Отмена", "callback_data": _vote_chat_dest_callback_data("cancel", flow_id)}],
+            ]},
+        )
+        return
+    vote_chat_flows.pop(flow_id, None)
 
     if destination == "cancel":
         await report("Объявление отменено.")
@@ -8754,6 +8866,23 @@ async def handle_vote_chat_destination_callback(
     # can have been taken away between writing the text and choosing a destination.
     if not await _can_manage_chat(api, flow["admin_chat_id"], clicker, flow.get("entry")):
         await report("Публиковать объявление могут только администраторы.")
+        return
+
+    if destination == "dmyes":
+        # A web_app button, unlike the group posts below: every message here lands in a
+        # private chat, the one place Telegram allows one, and it opens the page directly.
+        button = _announce_dm_button(cfg, flow.get("system") or "vote")
+        if button is None:
+            await report("Голосование не настроено -- некуда вести кнопку.")
+            return
+        mailing = lambda: _mail_bot_users(  # noqa: E731 -- built only if the job starts
+            api, dm_chat_id, flow["text"], {"inline_keyboard": [[button]]}, log=log,
+        )
+        if background_tasks is None:
+            await mailing()
+        elif not _start_bot_users_job(background_tasks, mailing):
+            await report(BOT_USERS_JOB_BUSY_TEXT + " Черновик сброшен -- начни заново: /vote chat")
+        log(f"[bot_listener] {clicker.get('username') or clicker.get('id')} started a DM mailing")
         return
 
     # A url button, never web_app: every destination here is a group, and Telegram accepts
@@ -8801,6 +8930,484 @@ async def handle_vote_chat_destination_callback(
     log(
         f"[bot_listener] {clicker.get('username') or clicker.get('id')} posted a vote "
         f"announcement to {destination}: {len(posted)} ok, {len(failed)} failed"
+    )
+
+
+# ------------------------------------------------------------- who has the bot started
+#
+# The /vote panel's "👥 Кто активировал бота", the "📬 Всем в личку" mailing and the
+# check that fills the list (bot_users.py keeps it). The mailing and the check are long
+# runs at Telegram's pace, so they go to background tasks, one at a time: two at once
+# would share the same flood limit and both crawl.
+
+BOT_USERS_JOB_BUSY_TEXT = "Уже идёт рассылка или проверка -- дождись, пока она закончится."
+_BOT_USERS_JOBS: set[str] = set()
+
+
+def _ru_people(count: int) -> str:
+    """Dative, after a number: "1 человеку", "5 людям"."""
+    return "человеку" if count % 10 == 1 and count % 100 != 11 else "людям"
+
+
+async def _note_bot_user(user: dict | None, log=print) -> None:
+    """Somebody did something in the bot's DM, so they have it started. Answered from
+    memory when nothing is new -- the common case, every message after the first of the
+    day -- and only otherwise handed to a thread, since that is a disk write. Never
+    raises: the list is a side note to whatever they actually came to do."""
+    if not user or user.get("is_bot") or user.get("id") is None:
+        return
+    registry = bot_users.registry()
+    if registry.is_current(user):
+        return
+    try:
+        await asyncio.to_thread(registry.note_seen, user)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not note {user.get('id')}: {e}")
+
+
+async def _note_bot_member_update(update: dict, log=print) -> None:
+    """A my_chat_member update: in a DM, somebody blocking or unblocking the bot."""
+    try:
+        status = await asyncio.to_thread(bot_users.registry().note_member_update, update)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not note a block/unblock: {e}")
+        return
+    if status:
+        user = update.get("from") or {}
+        log(f"[bot_users] {user.get('username') or user.get('id')} is now {status}")
+
+
+async def _bot_users_active_count(log=print) -> int:
+    try:
+        return (await asyncio.to_thread(bot_users.registry().counts))[bot_users.ACTIVE]
+    except Exception as e:  # noqa: BLE001 -- a count on a button is never worth failing over
+        log(f"[bot_users] could not count the list: {e}")
+        return 0
+
+
+def _start_bot_users_job(background_tasks: set, make_job) -> bool:
+    """Start `make_job()` as a background task unless a mailing or a check is already
+    running. Returns whether it started. `make_job` is a factory, so a refused job never
+    creates a coroutine that is then left unawaited."""
+    if "mailing" in _BOT_USERS_JOBS:
+        return False
+    _BOT_USERS_JOBS.add("mailing")
+
+    async def run():
+        try:
+            await make_job()
+        finally:
+            _BOT_USERS_JOBS.discard("mailing")
+
+    task = asyncio.create_task(run())
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return True
+
+
+def _announce_dm_button(cfg, system: str) -> dict | None:
+    """The announcement's one button in a DM: the page itself, as a web_app button --
+    which a private chat allows and a group does not (see _announce_button)."""
+    if system == "arena":
+        url = _arena_page_url(cfg)
+        return {"text": ARENA_OPEN_BUTTON_TEXT, "web_app": {"url": url}} if url else None
+    url = _vote_page_url(cfg)
+    return {"text": VOTE_OPEN_BUTTON_TEXT, "web_app": {"url": url}} if url else None
+
+
+def _bot_users_progress(api: TelegramBotAPI, chat_id, message_id, label: str, every: int = 25, log=print):
+    """A deliver() progress callback that rewrites one status message every `every`
+    people -- not after each, which would be an edit per send and half the flood limit."""
+    async def progress(done: int, total: int) -> None:
+        if message_id is None or done == total or done % every:
+            return
+        try:
+            await api.edit_message_text(chat_id, message_id, f"{label}: {done} из {total}…")
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_users] could not update the progress message: {e}")
+    return progress
+
+
+async def _finish_status(api: TelegramBotAPI, chat_id, message_id, text: str, reply_markup=None,
+                         log=print) -> None:
+    """The final word of a run: in place of the progress message, or as a new one."""
+    try:
+        if message_id is not None:
+            await api.edit_message_text(chat_id, message_id, text, reply_markup=reply_markup)
+        else:
+            await api.send_message(chat_id, text, parse_mode=None, reply_markup=reply_markup)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not report the result: {e}")
+
+
+async def _mail_bot_users(api: TelegramBotAPI, dm_chat_id, text: str, reply_markup: dict,
+                          log=print) -> "bot_users.Delivery":
+    """Send the announcement to everybody whose bot is started, then write down what came
+    back (who turned out to have blocked it since) in one store write, and report."""
+    registry = bot_users.registry()
+    recipients = [p.user_id for p in await asyncio.to_thread(registry.people, bot_users.ACTIVE)]
+    status = None
+    try:
+        status = await api.send_message(
+            dm_chat_id, f"📬 Рассылаю объявление: 0 из {len(recipients)}…", parse_mode=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not post the mailing's progress message: {e}")
+    status_id = (status or {}).get("message_id")
+
+    async def send(user_id: str) -> None:
+        await api.send_message(int(user_id), text, parse_mode=None, reply_markup=reply_markup)
+
+    result = await bot_users.deliver(
+        recipients, send,
+        progress=_bot_users_progress(api, dm_chat_id, status_id, "📬 Рассылаю объявление", log=log),
+    )
+    try:
+        await asyncio.to_thread(registry.record_outcomes, result.outcomes)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not record the mailing's outcomes: {e}")
+
+    lines = [f"📬 Рассылка закончена: доставлено {result.delivered} из {result.total}."]
+    blocked = result.count(bot_users.BLOCKED)
+    gone = result.count(bot_users.GONE)
+    never = result.count(bot_users.NEVER)
+    if blocked:
+        lines.append(f"⛔ Заблокировали бота: {blocked} -- теперь они в списке заблокировавших.")
+    if gone:
+        lines.append(f"🗑 Удалили аккаунт: {gone}.")
+    if never:
+        lines.append(f"Бот у них больше не запущен: {never} -- убраны из списка.")
+    if result.errors:
+        example = next(iter(result.errors.values()))
+        lines.append(f"Не дошло по другой причине: {len(result.errors)} (например: {example}).")
+    await _finish_status(api, dm_chat_id, status_id, "\n".join(lines), log=log)
+    log(
+        f"[bot_users] mailing: {result.delivered}/{result.total} delivered, {blocked} blocked, "
+        f"{gone} gone, {never} never started, {len(result.errors)} other errors"
+    )
+    return result
+
+
+def _bot_user_candidates(entry: str, log=print) -> dict[str, dict]:
+    """Everybody the bot could have a DM with, as {user_id: {"name", "username"}}: whoever
+    it has seen in the chat (the stats), whoever voted, and whoever is on the list already.
+    Blocking -- reads every recorded day -- so it runs in a worker thread."""
+    people: dict[str, dict] = {}
+    try:
+        for key, person in stats.aggregate_all_time(entry).items():
+            user_id = str(getattr(person, "user_id", None) or key)
+            if not user_id.isdigit():
+                continue
+            name = getattr(person, "display_name", "") or ""
+            people[user_id] = {
+                "name": "" if name == "Unknown" else name,
+                "username": getattr(person, "username", "") or "",
+            }
+    except Exception as e:  # noqa: BLE001 -- the other sources still count
+        log(f"[bot_users] could not read the chat's members from the stats: {e}")
+    try:
+        for week in voting.weekly_vote_records(entry):
+            for user_id in week.get("voter_ids") or ():
+                if str(user_id).isdigit():
+                    people.setdefault(str(user_id), {})
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not read the voters: {e}")
+    for person in bot_users.registry().people():
+        people.setdefault(person.user_id, {})
+    return people
+
+
+async def _check_bot_users(api: TelegramBotAPI, chat_id, user_id, entry: str, log=print) -> None:
+    """"🔍 Проверить всех из чата": asks Telegram, person by person, whether the bot may
+    write to them. sendChatAction is the question -- it sends nothing, fails for anybody
+    who never pressed Start or has blocked the bot, and says which of the two. The one
+    trace it leaves is a second of "печатает…" in the DM of someone who has the bot."""
+    status = None
+    try:
+        status = await api.send_message(
+            chat_id, "🔍 Собираю всех, кого бот видел в чате и в голосованиях…", parse_mode=None,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not post the check's progress message: {e}")
+    status_id = (status or {}).get("message_id")
+
+    candidates = await asyncio.to_thread(_bot_user_candidates, entry, log)
+
+    async def ask(candidate_id: str) -> None:
+        await api.send_chat_action(int(candidate_id), "typing")
+
+    result = await bot_users.deliver(
+        candidates, ask,
+        progress=_bot_users_progress(api, chat_id, status_id, "🔍 Проверяю", log=log),
+    )
+    registry = bot_users.registry()
+    try:
+        await asyncio.to_thread(registry.record_outcomes, result.outcomes, candidates, True)
+        counts = await asyncio.to_thread(registry.counts)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not record the check: {e}")
+        counts = {s: result.count(s) for s in bot_users.STATUSES}
+    lines = [
+        f"🔍 Проверка закончена: проверено {result.total}.",
+        f"✅ Бот запущен: {counts[bot_users.ACTIVE]}",
+        f"⛔ Заблокировали: {counts[bot_users.BLOCKED]}",
+    ]
+    if counts[bot_users.GONE]:
+        lines.append(f"🗑 Удалили аккаунт: {counts[bot_users.GONE]}")
+    lines.append(f"Не запускали бота: {result.count(bot_users.NEVER)}")
+    if result.errors:
+        lines.append(f"Не удалось проверить: {len(result.errors)} -- их статус не менялся.")
+    await _finish_status(
+        api, chat_id, status_id, "\n".join(lines),
+        reply_markup={"inline_keyboard": [[{
+            "text": "👥 Показать список",
+            "callback_data": _vote_action_callback_data("people", chat_id, user_id),
+        }]]},
+        log=log,
+    )
+    log(f"[bot_users] check: {result.total} asked, {counts}")
+
+
+def _bot_users_list_text(people: list, checked_at, tz, with_ids: bool = False) -> tuple[str, str]:
+    """(the counts on their own, the counts followed by everybody by name)."""
+    groups = [
+        ("✅ Бот запущен", [p for p in people if p.status == bot_users.ACTIVE]),
+        ("⛔ Заблокировали", [p for p in people if p.status == bot_users.BLOCKED]),
+        ("🗑 Удалили аккаунт", [p for p in people if p.status == bot_users.GONE]),
+    ]
+    head = ["👥 Кто активировал бота", ""]
+    head += [f"{title}: {len(rows)}" for title, rows in groups if rows or title.startswith(("✅", "⛔"))]
+    head.append("")
+    if checked_at is not None:
+        when = checked_at.astimezone(tz) if tz is not None else checked_at
+        head.append(f"Последняя проверка: {when.strftime('%d.%m.%Y %H:%M')}.")
+    else:
+        head.append(
+            "Проверки ещё не было: здесь только те, кто писал боту или жал его кнопки после "
+            "обновления. «🔍 Проверить всех из чата» найдёт и тех, кто запускал бота раньше."
+        )
+    head.append("🔕 Кто замьютил бота -- Telegram боту не сообщает, это узнать нельзя.")
+    sections = []
+    for title, rows in groups:
+        if rows:
+            sections.append(f"{title} ({len(rows)}):\n" + "\n".join(
+                f"{index}. {p.label()}" + (f" -- id {p.user_id}" if with_ids else "")
+                for index, p in enumerate(rows, 1)
+            ))
+    head_text = "\n".join(head)
+    return head_text, head_text + ("\n\n" + "\n\n".join(sections) if sections else "")
+
+
+async def _send_bot_users_list(api: TelegramBotAPI, chat_id, user_id, tz, reply, log=print) -> None:
+    """The list behind "👥 Кто активировал бота": counts and names in one message, or the
+    counts in a message and everybody in a file once they no longer fit."""
+    registry = bot_users.registry()
+    people, checked_at = await asyncio.to_thread(lambda: (registry.people(), registry.checked_at()))
+    head, full = _bot_users_list_text(people, checked_at, tz)
+    keyboard = {"inline_keyboard": [
+        [{"text": "🔍 Проверить всех из чата",
+          "callback_data": _vote_action_callback_data("check", chat_id, user_id)}],
+        [{"text": "📣 Сделать объявление",
+          "callback_data": _vote_action_callback_data("chat", chat_id, user_id)}],
+    ]}
+    if len(full) <= BOT_USERS_LIST_INLINE_LIMIT:
+        await reply(full, keyboard)
+        return
+    await reply(head + "\n\nВесь список -- в файле ниже.", keyboard)
+    _, with_ids = _bot_users_list_text(people, checked_at, tz, with_ids=True)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "bot_users.txt"
+            await asyncio.to_thread(path.write_text, with_ids, encoding="utf-8")
+            await api.send_document_file(chat_id, path, caption="Кто активировал бота")
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not send the list as a file: {e}")
+        await reply("Не получилось отправить список файлом -- смотри логи.")
+
+
+# ------------------------------------------------------------- a note to the admins
+
+
+def _vote_admins_callback_data(action: str, flow_id: str) -> str:
+    return f"{VOTE_ADMINS_CALLBACK_PREFIX}:{action}:{flow_id}"
+
+
+def _parse_vote_admins_callback(data: str) -> tuple[str, str] | None:
+    parts = (data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[0] != VOTE_ADMINS_CALLBACK_PREFIX
+        or parts[1] not in VOTE_ADMINS_ACTIONS
+        or not parts[2]
+    ):
+        return None
+    return parts[1], parts[2]
+
+
+async def _admin_notice_recipients(api: TelegramBotAPI, admin_chat_id, entry: str | None,
+                                   exclude_id, log=print) -> list[dict]:
+    """Who "/vote админам" reaches, as [{"id", "label"}]: the main chat's administrators
+    (people, not bots) and the members an administrator delegated management to
+    (/badgeadmin) -- the same people _can_manage_chat lets onto this panel -- less the
+    sender, who sees the preview instead."""
+    people: dict[str, str] = {}
+    if admin_chat_id is not None:
+        try:
+            for member in await api.get_chat_administrators(admin_chat_id):
+                user = member.get("user") or {}
+                if user.get("id") is None or user.get("is_bot"):
+                    continue
+                people[str(user["id"])] = bot_users.person_label(
+                    bot_users.display_name(user), user.get("username"), user["id"],
+                )
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] could not list the chat's administrators: {e}")
+    if entry:
+        try:
+            for record in await asyncio.to_thread(stats.list_badge_managers, entry):
+                user_id = str(record.get("user_id") or "")
+                if user_id.isdigit():
+                    people.setdefault(user_id, bot_users.person_label(
+                        record.get("display_name"), record.get("username"), user_id,
+                    ))
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] could not read the delegated managers: {e}")
+    people.pop(str(exclude_id), None)
+    return [{"id": user_id, "label": label} for user_id, label in people.items()]
+
+
+async def _take_admin_notice(api: TelegramBotAPI, message: dict, flow_id: str, flow: dict,
+                             vote_chat_flows: dict[str, dict], log=print) -> None:
+    """The answer to "/vote админам"'s prompt: any message -- text, a picture, a picture
+    with a caption. It is not retyped: the preview, and later every administrator's copy,
+    is copyMessage of the admin's own message, so formatting and picture arrive as they
+    were written. The preview carries Отправить/Отмена and the list of who gets it."""
+    chat_id = message["chat"]["id"]
+    actor = message.get("from") or {}
+    text = (message.get("text") or "").strip()
+
+    async def say(body: str) -> None:
+        try:
+            await api.send_message(chat_id, body, reply_to_message_id=message["message_id"], parse_mode=None)
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] failed to answer the admins' note: {e}")
+
+    if text.lower() in ("/cancel", "отмена"):
+        vote_chat_flows.pop(flow_id, None)
+        await say("Черновик отменён.")
+        return
+    if not await _can_manage_chat(api, flow.get("admin_chat_id"), actor, flow.get("entry")):
+        vote_chat_flows.pop(flow_id, None)
+        return
+    recipients = await _admin_notice_recipients(
+        api, flow.get("admin_chat_id"), flow.get("entry"), actor.get("id"), log=log,
+    )
+    if not recipients:
+        vote_chat_flows.pop(flow_id, None)
+        await say("Некому отправлять: кроме тебя администраторов не нашлось.")
+        return
+    flow.update(
+        source_chat_id=chat_id, source_message_id=message["message_id"],
+        recipients=recipients, created_at=time.monotonic(),
+    )
+    await say(
+        f"Получат админы ({len(recipients)}): "
+        + ", ".join(r["label"] for r in recipients)
+        + ".\nВот как это будет выглядеть:"
+    )
+    try:
+        preview = await api.copy_message(
+            chat_id, chat_id, message["message_id"],
+            reply_markup={"inline_keyboard": [[
+                {"text": f"✅ Отправить ({len(recipients)})",
+                 "callback_data": _vote_admins_callback_data("send", flow_id)},
+                {"text": "Отмена", "callback_data": _vote_admins_callback_data("cancel", flow_id)},
+            ]]},
+        )
+    except Exception as e:  # noqa: BLE001
+        vote_chat_flows.pop(flow_id, None)
+        log(f"[bot_listener] could not preview the admins' note: {e}")
+        await say("Такое сообщение не получится переслать -- пришли текст или картинку. Начни заново: /vote админам")
+        return
+    flow["preview_message_id"] = (preview or {}).get("message_id")
+    log(f"[bot_listener] {actor.get('username') or actor.get('id')} drafted a note to {len(recipients)} admins")
+
+
+async def handle_vote_admins_callback(api: TelegramBotAPI, callback: dict,
+                                      vote_chat_flows: dict[str, dict], log=print) -> None:
+    """Отправить/Отмена under the preview of "/vote админам". A handful of people, so the
+    copies go out right here rather than in the background; each one that does not arrive
+    is named in the report with the reason -- most often that admin never pressed Start."""
+    parsed = _parse_vote_admins_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, flow_id = parsed
+    flow = vote_chat_flows.get(flow_id)
+    if (
+        flow is None
+        or flow.get("system") != ADMIN_NOTICE_SYSTEM
+        or "source_message_id" not in flow
+        or time.monotonic() - flow["created_at"] > VOTE_CHAT_FLOW_TTL_SECONDS
+    ):
+        if flow is not None and flow.get("system") == ADMIN_NOTICE_SYSTEM:
+            vote_chat_flows.pop(flow_id, None)
+        await api.answer_callback_query(callback["id"], text="Черновик устарел -- начни заново: /vote админам")
+        return
+    clicker = callback.get("from") or {}
+    if clicker.get("id") != flow.get("user_id"):
+        await api.answer_callback_query(callback["id"], text="Эта кнопка не для тебя.")
+        return
+    await api.answer_callback_query(callback["id"])
+    vote_chat_flows.pop(flow_id, None)
+    dm_chat_id = flow["chat_id"]
+    if flow.get("preview_message_id") is not None:
+        try:
+            # The buttons go, so the preview cannot be sent twice.
+            await api.edit_message_reply_markup(dm_chat_id, flow["preview_message_id"], None)
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] could not take the preview's buttons away: {e}")
+
+    async def report(text: str) -> None:
+        try:
+            await api.send_message(dm_chat_id, text, parse_mode=None)
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] failed to report the admins' note: {e}")
+
+    if action == "cancel":
+        await report("Не отправлено.")
+        return
+    if not await _can_manage_chat(api, flow.get("admin_chat_id"), clicker, flow.get("entry")):
+        await report("Писать админам через бота могут только администраторы.")
+        return
+
+    recipients = flow.get("recipients") or []
+    labels = {r["id"]: r["label"] for r in recipients}
+
+    async def send(user_id: str) -> None:
+        await api.copy_message(int(user_id), flow["source_chat_id"], flow["source_message_id"])
+
+    result = await bot_users.deliver([r["id"] for r in recipients], send)
+    try:
+        await asyncio.to_thread(bot_users.registry().record_outcomes, result.outcomes)
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_users] could not record the admins' note outcomes: {e}")
+
+    reasons = {
+        bot_users.NEVER: "не запускал бота -- пусть откроет его и нажмёт Start",
+        bot_users.BLOCKED: "заблокировал бота",
+        bot_users.GONE: "аккаунт удалён",
+    }
+    lines = [f"📢 Отправлено админам: {result.delivered} из {result.total}."]
+    for user_id, outcome in result.outcomes.items():
+        if outcome in reasons:
+            lines.append(f"— {labels.get(user_id, user_id)}: {reasons[outcome]}")
+    for user_id, error in result.errors.items():
+        lines.append(f"— {labels.get(user_id, user_id)}: {error}")
+    await report("\n".join(lines))
+    log(
+        f"[bot_listener] {clicker.get('username') or clicker.get('id')} sent a note to admins: "
+        f"{result.delivered}/{result.total}"
     )
 
 
@@ -13027,9 +13634,15 @@ async def _dispatch_update(
     if member_update is not None:
         await _note_vote_member_update(cfg, member_update, home_chat_ref, known_chat_ids, log=log)
         return
+    my_member_update = update.get("my_chat_member")
+    if my_member_update is not None:
+        await _note_bot_member_update(my_member_update, log=log)
+        return
     callback = update.get("callback_query")
     if callback is not None:
         callback_data = callback.get("data") or ""
+        if ((callback.get("message") or {}).get("chat") or {}).get("type") == "private":
+            await _note_bot_user(callback.get("from"), log=log)
         if callback_data.startswith(f"{cabinet.CALLBACK_PREFIX}:"):
             await handle_cabinet_callback(
                 api, telethon_client, cfg, tz, callback, home_chat_ref, cabinet_flows,
@@ -13094,7 +13707,10 @@ async def _dispatch_update(
             # choosing a destination never waits on the Telethon session.
             await handle_vote_chat_destination_callback(
                 api, cfg, callback, vote_chat_flows, bot_username, log=log,
+                background_tasks=background_tasks,
             )
+        elif callback_data.startswith(f"{VOTE_ADMINS_CALLBACK_PREFIX}:"):
+            await handle_vote_admins_callback(api, callback, vote_chat_flows, log=log)
         elif callback_data.startswith(f"{PETS_CALLBACK_PREFIX_LITERAL}:"):
             # The pet menu. No chat resolution in the argument list: every button carries
             # its owner's id, and the member lookup happens inside, AFTER the spinner is
@@ -13143,6 +13759,8 @@ async def _dispatch_update(
     message = update.get("message")
     if not message:
         return
+    if (message.get("chat") or {}).get("type") == "private":
+        await _note_bot_user(message.get("from"), log=log)
     message_text = message.get("text") or message.get("caption") or ""
 
     # Learned regardless of whether this message is a trigger -- this is how

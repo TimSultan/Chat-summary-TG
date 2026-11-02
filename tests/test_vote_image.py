@@ -380,6 +380,9 @@ class VoteImageButtonTests(unittest.TestCase):
         "chat": "VOTE_CHAT_WORDS",
         "clear": "VOTE_CLEAR_WORDS",
         "month": "VOTE_MONTH_WORDS",
+        "people": "VOTE_PEOPLE_WORDS",
+        "check": "VOTE_CHECK_WORDS",
+        "admins": "VOTE_ADMINS_WORDS",
     }
 
     def test_every_menu_button_synthesizes_a_command_the_parser_recognizes(self):
