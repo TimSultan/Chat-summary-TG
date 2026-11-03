@@ -885,12 +885,120 @@ class AdminPageTests(_Store, AsyncTestCase):
         self.assertEqual(voting.load_poll(CHAT, "2026-10-gold").approved, ["400"])
         self.assertEqual(len(voting.load_poll(CHAT, "2026-10-bronze").approved), 3)
 
+    async def test_ballot_rules_saved_on_one_round_hold_for_all_three(self):
+        """October 2026: re-voting was switched off on the bronze tab, and silver and gold
+        still let people change their vote. The month's rules are one setting."""
+        week = voting.Poll(poll_id="2026-W45", entry=CHAT, created_at="2026-11-01T09:00:00+00:00",
+                           entries=[_entry(901), _entry(902)])
+        voting.set_approved(week, ["901", "902"])
+        voting.save_poll(week)
+        await self._post("/vote/api/ballot", {"poll_id": "2026-10-gold", "choices": ["400"]}, user_id=2)
+        bronze = [e.entry_id for e in voting.load_poll(CHAT, "2026-10-bronze").entries]
+
+        with patch("voting.save_poll", wraps=voting.save_poll) as save:
+            status, answer = await self._post("/vote/api/moderate", {
+                "poll_id": "2026-10-bronze", "approved": bronze[:2],
+                "max_choices": 1, "allow_revote": False,
+            })
+        self.assertEqual(status, 200)
+        self.assertEqual(answer["rule_polls"], ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
+        # The round on screen plus the two whose setting changed: one write each.
+        self.assertEqual(sorted(call.args[0].poll_id for call in save.call_args_list),
+                         ["2026-10-bronze", "2026-10-gold", "2026-10-silver"])
+        rounds = {p.poll_id: p for p in voting.page_polls(CHAT)}
+        self.assertEqual([rounds[f"2026-10-{k}"].allow_revote for k in ("bronze", "silver", "gold")],
+                         [False, False, False])
+        # Admitting is still the round's own, and the week's vote beside them keeps its rules.
+        self.assertEqual(rounds["2026-10-bronze"].approved, bronze[:2])
+        self.assertEqual(len(rounds["2026-10-silver"].approved), 4)
+        self.assertEqual(len(rounds["2026-10-gold"].votes["2"]), 1)
+        self.assertTrue(voting.load_poll(CHAT, "2026-W45").allow_revote)
+
+        # And it is enforced in a round other than the one it was saved on.
+        status, answer = await self._post("/vote/api/ballot", {"poll_id": "2026-10-gold", "choices": ["410"]},
+                                          user_id=2)
+        self.assertEqual(status, 409)
+        self.assertEqual(voting.load_poll(CHAT, "2026-10-gold").votes["2"], ["400"])
+        status, _ = await self._post("/vote/api/ballot", {"poll_id": "2026-10-silver", "choices": ["401"]},
+                                     user_id=2)
+        self.assertEqual(status, 200)
+        status, _ = await self._post("/vote/api/ballot", {"poll_id": "2026-10-silver", "choices": ["391"]},
+                                     user_id=2)
+        self.assertEqual(status, 409)
+
+        # Saving the same rules again writes only the round on screen.
+        with patch("voting.save_poll", wraps=voting.save_poll) as save:
+            await self._post("/vote/api/moderate", {
+                "poll_id": "2026-10-silver", "approved": list(rounds["2026-10-silver"].approved),
+                "max_choices": 1, "allow_revote": False,
+            })
+        self.assertEqual([call.args[0].poll_id for call in save.call_args_list], ["2026-10-silver"])
+
     async def test_admin_mode_shows_every_rounds_moderation(self):
         response = await self.client.get("/vote/api/poll?mode=admin",
                                          headers={"X-Telegram-Init-Data": _init_data(1)})
         data = await response.json()
         self.assertTrue(all(r["is_admin"] and "approved" in r for r in data["rounds"]))
         self.assertEqual(data["poll_id"], "2026-10-bronze")
+
+
+class AlignRulesTests(_Store, AsyncTestCase):
+    """Rounds saved while each kept its own rules are brought into line at startup."""
+
+    def _rounds(self, month="2026-10", allow=(False, True, True), limits=(1, 1, 1), open_=True):
+        for (key, *_), allow_revote, max_choices in zip(voting.MONTHLY_ROUNDS, allow, limits):
+            voting.save_poll(voting.Poll(
+                poll_id=f"{month}-{key}", entry=CHAT, created_at=f"{month}-28T09:00:00+00:00",
+                entries=[_entry(500)], approved=["500"], open=open_, hashtag=voting.MONTHLY_HASHTAG,
+                allow_revote=allow_revote, max_choices=max_choices,
+            ))
+
+    def _rules(self, month="2026-10"):
+        return [(p.allow_revote, p.max_choices)
+                for p in (voting.load_poll(CHAT, f"{month}-{key}") for key, *_ in voting.MONTHLY_ROUNDS)]
+
+    def test_the_lock_on_one_round_spreads_to_the_month(self):
+        self._rounds()
+        self.assertEqual(voting.align_month_rules(CHAT), ["2026-10-silver", "2026-10-gold"])
+        self.assertEqual(self._rules(), [(False, 1)] * 3)
+        with patch("voting.save_poll") as save:
+            self.assertEqual(voting.align_month_rules(CHAT), [])
+        save.assert_not_called()
+
+    def test_the_lowest_choice_limit_wins_and_unlimited_is_the_loosest(self):
+        self._rounds(allow=(True, True, True), limits=(None, 3, 2))
+        voting.align_month_rules(CHAT)
+        self.assertEqual(self._rules(), [(True, 2)] * 3)
+
+    def test_a_finished_month_and_the_weeks_vote_are_left_alone(self):
+        self._rounds(month="2026-09", open_=False)
+        week = voting.Poll(poll_id="2026-W45", entry=CHAT, created_at="2026-11-01T09:00:00+00:00",
+                           entries=[_entry(901)], approved=["901"], allow_revote=False)
+        voting.save_poll(week)
+        self.assertEqual(voting.align_month_rules(CHAT), [])
+        self.assertEqual(self._rules("2026-09"), [(False, 1), (True, 1), (True, 1)])
+
+    async def test_the_server_aligns_them_before_it_serves(self):
+        self._rounds()
+        serving = asyncio.Event()
+
+        def log(line):
+            if "voting page on port" in line:
+                serving.set()
+
+        async def is_admin(user):
+            return False
+
+        server = asyncio.create_task(vote_web.run_web_server(
+            SimpleNamespace(telegram_bot_token=BOT_TOKEN), CHAT, is_admin, port=0, log=log,
+        ))
+        try:
+            await asyncio.wait_for(serving.wait(), timeout=10)
+            self.assertEqual(self._rules(), [(False, 1)] * 3)
+        finally:
+            server.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await server
 
 
 if __name__ == "__main__":

@@ -449,35 +449,52 @@ async def handle_moderate(request: web.Request) -> web.Response:
     if not await request.app[_IS_ADMIN_KEY](user):
         return _json_error("только администраторы могут допускать работы", status=403)
 
-    entry_name = request.app[_ENTRY_KEY]
-    poll, problem = _requested_poll(entry_name, body, moderating=True)
-    if problem is not None:
-        return problem
-
     approved = body.get("approved")
     if not isinstance(approved, list) or not all(isinstance(a, str) for a in approved):
         return _json_error("approved must be a list of entry ids")
-
     if "max_choices" in body:
         max_choices = body["max_choices"]
         if max_choices is not None and (
             isinstance(max_choices, bool) or not isinstance(max_choices, int) or max_choices < 1
         ):
             return _json_error("max_choices must be a positive integer or null")
-        poll.max_choices = max_choices
-    if "allow_revote" in body:
-        poll.allow_revote = bool(body["allow_revote"])
 
-    voting.set_approved(poll, approved)
-    if "open" in body:
-        poll.open = bool(body["open"])
-    voting.save_poll(poll)
+    entry_name = request.app[_ENTRY_KEY]
+    # Under the poll lock, like a ballot: a month's rounds are also rebuilt from a worker
+    # thread holding it (vote_monthly.create_rounds), and this writes up to three of them.
+    async with voting.poll_lock:
+        poll, problem = _requested_poll(entry_name, body, moderating=True)
+        if problem is not None:
+            return problem
+        # A month's rounds share one set of ballot rules, so the settings saved on any of
+        # its tabs go into all three (voting.ballot_rule_polls). Admitting and closing stay
+        # per round.
+        ruled = (voting.ballot_rule_polls(entry_name, poll)
+                 if "max_choices" in body or "allow_revote" in body else [poll])
+        others_changed = []
+        for target in ruled:
+            before = (target.max_choices, target.allow_revote)
+            if "max_choices" in body:
+                target.max_choices = body["max_choices"]
+            if "allow_revote" in body:
+                target.allow_revote = bool(body["allow_revote"])
+            if target is not poll and (target.max_choices, target.allow_revote) != before:
+                others_changed.append(target)
+
+        voting.set_approved(poll, approved)
+        if "open" in body:
+            poll.open = bool(body["open"])
+        voting.save_poll(poll)
+        for target in others_changed:
+            voting.save_poll(target)
     request.app[_LOG_KEY](
         f"[vote_web] {voting.display_name(user)} admitted {len(poll.approved)}/{len(poll.entries)} entries"
     )
     return web.json_response({
         "ok": True, "approved": poll.approved, "open": poll.open,
         "max_choices": poll.max_choices, "allow_revote": poll.allow_revote,
+        # Every tab the settings now hold for, so the page updates them all.
+        "rule_polls": [target.poll_id for target in ruled],
     })
 
 
@@ -948,6 +965,15 @@ async def run_web_server(
     eligibility=None,
 ) -> None:
     """Serves until cancelled, as a sibling task of the two listeners."""
+    # Before the first request: a month's rounds saved while each kept its own ballot
+    # rules get the month's strictest (voting.align_month_rules). Never fatal -- /vote
+    # still has to come up.
+    try:
+        aligned = await asyncio.to_thread(voting.align_month_rules, entry)
+        if aligned:
+            log(f"[vote_web] ballot rules aligned across the month's rounds: {', '.join(aligned)}")
+    except Exception as e:  # noqa: BLE001
+        log(f"[vote_web] could not align the month's ballot rules: {e}")
     app = create_app(
         cfg, entry, is_admin, announce=announce, log=log, is_member=is_member,
         eligibility=eligibility, is_stats_admin=is_stats_admin, export=export,
@@ -961,8 +987,6 @@ async def run_web_server(
     try:
         # Nothing else to do: aiohttp serves from the runner's own tasks. Sleeping
         # forever keeps the runner alive and gives cancellation somewhere to land.
-        import asyncio
-
         await asyncio.Event().wait()
     finally:
         await runner.cleanup()
@@ -1144,6 +1168,7 @@ PAGE_HTML = """<!doctype html>
               border: 1px solid rgba(128,128,128,.4); background: var(--bg);
               color: var(--fg); padding: 4px; font-size: 13px; }
   .settings input[type="checkbox"] { width: 18px; height: 18px; }
+  .settings .note { color: var(--muted); font-size: 12px; padding-top: 2px; }
   /* Stands in when the vote controls are replaced with a sentence: a locked ballot, a
      closed poll, or a voter who may not vote (yet) -- see can_vote. */
   .notice { padding: 10px 12px; margin: 0 12px 4px; border-radius: 10px;
@@ -1265,7 +1290,7 @@ PAGE_HTML = """<!doctype html>
 <div class="doneCard" id="doneCard" hidden>
   <div class="big">🥉 🥈 🥇</div>
   <b id="doneTitle">Готово — ты проголосовал во всех раундах!</b>
-  <span>Спасибо. Передумаешь — выбери другую работу, пока голосование открыто.</span>
+  <span id="doneNote">Спасибо. Передумаешь — выбери другую работу, пока голосование открыто.</span>
 </div>
 <div class="confirmBanner" id="confirmBanner" hidden>Голос принят</div>
 <div class="winner" id="winnerBanner" hidden></div>
@@ -1278,6 +1303,7 @@ PAGE_HTML = """<!doctype html>
     <span>Разрешить менять голос</span>
     <input type="checkbox" id="allowRevote">
   </div>
+  <div class="note" id="settingsNote" hidden>Эти две настройки общие для всех раундов месяца.</div>
 </div>
 <div class="notice" id="notice" hidden></div>
 <div class="grid" id="grid"></div>
@@ -1929,6 +1955,13 @@ function renderRounds() {
                            rounds.some((r) => r.open && hasVoted(r)));
   $("doneTitle").textContent = "Готово — ты проголосовал во всех " +
     (rounds.every((r) => r.round) ? "раундах!" : "голосованиях!");
+  // Only promise a change of mind where one is still allowed.
+  const cast = rounds.filter((r) => r.open && hasVoted(r));
+  const locked = cast.filter((r) => r.allow_revote === false).length;
+  $("doneNote").textContent =
+    !locked ? "Спасибо. Передумаешь — выбери другую работу, пока голосование открыто."
+    : locked === cast.length ? "Спасибо. Голоса зафиксированы — изменить их уже нельзя."
+    : "Спасибо, голоса приняты.";
   if (!many) return;
   box.style.gridTemplateColumns = "repeat(" + rounds.length + ", minmax(0, 1fr))";
   box.innerHTML = rounds.map((r) => {
@@ -1978,6 +2011,7 @@ function selectRound(id, options = {}) {
   if (poll.is_admin) {
     $("maxChoices").value = poll.max_choices || "";
     $("allowRevote").checked = poll.allow_revote !== false;
+    $("settingsNote").hidden = !poll.round;
   }
   if (!options.keepBanner) $("confirmBanner").hidden = true;
   renderRounds();
@@ -2452,8 +2486,13 @@ async function saveModeration() {
     const response = await api("/api/moderate", { method: "POST", body: JSON.stringify(body) });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "не получилось");
-    poll.max_choices = data.max_choices;
-    poll.allow_revote = data.allow_revote;
+    // A month's rounds share their rules: the server saved them into every round listed.
+    const ruled = data.rule_polls || [poll.poll_id];
+    for (const r of rounds.length ? rounds : [poll]) {
+      if (r !== poll && !ruled.includes(r.poll_id)) continue;
+      r.max_choices = data.max_choices;
+      r.allow_revote = data.allow_revote;
+    }
     go.textContent = "Сохранено";
     if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
     // Deferred, not immediate: render() would otherwise overwrite this confirmation text
@@ -2616,6 +2655,7 @@ $("clear").addEventListener("click", async () => {
     if (poll.is_admin) {
       $("maxChoices").value = poll.max_choices || "";
       $("allowRevote").checked = poll.allow_revote !== false;
+      $("settingsNote").hidden = !poll.round;
     }
     renderRounds();
     renderSub();

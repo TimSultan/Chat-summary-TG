@@ -1109,7 +1109,12 @@ page that changes shape depending on who opens it:
   the weeks with their medallists as tick buttons, and only "🏅 Создать голосования"
   writes anything (`/vote месяц 10.2026` opens a given month). Every work is admitted, the
   vote is open and takes **one choice**, as the channel's own monthly polls did (the
-  moderation screen can change both). **All three are on the page at once**
+  moderation screen can change both). The two ballot settings (`max_choices`,
+  `allow_revote`) are **the month's, not the round's**: saving them on any round's tab
+  writes them into all three (`voting.ballot_rule_polls`), and at startup a month whose
+  open rounds disagree gets its strictest settings in every round (`voting.align_month_rules`)
+  -- before this, turning re-voting off on the bronze tab left silver and gold open to it.
+  Admitting and closing stay per round. **All three are on the page at once**
   (`voting.page_polls`): three tabs, 🥉 Бронза · 🥈 Серебро · 🥇 Золото, each in its
   medal's colour, which the page's accent takes on while that round is open. The Mini App
   gets every round in one `/api/poll` response, so switching is instant; a first vote in a
