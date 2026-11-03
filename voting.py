@@ -1004,6 +1004,52 @@ def _round_month(poll: Poll) -> str | None:
     return match.group(1) if match else None
 
 
+def ballot_rule_polls(entry: str, poll: Poll) -> list[Poll]:
+    """The polls whose ballot rules (`max_choices`, `allow_revote`) are `poll`'s own: every
+    round of its month on disk when it is a monthly round -- `poll` itself, the very object
+    passed in, among them -- and just [poll] for anything else.
+
+    A month's three rounds are one vote to the voter, gone through on one page, so they
+    keep one set of rules. The moderation screen used to save them into the round on
+    screen only, and October 2026's bronze round was locked while its silver and gold
+    still let people change their vote."""
+    month = _round_month(poll)
+    if month is None:
+        return [poll]
+    polls = []
+    for key, *_ in MONTHLY_ROUNDS:
+        poll_id = f"{month}-{key}"
+        other = poll if poll_id == poll.poll_id else load_poll(entry, poll_id)
+        if other is not None and other.is_monthly:
+            polls.append(other)
+    return polls
+
+
+def align_month_rules(entry: str) -> list[str]:
+    """Gives every month that still has an open round the same ballot rules in all of its
+    rounds, the strictest one there: changing a vote is allowed only if every round allows
+    it, and the lowest choice limit wins. Returns the ids of the rounds it changed.
+
+    Rounds made before the rules were shared (see ballot_rule_polls) can disagree, and a
+    round's lock is an administrator's deliberate choice, so the lock is what spreads.
+    Run once at startup; a month that already agrees is not written."""
+    polls = _all_polls(entry)
+    changed = []
+    for month in sorted({m for m in map(_round_month, polls) if m}):
+        rounds = _month_rounds(polls, month)
+        if not any(poll.open for poll in rounds):
+            continue
+        allow_revote = all(poll.allow_revote for poll in rounds)
+        limits = [poll.max_choices for poll in rounds if poll.max_choices]
+        max_choices = min(limits) if limits else None
+        for poll in rounds:
+            if (poll.allow_revote, poll.max_choices) != (allow_revote, max_choices):
+                poll.allow_revote, poll.max_choices = allow_revote, max_choices
+                save_poll(poll)
+                changed.append(poll.poll_id)
+    return changed
+
+
 def page_polls(entry: str, include_pending: bool = False) -> list[Poll]:
     """Every poll the voting page shows at once, in the order it lists them (one tab each).
 
