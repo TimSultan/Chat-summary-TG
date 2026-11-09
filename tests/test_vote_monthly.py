@@ -616,27 +616,62 @@ class CommandTests(_Store):
         self.assertIn("🥇 золото: голосование уже закрыто", text)
         self.assertEqual(voting.load_poll(CHAT, "2026-10-bronze").votes, {})
 
-    def test_the_picture_command_draws_every_round(self):
-        self._rounds()
-        drawn, sent = [], []
-
-        def render(poll, path, **kwargs):
-            drawn.append(poll.poll_id)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(b"jpeg")
-            return path
+    def _picture_command(self, render_month=None, render_poll=None):
+        sent = []
 
         async def send_document_file(chat_id, path, caption=None, reply_to_message_id=None):
-            sent.append(caption)
+            sent.append((Path(path), caption))
 
         api = FakeApi()
         api.send_document_file = send_document_file
         message = {"message_id": 1, "chat": {"id": DM, "type": "private"}, "from": ADMIN, "text": "/vote картинка"}
-        with patch.object(bot_listener.vote_image, "render_poll_image", render):
-            self._run(lambda tasks: bot_listener.handle_vote_command(
-                api, None, _cfg(), UTC, message, CHAT, "testbot", tasks, log=lambda *_: None))
-        self.assertEqual(drawn, ["2026-10-bronze", "2026-10-silver", "2026-10-gold"])
-        self.assertTrue(sent[0].startswith("🥉 бронза: "))
+        patches = []
+        if render_month is not None:
+            patches.append(patch.object(bot_listener.vote_image, "render_month_image", render_month))
+        if render_poll is not None:
+            patches.append(patch.object(bot_listener.vote_image, "render_poll_image", render_poll))
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self._run(lambda tasks: bot_listener.handle_vote_command(
+            api, None, _cfg(), UTC, message, CHAT, "testbot", tasks, log=lambda *_: None))
+        return sent
+
+    def test_the_picture_command_draws_the_whole_month_as_one_picture(self):
+        """Three rounds, one contest: one file, not three."""
+        self._rounds()
+        drawn = []
+
+        def render_month(polls, path, **kwargs):
+            drawn.append([poll.poll_id for poll in polls])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"jpeg")
+            return path
+
+        def render_poll(poll, path, **kwargs):
+            self.fail("a round must not be drawn on its own")
+
+        sent = self._picture_command(render_month, render_poll)
+        self.assertEqual(drawn, [["2026-10-bronze", "2026-10-silver", "2026-10-gold"]])
+        self.assertEqual(len(sent), 1)
+        self.assertIn("🥉 бронза, 🥈 серебро, 🥇 золото", sent[0][1])
+
+    def test_the_month_picture_is_drawn_for_real_with_a_section_per_round(self):
+        self._rounds()
+        sections = []
+        original = bot_listener.vote_image.render_sections_image
+
+        def spy(sections_, *args, **kwargs):
+            sections.extend(sections_)
+            return original(sections_, *args, **kwargs)
+
+        with patch.object(bot_listener.vote_image, "render_sections_image", spy):
+            [(path, _)] = self._picture_command()
+        self.assertEqual([section.heading for section in sections], ["Бронза", "Серебро", "Золото"])
+        self.assertTrue(path.exists())
+        from PIL import Image
+        with Image.open(path) as image:
+            self.assertEqual(image.width, bot_listener.vote_image.WIDTH)
 
     def test_each_closed_round_keeps_its_own_results_draft(self):
         """Closing bronze and then silver must not take the bronze draft's buttons away."""

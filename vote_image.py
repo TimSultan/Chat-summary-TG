@@ -24,6 +24,7 @@ and bot_listener.py's business respectively.
 import math
 import os
 import unicodedata
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -433,17 +434,29 @@ def render_standings_image(
     if header_height:
         y = MARGIN + header_height
 
+    _paste_grid(canvas, standings, media_dir, show_votes, crops, columns, y)
+    return _save(canvas, out_path)
+
+
+def _grid_height(count: int, columns: int) -> int:
+    rows = max(1, math.ceil(count / columns))
+    return rows * CARD_HEIGHT + (rows - 1) * GAP
+
+
+def _paste_grid(canvas, standings, media_dir: Path, show_votes: bool, crops, columns: int, top: int) -> None:
+    """The cards of `standings`, `columns` to a row, the first row's top at `top`."""
     crops = crops or {}
     mask = _rounded_mask()
     for index, (entry, votes) in enumerate(standings):
         column, row = index % columns, index // columns
         x = MARGIN + column * (CARD_WIDTH + GAP)
-        top = y + row * (CARD_HEIGHT + GAP)
         card = _draw_card(entry, votes, media_dir, show_votes, crops.get(entry.entry_id))
-        canvas.paste(card, (x, top), mask)
+        canvas.paste(card, (x, top + row * (CARD_HEIGHT + GAP)), mask)
 
+
+def _save(canvas, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.suffix.lower() in (".jpg", ".jpeg") and height > _JPEG_MAX_SIDE:
+    if out_path.suffix.lower() in (".jpg", ".jpeg") and canvas.height > _JPEG_MAX_SIDE:
         out_path = out_path.with_suffix(".png")
     if out_path.suffix.lower() in (".jpg", ".jpeg"):
         canvas.save(out_path, "JPEG", quality=92, optimize=True, progressive=True)
@@ -471,3 +484,143 @@ def render_poll_image(
         crops=poll.crops,
         columns=columns,
     )
+
+
+# ------------------------------------------------------------- the month's rounds at once
+#
+# The month's bronze, silver and gold rounds are three polls, but one contest: they are
+# exported as ONE picture -- the month's title, then each round under a heading of its own
+# medal's colour, its works ranked as on its tab of the page.
+
+MEDAL_COLOURS = {3: "#cd7f32", 2: "#c0c6cc", 1: "#f2c230"}
+MEDAL_FG = "#17212b"
+SECTION_SIZE = 28
+SECTION_GAP = 56          # between one round's last row and the next round's heading
+SECTION_HEADING_GAP = 18  # between a heading and its first row
+_PILL_PAD_X, _PILL_PAD_Y = 18, 9
+
+
+@dataclass
+class Section:
+    """One round of a combined picture: its heading, the line beside it, and its board."""
+    heading: str
+    note: str
+    standings: list
+    media_dir: Path
+    crops: dict | None = None
+    colour: str = ACCENT
+
+
+def _section_heading_height(probe, section_font) -> int:
+    return _text_size(probe, "Бр", section_font)[1] + 2 * _PILL_PAD_Y
+
+
+def render_sections_image(
+    sections, out_path, title: str = "", subtitle: str = "", columns: int = COLUMNS,
+    show_votes: bool = True,
+) -> Path:
+    """Several boards stacked in one picture, each under a coloured heading -- the month's
+    rounds (render_month_image). A round with nothing admitted says so under its heading
+    rather than being left out: three medals are promised, and a missing one would read as
+    a mistake. Raises ValueError when no section has anything to draw."""
+    sections = list(sections)
+    if not any(section.standings for section in sections):
+        raise ValueError("nothing to render -- no admitted entries in any section")
+    columns = clamp_columns(columns)
+    out_path = Path(out_path)
+    width = width_for(columns)
+
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    title_font, subtitle_font = _font(TITLE_SIZE, bold=True), _font(SUBTITLE_SIZE)
+    section_font, note_font = _font(SECTION_SIZE, bold=True), _font(SUBTITLE_SIZE)
+    if title:
+        title = _ellipsize(probe, title, title_font, width - 2 * MARGIN)
+    title_height = _text_size(probe, title, title_font)[1] if title else 0
+    subtitle_height = _text_size(probe, subtitle, subtitle_font)[1] if subtitle else 0
+    heading_height = _section_heading_height(probe, section_font)
+    empty_height = _text_size(probe, "Нет", note_font)[1] + 8
+
+    height = MARGIN
+    if title:
+        height += title_height + 14
+    if subtitle:
+        height += subtitle_height + 10
+    if title or subtitle:
+        height += 14 + SECTION_GAP // 2
+    for index, section in enumerate(sections):
+        if index:
+            height += SECTION_GAP
+        height += heading_height + SECTION_HEADING_GAP
+        height += _grid_height(len(section.standings), columns) if section.standings else empty_height
+    height += MARGIN
+
+    canvas = Image.new("RGB", (width, height), BG)
+    draw = ImageDraw.Draw(canvas)
+    y = MARGIN
+    if title:
+        draw.text((MARGIN, y), title, font=title_font, fill=FG)
+        y += title_height + 14
+    if subtitle:
+        draw.text((MARGIN, y), subtitle, font=subtitle_font, fill=MUTED)
+        y += subtitle_height + 10
+    if title or subtitle:
+        y += 14 + SECTION_GAP // 2
+
+    for index, section in enumerate(sections):
+        if index:
+            y += SECTION_GAP
+        heading = legible(section.heading, SECTION_SIZE, bold=True) or section.heading
+        heading_width = _text_size(draw, heading, section_font)[0]
+        pill = [MARGIN, y, MARGIN + heading_width + 2 * _PILL_PAD_X, y + heading_height]
+        draw.rounded_rectangle(pill, radius=heading_height // 2, fill=section.colour)
+        draw.text((MARGIN + _PILL_PAD_X, y + _PILL_PAD_Y - 3), heading, font=section_font, fill=MEDAL_FG)
+        if section.note:
+            note_x = pill[2] + 18
+            note = _ellipsize(draw, legible(section.note, SUBTITLE_SIZE), note_font, width - MARGIN - note_x)
+            note_height = _text_size(draw, note, note_font)[1]
+            draw.text((note_x, y + (heading_height - note_height) // 2 - 3), note, font=note_font, fill=MUTED)
+        y += heading_height + SECTION_HEADING_GAP
+        if section.standings:
+            _paste_grid(canvas, section.standings, Path(section.media_dir), show_votes,
+                        section.crops, columns, y)
+            y += _grid_height(len(section.standings), columns)
+        else:
+            draw.text((MARGIN, y), "Ни одной допущенной работы.", font=note_font, fill=MUTED)
+            y += empty_height
+    return _save(canvas, out_path)
+
+
+def poll_note(poll, standings=None) -> str:
+    """"проголосовало 12 · работ 9 · закрыто" -- the line beside a round's heading."""
+    standings = poll.tally() if standings is None else standings
+    return (
+        f"проголосовало {len(poll.votes)} · работ {len(standings)} · "
+        f"{'открыто' if poll.open else 'закрыто'}"
+    )
+
+
+def render_month_image(polls, out_path, title: str | None = None, subtitle: str | None = None,
+                       columns: int = COLUMNS) -> Path:
+    """The month's rounds (voting.page_polls' monthly polls, bronze first) as one picture,
+    each round's admitted works ranked by its own tally()."""
+    polls = list(polls)
+    sections = []
+    for poll in polls:
+        standings = poll.tally()
+        name = poll.round[2] if poll.round else poll.label()
+        sections.append(Section(
+            heading=name[:1].upper() + name[1:],
+            note=poll_note(poll, standings),
+            standings=standings,
+            media_dir=voting.media_path(poll.entry, poll.poll_id),
+            crops=poll.crops,
+            colour=MEDAL_COLOURS.get(poll.round[1] if poll.round else poll.tier, ACCENT),
+        ))
+    if title is None:
+        title = polls[0].group_label() if polls else ""
+    if subtitle is None:
+        voters = set()
+        for poll in polls:
+            voters.update(poll.votes)
+        subtitle = f"Раундов: {len(polls)} · проголосовало: {len(voters)} чел."
+    return render_sections_image(sections, out_path, title=title, subtitle=subtitle, columns=columns)

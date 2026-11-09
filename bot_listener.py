@@ -89,6 +89,7 @@ import post_stats_web
 import preview
 import stats
 import summary_share
+import tg_markdown
 import tripo
 import via_cleaner
 import vote_audit
@@ -6607,6 +6608,154 @@ def _announce_button(cfg, bot_username: str | None, system: str) -> dict | None:
     return {"text": VOTE_OPEN_BUTTON_TEXT, "url": url} if url else None
 
 
+# An announcement is what the admin replied with: text with its formatting (and typed
+# Markdown, see tg_markdown), a picture with a caption, or an album. An album reaches the
+# bot as one message per picture, so the first one waits this long for the rest before
+# the preview is drawn -- a background task's wait, never the update loop's.
+ANNOUNCE_ALBUM_SETTLE_SECONDS = 1.5
+ANNOUNCE_MAX_PHOTOS = 10  # Telegram's own limit for one album
+# An album carries no buttons, so the text and the button follow it as their own message;
+# an album with no text at all still needs a line for the button to sit under.
+_ANNOUNCE_ALBUM_TEXT = {"vote": "🗳 Голосуем!", "arena": "⚔️ На арену!"}
+# Album waits started without a caller's background_tasks set: kept referenced here so
+# the event loop does not collect them half-way.
+_ANNOUNCE_TASKS: set = set()
+
+
+def _announce_restart_hint(system: str | None) -> str:
+    return "/vote2 chat" if system == "arena" else "/vote chat"
+
+
+def _largest_photo_id(message: dict) -> str | None:
+    """The file_id of a photo message's biggest size (Telegram lists them smallest first)."""
+    sizes = message.get("photo") or []
+    return (sizes[-1] or {}).get("file_id") if sizes else None
+
+
+def _announcement_steps(flow: dict, keyboard: dict | None) -> list[tuple[str, dict]]:
+    """The Bot API calls that post a draft (an announcement, or the results), in order, as
+    (method, keyword arguments) without the chat. A list rather than one call because a
+    picture with a long caption, and any album, take two messages -- and a retry after a
+    flood wait must be able to send the second without posting the first twice (see
+    _post_announcement).
+
+    - text: one message, its formatting carried as entities;
+    - one picture: the picture with the text as its caption and `keyboard` under it, or,
+      past a bot's caption limit, the picture and then the text with `keyboard`;
+    - an album: the pictures, then the text with `keyboard` (an album takes no buttons).
+    """
+    text = flow.get("text") or ""
+    entities = flow.get("entities") or None
+    photos = list(flow.get("photos") or [])[:ANNOUNCE_MAX_PHOTOS]
+
+    # Formatting only goes along when there is some: plain text is sent exactly as it
+    # always was.
+    def message(body: str, body_entities) -> tuple[str, dict]:
+        kwargs = {"parse_mode": None, "reply_markup": keyboard}
+        if body_entities:
+            kwargs["entities"] = body_entities
+        return ("send_message", {"text": body, **kwargs})
+
+    if not photos:
+        return [message(text, entities)]
+    if len(photos) == 1:
+        if tg_markdown.utf16_len(text) <= CAPTION_LIMIT:
+            kwargs = {"photo": photos[0], "caption": text or None, "reply_markup": keyboard}
+            if entities:
+                kwargs["caption_entities"] = entities
+            return [("send_photo", kwargs)]
+        return [("send_photo", {"photo": photos[0], "caption": None}), message(text, entities)]
+    album = [{"type": "photo", "media": file_id} for file_id in photos]
+    if not text:
+        text, entities = _ANNOUNCE_ALBUM_TEXT.get(flow.get("system") or "vote", "🗳 Голосуем!"), None
+    return [("send_media_group", {"media": album}), message(text, entities)]
+
+
+def _announce_keyboard(button: dict) -> dict:
+    return {"inline_keyboard": [[button]]}
+
+
+def _draft_content(message: dict) -> tuple[str, list[dict], str | None]:
+    """(text, entities, picture file_id) of a draft reply: the text or the caption with
+    the sender's formatting and typed Markdown (tg_markdown), and the photo if there is
+    one."""
+    if message.get("text"):
+        text, entities = tg_markdown.prepare(message.get("text"), message.get("entities"))
+    else:
+        text, entities = tg_markdown.prepare(message.get("caption"), message.get("caption_entities"))
+    return text, entities, _largest_photo_id(message)
+
+
+def _has_other_media(message: dict) -> bool:
+    return any(message.get(kind) for kind in (
+        "document", "video", "animation", "sticker", "audio", "voice", "video_note",
+    ))
+
+
+def _start_album(flow: dict, message: dict, photo: str, caption_taken: bool) -> None:
+    """The first picture of an album: the rest join the draft by media_group_id."""
+    flow["media_group_id"] = message.get("media_group_id")
+    flow["album"] = {message["message_id"]: photo}
+    flow["album_caption_taken"] = caption_taken
+    flow["offered"] = False
+
+
+def _add_album_picture(flow: dict, message: dict, log=print) -> None:
+    """Another picture of the album the draft started with, and its caption if the album's
+    first picture had none. One that comes after the preview was drawn is left out: the
+    preview is the promise of what gets posted."""
+    photo = _largest_photo_id(message)
+    if photo is None:
+        return
+    if flow.get("offered"):
+        log("[bot_listener] a picture came after the draft's preview; left out")
+        return
+    flow.setdefault("album", {})[message["message_id"]] = photo
+    if not flow.get("album_caption_taken") and (message.get("caption") or "").strip():
+        flow["text"], flow["entities"], _ = _draft_content(message)
+        flow["album_caption_taken"] = True
+
+
+def _finish_album(flow: dict) -> None:
+    """The album is in: its pictures, in the order they were sent, become the draft's."""
+    flow["offered"] = True
+    album = flow.pop("album", None)
+    if album:
+        flow["photos"] = [album[key] for key in sorted(album)][:ANNOUNCE_MAX_PHOTOS]
+
+
+def _wait_for_album(flow_id: str, flow: dict, flows: dict[str, dict], offer,
+                    background_tasks: set | None, log=print) -> None:
+    """Calls `offer()` once the album's other pictures have had time to arrive -- in a
+    background task, so the update loop goes on reading them meanwhile."""
+    async def settle() -> None:
+        await asyncio.sleep(ANNOUNCE_ALBUM_SETTLE_SECONDS)
+        if flows.get(flow_id) is not flow or flow.get("offered"):
+            return
+        _finish_album(flow)
+        try:
+            await offer()
+        except Exception:  # noqa: BLE001 -- a background task has nobody to raise to
+            log(f"[bot_listener] showing the album draft failed:\n{traceback.format_exc()}")
+
+    tasks = background_tasks if background_tasks is not None else _ANNOUNCE_TASKS
+    task = asyncio.create_task(settle())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+
+
+async def _post_announcement(api: TelegramBotAPI, chat_id, steps, done: int = 0,
+                             on_step=None) -> None:
+    """Runs `steps` (see _announcement_steps) into one chat, from step `done` on.
+    `on_step(n)` hears how many have gone out, so a caller that retries after a flood
+    wait can resume after the album instead of posting it again."""
+    for index in range(done, len(steps)):
+        method, kwargs = steps[index]
+        await getattr(api, method)(chat_id, **kwargs)
+        if on_step is not None:
+            on_step(index + 1)
+
+
 async def _start_announcement_draft(
     vote_chat_flows: dict[str, dict] | None,
     reply,
@@ -6967,7 +7116,10 @@ async def handle_arena_command(
             return
         await _start_announcement_draft(
             vote_chat_flows, reply, telethon_client, chat_id, user, entry, "arena",
-            "Какой текст написать в объявлении об арене? Ответь на это сообщение.",
+            "Какой текст написать в объявлении об арене? "
+            "Ответь на это сообщение текстом -- можно с картинкой или альбомом. Ссылки и "
+            "форматирование сохранятся, Markdown тоже работает: [текст](ссылка), **жирный**, "
+            "__курсив__. Перед отправкой покажу, как это будет выглядеть.",
             log=log,
         )
         return
@@ -8066,6 +8218,47 @@ async def _send_vote_image(api, reply, chat_id, message: dict, entry: str, poll,
         await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
 
 
+async def _send_month_image(api, reply, chat_id, message: dict, entry: str, rounds: list,
+                            image_columns: int, log=print) -> None:
+    """"/vote картинка" while the month's rounds are on the page: all of them in one
+    picture (vote_image.render_month_image), sent as one file."""
+    counts = [len(poll.tally()) for poll in rounds]
+    if not any(counts):
+        await reply("К голосованиям месяца ещё не допущена ни одна работа -- рисовать нечего.")
+        return
+    await reply(
+        f"Рисую картинку месяца: раундов {len(rounds)}, работ {sum(counts)}, {image_columns} в ряд. "
+        "Это займёт несколько секунд."
+    )
+    month = rounds[0].poll_id.rsplit("-", 1)[0]
+    try:
+        # In a thread, like _send_vote_image: decoding and scaling every photo of three
+        # rounds is seconds of CPU the event loop must not spend.
+        path = await asyncio.to_thread(
+            vote_image.render_month_image, rounds,
+            voting.export_image_path(entry, f"{month}-rounds", image_columns),
+            columns=image_columns,
+        )
+    except Exception:
+        log(f"[bot_listener] rendering the month's picture failed:\n{traceback.format_exc()}")
+        await reply("Не получилось нарисовать картинку -- смотри логи.")
+        return
+    log(
+        f"[bot_listener] rendered the month's picture for {month}: {path} "
+        f"({image_columns} columns, {path.stat().st_size} bytes)"
+    )
+    badges = ", ".join(f"{poll.round[3]} {poll.round[2]}" for poll in rounds)
+    try:
+        await api.send_document_file(
+            chat_id, path,
+            caption=f"Итоги месяца одной картинкой: {badges}. Файлом, чтобы Telegram не сжимал.",
+            reply_to_message_id=message["message_id"],
+        )
+    except Exception as e:
+        log(f"[bot_listener] failed to send the month's picture: {e}")
+        await reply(f"Картинка отрисована ({path.name}), но отправить её не вышло -- смотри логи.")
+
+
 async def handle_vote_command(
     api: TelegramBotAPI,
     telethon_client,
@@ -8474,7 +8667,10 @@ async def handle_vote_command(
             return
         await _start_announcement_draft(
             vote_chat_flows, reply, telethon_client, chat_id, user, entry, "vote",
-            "Какой текст написать в объявлении о голосовании? Ответь на это сообщение.",
+            "Какой текст написать в объявлении о голосовании? "
+            "Ответь на это сообщение текстом -- можно с картинкой или альбомом. Ссылки и "
+            "форматирование сохранятся, Markdown тоже работает: [текст](ссылка), **жирный**, "
+            "__курсив__. Перед отправкой покажу, как это будет выглядеть.",
             log=log,
         )
         return
@@ -8512,8 +8708,15 @@ async def handle_vote_command(
         if not polls:
             await reply("Голосование ещё не создано -- нечего рисовать. Сначала /vote собрать.")
             return
-        # The month's rounds are three votes on the page at once: a picture for each.
-        for poll in polls:
+        # The month's rounds are three votes on the page at once, but one contest: ONE
+        # picture with a section per round. A week voted in beside them gets its own.
+        rounds = [poll for poll in polls if poll.round]
+        others = [poll for poll in polls if not poll.round]
+        if len(rounds) > 1:
+            await _send_month_image(api, reply, chat_id, message, entry, rounds, image_columns, log=log)
+        else:
+            others = polls
+        for poll in others:
             await _send_vote_image(api, reply, chat_id, message, entry, poll, image_columns,
                                    named=len(polls) > 1, log=log)
         return
@@ -8653,13 +8856,22 @@ async def handle_vote_chat_text_input(
     message: dict,
     vote_chat_flows: dict[str, dict],
     log=print,
+    background_tasks: set | None = None,
 ) -> bool:
     """Consumes "/vote chat"'s force-reply and asks where the finished announcement should
     go -- the main chat, the second group (VOTE_ANNOUNCE_EXTRA_CHAT), or both. Nothing is
-    posted here: the text is parked in its own flow and
+    posted here: the draft is parked in its own flow and
     handle_vote_chat_destination_callback sends it once a destination button is pressed,
     which is why this is the one force-reply flow in this file that does NOT pop its entry
     on the reply.
+
+    The reply can be text, a picture with a caption, or an album. The text keeps the
+    formatting the admin's app put on it and has typed Markdown converted (tg_markdown):
+    reading only the bare text used to drop every hidden link's address. Before the
+    destination buttons comes a preview -- the announcement itself, exactly as it will be
+    posted -- so a link that did not come out is seen in the DM, not in the group. An
+    album's pictures arrive one message each; the first waits ANNOUNCE_ALBUM_SETTLE_SECONDS
+    in `background_tasks` for the rest, and those are added to the same draft.
 
     Returns True once this message belonged to a pending draft, so the caller stops
     treating it as ordinary chat input -- same contract as handle_badge_text_input/
@@ -8668,13 +8880,19 @@ async def handle_vote_chat_text_input(
     chat_id = message["chat"]["id"]
     actor = message.get("from") or {}
     replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    album = message.get("media_group_id")
     found = next(
         (
             (flow_id, flow)
             for flow_id, flow in vote_chat_flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("user_id") == actor.get("id")
-            and flow.get("prompt_message_id") == replied_to
+            and (
+                flow.get("prompt_message_id") == replied_to
+                # The album's other pictures belong to the draft whether or not each one
+                # carries the reply.
+                or (album is not None and flow.get("media_group_id") == album)
+            )
             and time.monotonic() - flow["created_at"] <= VOTE_CHAT_FLOW_TTL_SECONDS
         ),
         None,
@@ -8688,36 +8906,96 @@ async def handle_vote_chat_text_input(
         await _take_admin_notice(api, message, flow_id, flow, vote_chat_flows, log=log)
         return True
 
-    text = (message.get("text") or "").strip()
-    if text.lower() in ("/cancel", "отмена"):
+    if album is not None and flow.get("media_group_id") == album:
+        _add_album_picture(flow, message, log=log)
+        return True
+
+    raw_text = message.get("text") or message.get("caption") or ""
+    system = flow.get("system") or "vote"
+
+    async def say(body: str) -> None:
+        await api.send_message(chat_id, body, reply_to_message_id=message["message_id"], parse_mode=None)
+
+    if raw_text.strip().lower() in ("/cancel", "отмена"):
         vote_chat_flows.pop(flow_id, None)
-        await api.send_message(
-            chat_id, "Черновик отменён.", reply_to_message_id=message["message_id"], parse_mode=None
-        )
+        await say("Черновик отменён.")
         return True
     if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
         vote_chat_flows.pop(flow_id, None)
         return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
-    if not text:
+    photo = _largest_photo_id(message)
+    if _has_other_media(message):
+        # A file, a video, a sticker: posting only its caption would quietly lose the
+        # very thing the admin attached.
         vote_chat_flows.pop(flow_id, None)
-        await api.send_message(
-            chat_id, "Пустой текст -- объявление не отправлено.",
-            reply_to_message_id=message["message_id"], parse_mode=None,
+        await say(
+            "Такое не отправить: пришли текст или картинку (фото, не файлом). "
+            f"Начни заново: {_announce_restart_hint(system)}"
         )
+        return True
+    if not raw_text.strip() and photo is None:
+        vote_chat_flows.pop(flow_id, None)
+        await say("Пустой текст -- объявление не отправлено.")
         return True
 
     # Which system asked for the draft decides where its button goes; "vote" is the default
     # so a flow written before the arena existed still means what it did.
-    system = flow.get("system") or "vote"
     if not (_arena_page_url(cfg) if system == "arena" else _vote_page_url(cfg)):
         vote_chat_flows.pop(flow_id, None)
-        await api.send_message(
-            chat_id,
+        await say(
             "Арена не настроена -- некуда вести кнопку." if system == "arena"
-            else "Голосование не настроено -- некуда вести кнопку.",
-            reply_to_message_id=message["message_id"], parse_mode=None,
+            else "Голосование не настроено -- некуда вести кнопку."
         )
         return True
+
+    text, entities, _ = _draft_content(message)
+    flow.update(
+        text=text, entities=entities, photos=[photo] if photo else [],
+        source_message_id=message["message_id"], offered=True,
+        # The next step gets the full TTL of its own: the clock so far measured how long
+        # the admin took to write the text, which says nothing about how long they need to
+        # decide where it goes.
+        created_at=time.monotonic(),
+    )
+    for key in ("media_group_id", "album", "album_caption_taken"):
+        flow.pop(key, None)
+    offer = lambda: _offer_announcement(api, cfg, flow_id, flow, vote_chat_flows, log=log)  # noqa: E731
+    if album is not None and photo is not None:
+        _start_album(flow, message, photo, caption_taken=bool(text))
+        _wait_for_album(flow_id, flow, vote_chat_flows, offer, background_tasks, log=log)
+        return True
+    await offer()
+    return True
+
+
+async def _offer_announcement(api: TelegramBotAPI, cfg, flow_id: str, flow: dict,
+                              vote_chat_flows: dict[str, dict], log=print) -> None:
+    """Shows the admin the announcement exactly as it will be posted, then asks where it
+    goes. A preview Telegram refuses (a link it does not accept, a text over its limit)
+    ends the draft here, with Telegram's reason, before anything reaches a group."""
+    chat_id = flow["chat_id"]
+    reply_to = flow.get("source_message_id")
+    system = flow.get("system") or "vote"
+
+    preview_button = _announce_dm_button(cfg, system)
+    if preview_button is None:
+        vote_chat_flows.pop(flow_id, None)
+        await api.send_message(chat_id, "Голосование не настроено -- некуда вести кнопку.", parse_mode=None)
+        return
+    try:
+        await _post_announcement(api, chat_id, _announcement_steps(flow, _announce_keyboard(preview_button)))
+    except Exception as e:  # noqa: BLE001 -- Telegram's reason goes back to the admin
+        vote_chat_flows.pop(flow_id, None)
+        log(f"[bot_listener] the announcement's preview was refused: {e}")
+        try:
+            await api.send_message(
+                chat_id,
+                f"Telegram не принял объявление: {e}\nПоправь и начни заново: {_announce_restart_hint(system)}",
+                reply_to_message_id=reply_to, parse_mode=None,
+            )
+        except Exception as report_error:  # noqa: BLE001
+            log(f"[bot_listener] failed to report the refused preview: {report_error}")
+        return
 
     destinations = [[{
         "text": "📣 В чат", "callback_data": _vote_chat_dest_callback_data("main", flow_id),
@@ -8742,23 +9020,22 @@ async def handle_vote_chat_text_input(
         "text": "Отмена", "callback_data": _vote_chat_dest_callback_data("cancel", flow_id),
     }])
 
-    flow["text"] = text
-    # The destination step gets the full TTL of its own: the clock so far measured how long
-    # the admin took to write the text, which says nothing about how long they need to
-    # decide where it goes.
     flow["created_at"] = time.monotonic()
     try:
         await api.send_message(
-            chat_id, "Куда отправить объявление?",
-            reply_to_message_id=message["message_id"], parse_mode=None,
+            chat_id, "Куда отправить объявление? Выше -- как оно будет выглядеть.",
+            reply_to_message_id=reply_to, parse_mode=None,
             reply_markup={"inline_keyboard": destinations},
         )
     except Exception as e:
         log(f"[bot_listener] failed to offer the vote announcement destinations: {e}")
         vote_chat_flows.pop(flow_id, None)
-        return True
-    log(f"[bot_listener] {actor.get('username') or actor.get('id')} drafted a vote announcement ({len(text)} chars)")
-    return True
+        return
+    photos = len(flow.get("photos") or [])
+    log(
+        f"[bot_listener] user {flow.get('user_id')} drafted a vote announcement "
+        f"({len(flow.get('text') or '')} chars, {len(flow.get('entities') or [])} entities, {photos} pictures)"
+    )
 
 
 def _vote_chat_dest_callback_data(destination: str, flow_id: str) -> str:
@@ -8843,8 +9120,8 @@ async def handle_vote_chat_destination_callback(
             return
         await report(
             f"Разослать это объявление в личку {count} {_ru_people(count)}, у которых "
-            "запущен бот? Каждый получит текст и кнопку голосования. Отменить разосланное "
-            "будет нельзя.",
+            "запущен бот? Каждый получит его таким, как в превью выше, с кнопкой "
+            "голосования. Отменить разосланное будет нельзя.",
             reply_markup={"inline_keyboard": [
                 [{"text": f"✅ Да, разослать ({count})",
                   "callback_data": _vote_chat_dest_callback_data("dmyes", flow_id)}],
@@ -8872,7 +9149,7 @@ async def handle_vote_chat_destination_callback(
             await report("Голосование не настроено -- некуда вести кнопку.")
             return
         mailing = lambda: _mail_bot_users(  # noqa: E731 -- built only if the job starts
-            api, dm_chat_id, flow["text"], {"inline_keyboard": [[button]]}, log=log,
+            api, dm_chat_id, _announcement_steps(flow, _announce_keyboard(button)), log=log,
         )
         if background_tasks is None:
             await mailing()
@@ -8889,7 +9166,7 @@ async def handle_vote_chat_destination_callback(
         return
     # One button only: the owner wants the posted announcement without "Если Бот не
     # работает" -- the browser page stays on the voter's DM and the admin panel.
-    keyboard = {"inline_keyboard": [[button]]}
+    steps = _announcement_steps(flow, _announce_keyboard(button))
 
     targets: list[tuple[str, object]] = []
     if destination in ("main", "both"):
@@ -8907,7 +9184,7 @@ async def handle_vote_chat_destination_callback(
             # Never scheduled for auto-delete, unlike the stats replies this codebase
             # sweeps away as noise: an announcement whose whole purpose is to be come back
             # to and voted from is the one message that has to still be there tomorrow.
-            await api.send_message(target, flow["text"], parse_mode=None, reply_markup=keyboard)
+            await _post_announcement(api, target, steps)
         except Exception as e:
             log(f"[bot_listener] failed to post the vote announcement to {label}: {e}")
             failed.append(f"{label} ({e})")
@@ -9036,10 +9313,10 @@ async def _finish_status(api: TelegramBotAPI, chat_id, message_id, text: str, re
         log(f"[bot_users] could not report the result: {e}")
 
 
-async def _mail_bot_users(api: TelegramBotAPI, dm_chat_id, text: str, reply_markup: dict,
-                          log=print) -> "bot_users.Delivery":
-    """Send the announcement to everybody whose bot is started, then write down what came
-    back (who turned out to have blocked it since) in one store write, and report."""
+async def _mail_bot_users(api: TelegramBotAPI, dm_chat_id, steps: list, log=print) -> "bot_users.Delivery":
+    """Send the announcement (_announcement_steps) to everybody whose bot is started, then
+    write down what came back (who turned out to have blocked it since) in one store
+    write, and report."""
     registry = bot_users.registry()
     recipients = [p.user_id for p in await asyncio.to_thread(registry.people, bot_users.ACTIVE)]
     status = None
@@ -9051,8 +9328,15 @@ async def _mail_bot_users(api: TelegramBotAPI, dm_chat_id, text: str, reply_mark
         log(f"[bot_users] could not post the mailing's progress message: {e}")
     status_id = (status or {}).get("message_id")
 
+    # How many of the steps each person already has. deliver() retries a person after a
+    # flood wait, and an album that went out before the wait must not go out again.
+    sent_steps: dict[str, int] = {}
+
     async def send(user_id: str) -> None:
-        await api.send_message(int(user_id), text, parse_mode=None, reply_markup=reply_markup)
+        await _post_announcement(
+            api, int(user_id), steps, sent_steps.get(user_id, 0),
+            on_step=lambda done: sent_steps.__setitem__(user_id, done),
+        )
 
     result = await bot_users.deliver(
         recipients, send,
@@ -9479,7 +9763,8 @@ def _save_vote_results(poll, standings: list, text: str, log=print) -> None:
         log(f"[bot_listener] failed to save the vote results record:\n{traceback.format_exc()}")
 
 
-async def _send_vote_result_draft(api: TelegramBotAPI, flow_id: str, flow: dict, log=print) -> bool:
+async def _send_vote_result_draft(api: TelegramBotAPI, flow_id: str, flow: dict, log=print,
+                                  errors: list | None = None) -> bool:
     """Puts one copy of the draft in front of the admin: the results text with the three
     buttons under it.
 
@@ -9491,16 +9776,19 @@ async def _send_vote_result_draft(api: TelegramBotAPI, flow_id: str, flow: dict,
     in the group: the draft is something the admin comes back to when they have thought of
     better wording, so nothing in this bot's auto-delete sweep may touch it.
 
+    An edited draft can carry formatting and pictures (see handle_vote_result_text_input);
+    it is shown exactly as Отправить will post it, the buttons on its last message.
+
     Returns False when nothing could be delivered at all, which is the caller's cue to drop
-    the flow rather than leave buttons nobody will ever see.
+    the flow rather than leave buttons nobody will ever see. `errors`, when given, gets
+    Telegram's reason.
     """
     try:
-        await api.send_message(
-            flow["chat_id"], flow["text"], parse_mode=None,
-            reply_markup=_vote_result_keyboard(flow_id),
-        )
+        await _post_announcement(api, flow["chat_id"], _announcement_steps(flow, _vote_result_keyboard(flow_id)))
     except Exception as e:
         log(f"[bot_listener] failed to show the vote results draft: {e}")
+        if errors is not None:
+            errors.append(str(e))
         return False
     return True
 
@@ -9636,7 +9924,9 @@ async def handle_vote_result_callback(
             which = flow["poll"].label() if getattr(flow.get("poll"), "is_monthly", False) else ""
             prompt = await api.send_message(
                 flow["chat_id"],
-                f"Пришли новый текст итогов{f' «{which}»' if which else ''} ответом на это сообщение.",
+                f"Пришли новый текст итогов{f' «{which}»' if which else ''} ответом на это сообщение. "
+                "Форматирование и ссылки сохранятся, можно приложить картинку или альбом; "
+                "картинка без подписи прикрепится к нынешнему тексту.",
                 parse_mode=None,
                 reply_markup={"force_reply": True, "selective": True},
             )
@@ -9659,8 +9949,12 @@ async def handle_vote_result_callback(
         # Never scheduled for auto-delete, unlike the stats replies this codebase sweeps
         # away as noise (see schedule_bot_delete) and exactly like the /vote announcement:
         # the week's results are the message people scroll back to, so no sweep path may
-        # ever touch them.
-        await api.send_message(target, text, parse_mode=None)
+        # ever touch them. `posted_steps` makes a retry after a failure carry on after
+        # an album that already went out rather than post it twice.
+        await _post_announcement(
+            api, target, _announcement_steps(flow, None), flow.get("posted_steps", 0),
+            on_step=lambda done: flow.__setitem__("posted_steps", done),
+        )
     except Exception as e:
         log(f"[bot_listener] failed to post the vote results: {e}")
         await report(f"Не получилось отправить итоги в чат: {e}")
@@ -9680,10 +9974,17 @@ async def handle_vote_result_text_input(
     message: dict,
     vote_result_flows: dict[str, dict],
     log=print,
+    background_tasks: set | None = None,
 ) -> bool:
-    """Consumes the force-reply Редактировать opened: the reply becomes the draft text and
-    the draft is shown again, with the same three buttons, so editing can be repeated as
-    many times as the admin likes.
+    """Consumes the force-reply Редактировать opened: the reply becomes the draft and the
+    draft is shown again, with the same three buttons, so editing can be repeated as many
+    times as the admin likes.
+
+    The reply is text, a picture with a caption, or an album, and replaces the draft --
+    except a picture with no caption, which is attached to the text already there. Text
+    keeps its formatting and typed Markdown (tg_markdown). An album's pictures arrive one
+    message each; the draft is shown once they are in (see _wait_for_album). A draft
+    Telegram refuses to show (a bad link, say) is put back the way it was.
 
     Like handle_vote_chat_text_input this does NOT pop its flow on the reply -- the draft
     has to survive until Отправить or Отмена -- and unlike it, an empty reply is not fatal
@@ -9697,14 +9998,17 @@ async def handle_vote_result_text_input(
     chat_id = message["chat"]["id"]
     actor = message.get("from") or {}
     replied_to = (message.get("reply_to_message") or {}).get("message_id")
+    album = message.get("media_group_id")
     found = next(
         (
             (flow_id, flow)
             for flow_id, flow in vote_result_flows.items()
             if flow.get("chat_id") == chat_id
             and flow.get("user_id") == actor.get("id")
-            and flow.get("prompt_message_id") is not None
-            and flow.get("prompt_message_id") == replied_to
+            and (
+                (flow.get("prompt_message_id") is not None and flow.get("prompt_message_id") == replied_to)
+                or (album is not None and flow.get("media_group_id") == album)
+            )
             and time.monotonic() - flow["created_at"] <= VOTE_RESULT_FLOW_TTL_SECONDS
         ),
         None,
@@ -9712,8 +10016,11 @@ async def handle_vote_result_text_input(
     if found is None:
         return False
     flow_id, flow = found
+    if album is not None and flow.get("media_group_id") == album:
+        _add_album_picture(flow, message, log=log)
+        return True
 
-    text = (message.get("text") or "").strip()
+    text = (message.get("text") or message.get("caption") or "").strip()
     if text.lower() in ("/cancel", "отмена"):
         vote_result_flows.pop(flow_id, None)
         await api.send_message(
@@ -9727,19 +10034,63 @@ async def handle_vote_result_text_input(
         vote_result_flows.pop(flow_id, None)
         return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
 
-    if text:
-        flow["text"] = text
-        _save_vote_results(flow["poll"], flow["standings"], text, log=log)
-        log(
-            f"[bot_listener] {actor.get('username') or actor.get('id')} rewrote the vote "
-            f"results text ({len(text)} chars)"
-        )
     # Used up: the next Редактировать installs a prompt of its own, so a stale one can
     # never swallow an unrelated reply later in the same DM.
     flow["prompt_message_id"] = None
     flow["created_at"] = time.monotonic()
-    if not await _send_vote_result_draft(api, flow_id, flow, log=log):
-        vote_result_flows.pop(flow_id, None)
+    if _has_other_media(message):
+        await api.send_message(
+            chat_id, "Такое не приложить: нужна картинка (фото, не файлом). Итоги не изменились.",
+            reply_to_message_id=message["message_id"], parse_mode=None,
+        )
+        if not await _send_vote_result_draft(api, flow_id, flow, log=log):
+            vote_result_flows.pop(flow_id, None)
+        return True
+
+    before = {"text": flow.get("text"), "entities": flow.get("entities"), "photos": list(flow.get("photos") or [])}
+    new_text, entities, photo = _draft_content(message)
+    if new_text:
+        flow["text"], flow["entities"] = new_text, entities
+    if new_text or photo:
+        flow["photos"] = [photo] if photo else []
+    for key in ("media_group_id", "album", "album_caption_taken"):
+        flow.pop(key, None)
+    flow["offered"] = True
+
+    async def show() -> None:
+        errors: list[str] = []
+        changed = flow.get("text") != before["text"] or list(flow.get("photos") or []) != before["photos"]
+        if await _send_vote_result_draft(api, flow_id, flow, log=log, errors=errors):
+            if changed:
+                flow.pop("posted_steps", None)
+                _save_vote_results(flow["poll"], flow["standings"], flow["text"], log=log)
+                log(
+                    f"[bot_listener] {actor.get('username') or actor.get('id')} rewrote the vote "
+                    f"results ({len(flow['text'])} chars, {len(flow.get('photos') or [])} pictures)"
+                )
+            return
+        if not changed:
+            vote_result_flows.pop(flow_id, None)
+            return
+        # Telegram would not take the new version: the draft goes back to the last one
+        # that it did, and the admin hears why.
+        flow.update(before)
+        try:
+            await api.send_message(
+                chat_id, f"Telegram не принял новый вариант: {errors[0] if errors else 'ошибка'}\n"
+                "Итоги остались прежними:",
+                reply_to_message_id=message["message_id"], parse_mode=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[bot_listener] failed to report the refused results edit: {e}")
+        if not await _send_vote_result_draft(api, flow_id, flow, log=log):
+            vote_result_flows.pop(flow_id, None)
+
+    if album is not None and photo is not None:
+        _start_album(flow, message, photo, caption_taken=bool(new_text))
+        _wait_for_album(flow_id, flow, vote_result_flows, show, background_tasks, log=log)
+        return True
+    await show()
     return True
 
 
@@ -14101,12 +14452,12 @@ async def _dispatch_update(
         return
 
     if await handle_vote_chat_text_input(
-        api, cfg, message, vote_chat_flows, log=log
+        api, cfg, message, vote_chat_flows, log=log, background_tasks=background_tasks,
     ):
         return
 
     if await handle_vote_result_text_input(
-        api, message, vote_result_flows, log=log
+        api, message, vote_result_flows, log=log, background_tasks=background_tasks,
     ):
         return
 

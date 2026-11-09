@@ -137,6 +137,7 @@ class TelegramBotAPI:
         reply_markup: dict | None = None,
         parse_mode: str | None = "Markdown",
         disable_notification: bool = False,
+        entities: list[dict] | None = None,
     ) -> dict:
         # parse_mode=None (plain text) is for callers echoing uncontrolled text (e.g.
         # someone's display name) straight into the message -- Telegram's legacy
@@ -151,6 +152,11 @@ class TelegramBotAPI:
             "link_preview_options": {"is_disabled": True},
             "reply_markup": reply_markup,
         }
+        if entities:
+            # The formatting as a list of entities (an administrator's own message, see
+            # tg_markdown) instead of markup to parse -- Telegram takes one or the other.
+            params["entities"] = entities
+            params["parse_mode"] = None
         if disable_notification:
             params["disable_notification"] = True
         if reply_to_message_id is not None:
@@ -173,17 +179,20 @@ class TelegramBotAPI:
         self,
         chat_id,
         photo: str,
-        caption: str,
+        caption: str | None,
         reply_to_message_id: int | None = None,
         reply_markup: dict | None = None,
         parse_mode: str | None = None,
+        caption_entities: list[dict] | None = None,
     ) -> dict:
-        """Send a Telegram photo file_id with an optional caption and inline keyboard."""
+        """Send a Telegram photo file_id with an optional caption and inline keyboard.
+        `caption_entities` carries the caption's formatting instead of `parse_mode`."""
         params = {
             "chat_id": chat_id,
             "photo": photo,
-            "caption": caption,
-            "parse_mode": parse_mode,
+            "caption": caption or None,
+            "parse_mode": None if caption_entities else parse_mode,
+            "caption_entities": caption_entities or None,
             "reply_markup": reply_markup,
         }
         if reply_to_message_id is not None:
@@ -192,6 +201,12 @@ class TelegramBotAPI:
                 "allow_sending_without_reply": True,
             }
         return await self._call("sendPhoto", **params)
+
+    async def send_media_group(self, chat_id, media: list[dict]) -> list[dict]:
+        """Post pictures Telegram already has (InputMediaPhoto items with file_ids) as
+        ONE album. Like send_media_group_files, it takes no reply_markup: a caller that
+        needs a button sends it in a message of its own."""
+        return await self._call("sendMediaGroup", chat_id=chat_id, media=media)
 
     async def send_photo_file(
         self,
