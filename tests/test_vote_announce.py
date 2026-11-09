@@ -46,29 +46,47 @@ def _cfg(extra=EXTRA_CHAT, short_name=None):
 
 
 class FakeApi:
-    """sendMessage plus answerCallbackQuery, with a per-chat failure injection so a
-    destination that rejects the post can be tested next to one that accepts it.
+    """sendMessage, sendPhoto and sendMediaGroup (by file_id) plus answerCallbackQuery,
+    with a per-chat failure injection so a destination that rejects the post can be
+    tested next to one that accepts it. Every message lands in `sent`, a picture with
+    "kind": "photo" and an album with "kind": "album".
 
-    Deliberately has no send_photo_file: neither of these flows posts a picture any more,
-    so a regression that reintroduced one would blow up here on the missing attribute
-    instead of quietly passing a test that never looked."""
+    Deliberately has no send_photo_file: neither of these flows uploads a picture, so a
+    regression that reintroduced one would blow up here on the missing attribute instead
+    of quietly passing a test that never looked."""
 
-    def __init__(self, failing_chats=()):
+    def __init__(self, failing_chats=(), refuse_entities=False):
         self.sent = []
         self.answered = []
         self.failing_chats = set(failing_chats)
+        self.refuse_entities = refuse_entities
 
-    async def send_message(self, chat_id, text, reply_to_message_id=None,
-                           reply_markup=None, parse_mode=None):
+    def _record(self, chat_id, **item):
         if chat_id in self.failing_chats:
             raise RuntimeError("Bad Request: chat not found")
-        item = {
-            "message_id": 100 + len(self.sent),
-            "chat_id": chat_id, "text": text, "reply_markup": reply_markup,
-            "reply_to_message_id": reply_to_message_id,
-        }
+        item.update(message_id=100 + len(self.sent), chat_id=chat_id)
+        item.setdefault("reply_markup", None)
         self.sent.append(item)
         return item
+
+    async def send_message(self, chat_id, text, reply_to_message_id=None,
+                           reply_markup=None, parse_mode=None, entities=None):
+        if entities and self.refuse_entities:
+            raise RuntimeError("Bad Request: can't parse entities")
+        return self._record(
+            chat_id, kind="text", text=text, entities=entities, reply_markup=reply_markup,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    async def send_photo(self, chat_id, photo, caption, reply_to_message_id=None,
+                         reply_markup=None, parse_mode=None, caption_entities=None):
+        return self._record(
+            chat_id, kind="photo", photo=photo, text=caption, entities=caption_entities,
+            reply_markup=reply_markup,
+        )
+
+    async def send_media_group(self, chat_id, media):
+        return self._record(chat_id, kind="album", photos=[item["media"] for item in media], text=None)
 
     async def answer_callback_query(self, callback_id, text=None):
         self.answered.append({"id": callback_id, "text": text})
@@ -150,20 +168,29 @@ class DraftAsksWhereItGoesTests(_EmptyBotUsers, unittest.TestCase):
     def test_the_draft_is_not_posted_yet_and_the_flow_survives_the_reply(self):
         api, flows, handled = self._feed("Новое голосование")
         self.assertTrue(handled)
-        self.assertEqual([s["chat_id"] for s in api.sent], [DM_CHAT_ID])
-        self.assertIn("Куда отправить объявление", api.sent[0]["text"])
+        self.assertEqual([s["chat_id"] for s in api.sent], [DM_CHAT_ID, DM_CHAT_ID])
+        self.assertIn("Куда отправить объявление", api.sent[-1]["text"])
         self.assertEqual(flows["f1"]["text"], "Новое голосование")
+
+    def test_the_preview_is_the_announcement_itself_before_the_question(self):
+        api, _, _ = self._feed("Новое голосование")
+        preview, question = api.sent
+        self.assertEqual(preview["text"], "Новое голосование")
+        [[button]] = preview["reply_markup"]["inline_keyboard"]
+        self.assertEqual(button["text"], bot_listener.VOTE_OPEN_BUTTON_TEXT)
+        self.assertIn("web_app", button, "the preview sits in a DM, where the page opens in place")
+        self.assertIn("Куда отправить объявление", question["text"])
 
     def test_all_three_destinations_are_offered_when_the_second_group_is_configured(self):
         api, _, _ = self._feed("Текст")
-        labels = [b["text"] for row in api.sent[0]["reply_markup"]["inline_keyboard"] for b in row]
+        labels = [b["text"] for row in api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row]
         self.assertEqual(
             labels, ["📣 В чат", "🎨 В Папку художников", "📣 В оба", "📬 Всем в личку (0)", "Отмена"],
         )
 
     def test_without_a_second_group_only_the_main_chat_is_offered(self):
         api, _, _ = self._feed("Текст", cfg=_cfg(extra=None))
-        labels = [b["text"] for row in api.sent[0]["reply_markup"]["inline_keyboard"] for b in row]
+        labels = [b["text"] for row in api.sent[-1]["reply_markup"]["inline_keyboard"] for b in row]
         self.assertEqual(labels, ["📣 В чат", "📬 Всем в личку (0)", "Отмена"])
 
     def test_cancelling_at_the_text_step_drops_the_draft(self):
@@ -337,8 +364,10 @@ class ArenaAnnouncementTests(_EmptyBotUsers, unittest.TestCase):
                 api, _cfg(), _reply_message("Текст про арену"), flows, log=lambda *_: None,
             ))
         self.assertTrue(handled)
-        self.assertIn("Куда отправить объявление", api.sent[0]["text"])
+        self.assertIn("Куда отправить объявление", api.sent[-1]["text"])
         self.assertEqual(flows["f1"]["text"], "Текст про арену")
+        [[button]] = api.sent[0]["reply_markup"]["inline_keyboard"]
+        self.assertEqual(button["text"], bot_listener.ARENA_OPEN_BUTTON_TEXT)
         self.assertEqual(flows["f1"]["system"], "arena")
 
 
@@ -798,7 +827,7 @@ class ResultsDispatchTests(unittest.TestCase):
     def test_the_edit_reply_reaches_its_handler_through_update_dispatch(self):
         handled = []
 
-        async def handle(api, message, flows, log=print):
+        async def handle(api, message, flows, log=print, background_tasks=None):
             handled.append(message)
             return True
 
@@ -816,6 +845,271 @@ class ResultsDispatchTests(unittest.TestCase):
         _run(go())
         self.assertEqual(len(handled), 1)
         self.assertEqual(handled[0]["text"], "Новый текст")
+
+
+# ---- formatting and pictures ------------------------------------------------------------
+
+HIDDEN_LINK = {"type": "text_link", "offset": 9, "length": 7, "url": "https://t.me/papka/5"}
+
+
+def _photo(file_id):
+    """A photo message's sizes, smallest first, as Telegram lists them."""
+    return [{"file_id": f"{file_id}-small", "width": 90}, {"file_id": file_id, "width": 1280}]
+
+
+def _draft_message(message_id=8, reply=True, **fields):
+    message = {"message_id": message_id, "chat": {"id": DM_CHAT_ID, "type": "private"}, "from": ADMIN}
+    if reply:
+        message["reply_to_message"] = {"message_id": PROMPT_ID}
+    message.update(fields)
+    return message
+
+
+class _Draft(_EmptyBotUsers):
+    """Feeds draft replies into handle_vote_chat_text_input on one event loop, so an
+    album's wait (patched to nothing) runs to its end before anything is checked."""
+
+    def feed(self, *messages, api=None, flows=None):
+        api = api or FakeApi()
+        flows = {"f1": _flow()} if flows is None else flows
+        for flow in flows.values():
+            flow.pop("text", None)
+        tasks = set()
+
+        async def go():
+            with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)), \
+                    patch.object(bot_listener, "ANNOUNCE_ALBUM_SETTLE_SECONDS", 0):
+                for message in messages:
+                    self.assertTrue(await bot_listener.handle_vote_chat_text_input(
+                        api, _cfg(), message, flows, log=lambda *_: None, background_tasks=tasks,
+                    ))
+                await asyncio.gather(*tasks)
+
+        _run(go())
+        return api, flows
+
+    def post(self, flows, destination="main", api=None):
+        api = api or FakeApi()
+        with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)):
+            _run(bot_listener.handle_vote_chat_destination_callback(
+                api, _cfg(), _press(destination, "f1"), flows, BOT, log=lambda *_: None,
+            ))
+        return api
+
+
+class AnnouncementFormattingTests(_Draft, unittest.TestCase):
+    def test_a_hidden_link_keeps_its_address_all_the_way_to_the_group(self):
+        """The bug: the draft kept only the bare text, so a link written as a word lost
+        where it pointed."""
+        api, flows = self.feed(_draft_message(text="Голосуем! Правила внутри", entities=[HIDDEN_LINK]))
+        self.assertEqual(api.sent[0]["entities"], [HIDDEN_LINK])
+        [post] = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual(post["text"], "Голосуем! Правила внутри")
+        self.assertEqual(post["entities"], [HIDDEN_LINK])
+
+    def test_typed_markdown_becomes_formatting(self):
+        api, flows = self.feed(_draft_message(text="**Голосуем!** [Правила](https://t.me/papka/5)"))
+        [post] = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual(post["text"], "Голосуем! Правила")
+        self.assertEqual(post["entities"], [
+            {"type": "bold", "offset": 0, "length": 9},
+            {"type": "text_link", "url": "https://t.me/papka/5", "offset": 10, "length": 7},
+        ])
+
+    def test_plain_text_goes_out_without_entities(self):
+        _, flows = self.feed(_draft_message(text="Просто текст"))
+        [post] = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertIsNone(post["entities"])
+
+    def test_a_preview_telegram_refuses_ends_the_draft_before_any_group_sees_it(self):
+        api, flows = self.feed(
+            _draft_message(text="Текст", entities=[{"type": "bold", "offset": 0, "length": 5}]),
+            api=FakeApi(refuse_entities=True),
+        )
+        self.assertEqual(flows, {})
+        self.assertIn("Telegram не принял объявление", api.sent[-1]["text"])
+        self.assertIn("can't parse entities", api.sent[-1]["text"])
+        self.assertEqual(api.posts_to(MAIN_CHAT_ID), [])
+
+
+class AnnouncementPictureTests(_Draft, unittest.TestCase):
+    def test_a_picture_with_a_caption_is_one_post_with_the_button(self):
+        api, flows = self.feed(_draft_message(
+            photo=_photo("pic1"), caption="Голосуем! Правила внутри", caption_entities=[HIDDEN_LINK],
+        ))
+        preview = api.sent[0]
+        self.assertEqual((preview["kind"], preview["photo"]), ("photo", "pic1"))
+        self.assertIn("web_app", preview["reply_markup"]["inline_keyboard"][0][0])
+        [post] = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual((post["kind"], post["photo"]), ("photo", "pic1"))
+        self.assertEqual(post["text"], "Голосуем! Правила внутри")
+        self.assertEqual(post["entities"], [HIDDEN_LINK])
+        self.assertEqual(post["reply_markup"]["inline_keyboard"][0][0]["url"], f"https://t.me/{BOT}?start=vote")
+
+    def test_a_picture_alone_is_posted_with_just_the_button(self):
+        _, flows = self.feed(_draft_message(photo=_photo("pic1")))
+        [post] = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual((post["kind"], post["text"]), ("photo", None))
+        self.assertIsNotNone(post["reply_markup"])
+
+    def test_a_caption_past_the_limit_follows_the_picture_as_its_own_message(self):
+        long_text = "Голосуем! " * 120
+        _, flows = self.feed(_draft_message(photo=_photo("pic1"), caption=long_text))
+        picture, text = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual((picture["kind"], picture["text"], picture["reply_markup"]), ("photo", None, None))
+        self.assertEqual((text["kind"], text["text"]), ("text", long_text.strip()))
+        self.assertIsNotNone(text["reply_markup"])
+
+    def test_an_album_is_collected_into_one_draft_and_previewed_once(self):
+        api, flows = self.feed(
+            _draft_message(8, photo=_photo("p1"), caption="Три работы", media_group_id="g1"),
+            _draft_message(9, reply=False, photo=_photo("p2"), media_group_id="g1"),
+            _draft_message(10, photo=_photo("p3"), media_group_id="g1"),
+        )
+        self.assertEqual(flows["f1"]["photos"], ["p1", "p2", "p3"])
+        album, text, question = api.sent
+        self.assertEqual((album["kind"], album["photos"]), ("album", ["p1", "p2", "p3"]))
+        self.assertEqual(text["text"], "Три работы")
+        self.assertIn("web_app", text["reply_markup"]["inline_keyboard"][0][0])
+        self.assertIn("Куда отправить объявление", question["text"])
+
+        posted = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertEqual([item["kind"] for item in posted], ["album", "text"])
+        self.assertEqual(posted[0]["photos"], ["p1", "p2", "p3"])
+        self.assertEqual(posted[1]["text"], "Три работы")
+        self.assertIn("url", posted[1]["reply_markup"]["inline_keyboard"][0][0])
+
+    def test_an_albums_caption_is_taken_from_whichever_picture_has_it(self):
+        _, flows = self.feed(
+            _draft_message(8, photo=_photo("p1"), media_group_id="g1"),
+            _draft_message(9, photo=_photo("p2"), caption="Подпись", media_group_id="g1"),
+        )
+        self.assertEqual(flows["f1"]["text"], "Подпись")
+
+    def test_an_album_without_text_still_gets_a_line_for_the_button(self):
+        _, flows = self.feed(
+            _draft_message(8, photo=_photo("p1"), media_group_id="g1"),
+            _draft_message(9, photo=_photo("p2"), media_group_id="g1"),
+        )
+        _, text = self.post(flows).posts_to(MAIN_CHAT_ID)
+        self.assertTrue(text["text"])
+        self.assertIsNotNone(text["reply_markup"])
+
+    def test_a_picture_after_the_preview_is_left_out(self):
+        api = FakeApi()
+        flows = {"f1": _flow()}
+        self.feed(_draft_message(8, photo=_photo("p1"), media_group_id="g1"),
+                  _draft_message(9, photo=_photo("p2"), media_group_id="g1"), api=api, flows=flows)
+        sent = len(api.sent)
+        self.feed(_draft_message(10, photo=_photo("late"), media_group_id="g1"), api=api, flows=flows)
+        self.assertEqual(flows["f1"]["photos"], ["p1", "p2"])
+        self.assertEqual(len(api.sent), sent)
+
+    def test_a_file_is_refused_rather_than_posting_only_its_caption(self):
+        api, flows = self.feed(_draft_message(document={"file_id": "doc"}, caption="Текст"))
+        self.assertEqual(flows, {})
+        self.assertIn("фото, не файлом", api.sent[-1]["text"])
+
+
+class ResultsPictureTests(unittest.TestCase):
+    """Редактировать on the results draft takes formatting and pictures as well."""
+
+    def setUp(self):
+        self.api = FakeApi()
+        self.flows = {"r1": _result_flow()}
+        self.saved = _SavedResults()
+
+    def _edit(self, *replies, api=None):
+        api = api or self.api
+        tasks = set()
+
+        async def go():
+            with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)), \
+                    patch.object(voting, "save_results", self.saved, create=True), \
+                    patch.object(bot_listener, "ANNOUNCE_ALBUM_SETTLE_SECONDS", 0):
+                await bot_listener.handle_vote_result_callback(
+                    api, _press_result("edit", "r1"), self.flows, log=lambda *_: None,
+                )
+                prompt_id = api.sent[-1]["message_id"]
+                for index, fields in enumerate(replies):
+                    message = {"message_id": 12 + index, "chat": {"id": RESULT_DM, "type": "private"},
+                               "from": ADMIN, "reply_to_message": {"message_id": prompt_id}}
+                    message.update(fields)
+                    await bot_listener.handle_vote_result_text_input(
+                        api, message, self.flows, log=lambda *_: None, background_tasks=tasks,
+                    )
+                await asyncio.gather(*tasks)
+
+        _run(go())
+
+    def _send(self, api=None):
+        with patch.object(bot_listener, "_can_manage_chat", _AlwaysAdmin(True)), \
+                patch.object(voting, "save_results", self.saved, create=True):
+            _run(bot_listener.handle_vote_result_callback(
+                api or self.api, _press_result("send", "r1"), self.flows, log=lambda *_: None,
+            ))
+
+    def test_a_picture_with_a_caption_replaces_the_draft_and_is_posted_with_it(self):
+        self._edit({"photo": _photo("board"), "caption": "Итоги месяца", "caption_entities": [
+            {"type": "bold", "offset": 0, "length": 5}]})
+        redrawn = self.api.sent[-1]
+        self.assertEqual((redrawn["kind"], redrawn["photo"], redrawn["text"]), ("photo", "board", "Итоги месяца"))
+        self.assertEqual(_buttons(redrawn), ["Редактировать", "Отправить", "Отмена"])
+        self._send()
+        [post] = self.api.posts_to(MAIN_CHAT_ID)
+        self.assertEqual((post["kind"], post["photo"], post["text"]), ("photo", "board", "Итоги месяца"))
+        self.assertEqual(post["entities"], [{"type": "bold", "offset": 0, "length": 5}])
+        self.assertIsNone(post["reply_markup"], "the results carry no buttons into the chat")
+        self.assertEqual(self.saved.calls[-1]["text"], "Итоги месяца")
+
+    def test_a_picture_without_a_caption_is_attached_to_the_text_already_there(self):
+        self._edit({"photo": _photo("board")})
+        self.assertEqual(self.flows["r1"]["text"], RESULTS_TEXT)
+        self.assertEqual(self.flows["r1"]["photos"], ["board"])
+
+    def test_an_album_goes_first_and_the_text_after_it(self):
+        self._edit({"photo": _photo("p1"), "media_group_id": "g"},
+                   {"photo": _photo("p2"), "media_group_id": "g"})
+        album, text = self.api.sent[-2:]
+        self.assertEqual(album["photos"], ["p1", "p2"])
+        self.assertEqual(text["text"], RESULTS_TEXT)
+        self.assertEqual(_buttons(text), ["Редактировать", "Отправить", "Отмена"])
+        self._send()
+        self.assertEqual([p["kind"] for p in self.api.posts_to(MAIN_CHAT_ID)], ["album", "text"])
+
+    def test_a_retry_after_a_failed_post_does_not_post_the_album_twice(self):
+        self._edit({"photo": _photo("p1"), "media_group_id": "g"},
+                   {"photo": _photo("p2"), "media_group_id": "g"})
+        flaky = FakeApi()
+        calls = {"text": 0}
+        original = flaky.send_message
+
+        async def send_message(chat_id, text, **kwargs):
+            if chat_id == MAIN_CHAT_ID and calls["text"] == 0:
+                calls["text"] += 1
+                raise RuntimeError("Too Many Requests: retry after 3")
+            return await original(chat_id, text, **kwargs)
+
+        flaky.send_message = send_message
+        self._send(api=flaky)
+        self.assertIn("r1", self.flows, "a failed post keeps the draft for a retry")
+        self._send(api=flaky)
+        self.assertEqual([p["kind"] for p in flaky.posts_to(MAIN_CHAT_ID)], ["album", "text"])
+        self.assertEqual(self.flows, {})
+
+    def test_a_version_telegram_refuses_puts_the_draft_back(self):
+        self._edit({"text": "Новый", "entities": [{"type": "bold", "offset": 0, "length": 5}]},
+                   api=FakeApi(refuse_entities=True))
+        self.assertIn("r1", self.flows)
+        self.assertEqual(self.flows["r1"]["text"], RESULTS_TEXT)
+        self.assertEqual(self.saved.calls, [])
+
+    def test_a_link_in_the_edited_text_keeps_its_address(self):
+        self._edit({"text": "Итоги: [пост](https://t.me/papka/9)"})
+        self._send()
+        [post] = self.api.posts_to(MAIN_CHAT_ID)
+        self.assertEqual(post["text"], "Итоги: пост")
+        self.assertEqual(post["entities"], [{"type": "text_link", "url": "https://t.me/papka/9", "offset": 7, "length": 4}])
 
 
 if __name__ == "__main__":

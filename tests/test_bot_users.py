@@ -94,18 +94,39 @@ class FakeApi:
         self.actions = []
         self.documents = []
         self.markups = []
+        self.flood_after_album = set()
 
     def _maybe_fail(self, chat_id):
         if chat_id in self.errors:
             raise ChatSummaryError(self.errors[chat_id])
 
     async def send_message(self, chat_id, text, reply_to_message_id=None, reply_markup=None,
-                           parse_mode=None, disable_notification=False):
+                           parse_mode=None, disable_notification=False, entities=None):
         self._maybe_fail(chat_id)
+        if chat_id in self.flood_after_album:
+            # A flood wait right after the album went out, once per person.
+            self.flood_after_album.discard(chat_id)
+            raise ChatSummaryError("Too Many Requests: retry after 1")
         item = {"message_id": 100 + len(self.sent), "chat_id": chat_id, "text": text,
-                "reply_markup": reply_markup}
+                "reply_markup": reply_markup, "entities": entities, "kind": "text"}
         self.sent.append(item)
         return item
+
+    async def send_photo(self, chat_id, photo, caption, reply_to_message_id=None,
+                         reply_markup=None, parse_mode=None, caption_entities=None):
+        self._maybe_fail(chat_id)
+        item = {"message_id": 100 + len(self.sent), "chat_id": chat_id, "text": caption,
+                "reply_markup": reply_markup, "entities": caption_entities, "kind": "photo",
+                "photo": photo}
+        self.sent.append(item)
+        return item
+
+    async def send_media_group(self, chat_id, media):
+        self._maybe_fail(chat_id)
+        item = {"message_id": 100 + len(self.sent), "chat_id": chat_id, "text": None,
+                "reply_markup": None, "kind": "album", "photos": [m["media"] for m in media]}
+        self.sent.append(item)
+        return [item]
 
     async def edit_message_text(self, chat_id, message_id, text, reply_markup=None, parse_mode=None):
         self.edits.append({"chat_id": chat_id, "message_id": message_id, "text": text,
@@ -449,6 +470,35 @@ class MailingTests(_Registry, unittest.TestCase):
             [button] = _buttons(message["reply_markup"])
             self.assertEqual(button["web_app"], {"url": "https://example.com" + bot_listener.vote_web.ROUTE_PREFIX})
         self.assertEqual(api.to(3), [], "somebody who blocked the bot is not written to")
+        self.assertIn("доставлено 2 из 2", api.edits[-1]["text"])
+
+    def test_a_formatted_picture_reaches_each_person_with_its_caption_and_link(self):
+        self.seed({"1": "active"})
+        link = {"type": "text_link", "offset": 0, "length": 9, "url": "https://t.me/papka/5"}
+        api = self._tap("dmyes", {"f1": _flow(text="Голосуем!", entities=[link], photos=["pic"])},
+                        background_tasks=set())
+        [message] = api.to(1)
+        self.assertEqual((message["kind"], message["photo"], message["text"]), ("photo", "pic", "Голосуем!"))
+        self.assertEqual(message["entities"], [link])
+        self.assertIn("web_app", _buttons(message["reply_markup"])[0])
+
+    def test_a_flood_wait_after_an_album_does_not_send_the_album_twice(self):
+        """deliver() tries a person again after "retry after N"; the album that already
+        went out must not go out a second time."""
+        self.seed({"1": "active", "2": "active"})
+        api = FakeApi()
+        api.flood_after_album = {1}
+        real_deliver = bot_users.deliver
+
+        async def no_wait(*args, **kwargs):
+            async def sleep(_seconds):
+                return None
+            return await real_deliver(*args, **{**kwargs, "sleep": sleep})
+
+        with patch.object(bot_users, "deliver", no_wait):
+            self._tap("dmyes", {"f1": _flow(photos=["p1", "p2"])}, api=api, background_tasks=set())
+        self.assertEqual([item["kind"] for item in api.to(1)], ["album", "text"])
+        self.assertEqual([item["kind"] for item in api.to(2)], ["album", "text"])
         self.assertIn("доставлено 2 из 2", api.edits[-1]["text"])
 
     def test_the_arena_announcement_opens_the_arena(self):

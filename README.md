@@ -1131,8 +1131,10 @@ page that changes shape depending on who opens it:
   is closed the page is what it always was. The
   browser page has the same tabs and builds **one** `/start vote-…` link carrying a choice
   from every round; the bot sorts each work back into its round and records each ballot
-  under that round's own rules. "/vote картинка" draws a picture per round, the cropping
-  page switches rounds with `?poll=`. Each round is an ordinary poll under `#итогимесяца` (ids like `2026-10-bronze`,
+  under that round's own rules. "/vote картинка" draws the month as **one** picture — the
+  month's title, then a section per round under a heading in its medal's colour, each
+  ranked by its own votes (`vote_image.render_month_image`) — and the cropping page
+  switches rounds with `?poll=`. Each round is an ordinary poll under `#итогимесяца` (ids like `2026-10-bronze`,
   the same as the archived rounds), so announcing, the board picture and the results draft
   work as for any vote; its winner takes the round's own medal in the Hall of Fame
   (`Poll.tier` → `Contest.tier`). Pressing the button again rebuilds only rounds nobody has
@@ -1161,6 +1163,21 @@ page that changes shape depending on who opens it:
   codebase otherwise sweeps away as noise, the whole point of it is to still be there
   tomorrow. Leaving `VOTE_ANNOUNCE_EXTRA_CHAT` blank simply removes the second and third
   buttons rather than offering a destination that could not work.
+
+  The reply can be **text, a picture with a caption, or an album** (up to 10 pictures),
+  and the formatting comes along: bold, spoilers and hidden links the admin's app put on
+  the text are kept as entities, and Markdown typed out by hand (`[текст](ссылка)`,
+  `**жирный**`, `__курсив__`, `~~зачёркнутый~~`, `||спойлер||`, `` `код` ``) is converted
+  (`tg_markdown.py`) — reading only the bare text used to drop every hidden link's address.
+  Before the destination question the bot posts a **preview**: the announcement itself,
+  exactly as it will go out, so a link that did not come out shows up in the DM rather than
+  in the group; one Telegram refuses ends the draft with Telegram's reason. A picture
+  carries its caption and the button in one message (past the 1024-character caption limit
+  the text follows it as its own message); an album cannot carry a button, so the pictures
+  go first and the text with the button right after them. An album's pictures reach the
+  bot one message each, so the first waits 1.5 s in a background task for the rest. The
+  results draft's "Редактировать" takes the same kinds of reply; there a picture without a
+  caption is attached to the results text already in the draft.
 
   The button on that posted announcement is a plain `url`, not a `web_app` one: Telegram
   accepts a Mini App button only in a private chat and rejects one posted to a group. With
