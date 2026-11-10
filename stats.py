@@ -1297,6 +1297,88 @@ def revoke_custom_badge(entry: str, badge_id: str, user_id: int | str) -> Badge 
     )
 
 
+_DASHES = str.maketrans({"–": "-", "—": "-", "‑": "-", "−": "-", "‒": "-"})
+
+
+def _badge_look(record: dict) -> tuple[str, str]:
+    """What a badge looks like to a person: its emoji without the invisible variation
+    selector, its name without case, dash style or extra spaces. Two badges with the same
+    look are one badge as far as anybody tapping a button can tell -- "🥈 …-СЕРЕБРО" and
+    "🥈️ … — серебро" render identically in a list."""
+    emoji = "".join(ch for ch in str(record.get("emoji") or "") if ch not in "\ufe0f\ufe0e" and not ch.isspace())
+    name = re.sub(r"\s*-\s*", "-", " ".join(str(record.get("name") or "").translate(_DASHES).split()))
+    name = name.casefold()
+    return emoji, name
+
+
+def _custom_badge(record: dict) -> Badge:
+    return Badge(
+        badge_id=record["id"], emoji=record["emoji"], name=record["name"],
+        description="выдан администратором", custom=True,
+    )
+
+
+def revoke_custom_badge_from(entry: str, badge_id: str, user_ids) -> tuple[Badge, str, int] | None:
+    """Take one `badge_id` off whichever of `user_ids` holds it: (badge, holder's id, how
+    many they have left), or None when none of them does.
+
+    Two things the plain revoke_custom_badge missed, and an administrator could not undo
+    an award because of them (reported 2026-11-09: «У Павел нет этого значка» about a badge
+    his /stat showed):
+    - `user_ids` is every record the admin's answer matched, not only the first: one
+      person can sit in the stats twice, and the badge on the other record was invisible.
+    - A badge that LOOKS the same (_badge_look) counts as the same: with two near-identical
+      definitions in the list, the one tapped need not be the one that was given.
+    The exact badge is always tried before a look-alike. One store read, at most one write.
+    """
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+    selected = data["badges"].get(badge_id)
+    badge_ids = [badge_id]
+    if selected is not None:
+        look = _badge_look(selected)
+        badge_ids += [
+            other_id for other_id, record in data["badges"].items()
+            if other_id != badge_id and _badge_look(record) == look
+        ]
+    for user_id in dict.fromkeys(str(u) for u in user_ids if u is not None):
+        assigned = data["assignments"].get(user_id) or {}
+        for held_id in badge_ids:
+            held = assigned.get(held_id)
+            if held is None:
+                continue
+            count = _badge_stack_count(held) - 1
+            if count >= 1 and isinstance(held, dict):
+                held["count"] = count
+            else:
+                assigned.pop(held_id, None)
+                count = 0
+            _save_custom_badge_data(entry, data)
+            record = data["badges"].get(held_id) or selected
+            if record is None:
+                return None
+            return _custom_badge(record), user_id, count
+    return None
+
+
+def custom_badges_held(entry: str, user_ids) -> list[Badge]:
+    """Every custom badge any of `user_ids` holds, once each -- what an administrator is
+    offered to pick from when the badge they chose is not among them."""
+    try:
+        data = _load_custom_badge_data(entry)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return []
+    held: dict[str, Badge] = {}
+    for user_id in dict.fromkeys(str(u) for u in user_ids if u is not None):
+        for badge_id in (data["assignments"].get(user_id) or {}):
+            record = data["badges"].get(badge_id)
+            if record is not None and badge_id not in held:
+                held[badge_id] = _custom_badge(record)
+    return list(held.values())
+
+
 def list_custom_badges(entry: str) -> list[Badge]:
     data = _load_custom_badge_data(entry)
     records = sorted(data["badges"].values(), key=lambda item: item.get("created_at", ""))
@@ -3407,6 +3489,17 @@ def format_works(
     return messages
 
 
+def _find_users(users: dict[str, UserStats], name_or_username: str) -> list[UserStats]:
+    """Every tracked record the answer names EXACTLY: by @username, then -- only when no
+    username matched -- by the whole display name. _find_user picks one of them; this is
+    for the places where the same person sitting in the stats twice matters."""
+    needle = (name_or_username or "").strip().lstrip("@").lower()
+    if not needle:
+        return []
+    by_username = [s for s in users.values() if s.username and needle == s.username.lower()]
+    return by_username or [s for s in users.values() if needle == s.display_name.strip().lower()]
+
+
 def _find_user(users: dict[str, UserStats], name_or_username: str) -> UserStats | None:
     """Case-insensitive match against a tracked user's @username (exact), then their
     display name (exact), then a substring of it -- same idea as telegram_fetch.
@@ -3468,7 +3561,7 @@ async def chat_tree_totals(
 
 async def resolve_stat_target(
     client, chat_ref, entry: str, arg: str, requester_username: str | None, requester_display_name: str, tz,
-    log=print, frozen_days_for=None, requester_id=None,
+    log=print, frozen_days_for=None, requester_id=None, also_matching: list | None = None,
 ) -> tuple[UserStats | None, int | None, int, int | None, int | None]:
     """Resolves who a /stat command is asking about: an explicit argument (@username or
     a name fragment) if given, otherwise the requester's own tracked stats -- by their
@@ -3493,9 +3586,14 @@ async def resolve_stat_target(
     `frozen_days_for`, if given, is called with the resolved user_id and returns the days
     covered by bought streak freezes (economy.apply_streak_freezes). It is injected as a
     callback rather than imported because economy imports this module, and it can only be
-    called once the target is known -- which is here, not in the caller."""
+    called once the target is known -- which is here, not in the caller.
+
+    `also_matching`, if given, is filled with every record an explicit `arg` names
+    exactly (_find_users) -- from the same aggregate, so it costs no second read."""
     all_time = await aggregate_all_time_live(client, chat_ref, entry, tz, log=log)
     total = len(all_time)
+    if arg and also_matching is not None:
+        also_matching.extend(_find_users(all_time, arg))
     if arg:
         user = _find_user(all_time, arg)
     else:

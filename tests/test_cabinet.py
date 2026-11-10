@@ -1124,5 +1124,85 @@ class MenuRegistrationTests(unittest.TestCase):
         asyncio.run(bot_listener.register_bot_menu(FailingAPI(), log=lambda *_: None))
 
 
+class BadgeRevokeFromAnyRecordTests(unittest.TestCase):
+    """revoke_custom_badge_from: «У Павел нет этого значка» about a badge his /stat showed
+    (2026-11-09). The badge may sit on another stats record of the same person, or be a
+    look-alike of the one tapped in the list."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.silver = stats.create_custom_badge("chat", "🥈", "Лучшая работа месяца - СЕРЕБРО", 10, "Admin")
+        # The same badge to the eye: a variation selector and a long dash.
+        self.twin = stats.create_custom_badge("chat", "🥈️", "Лучшая работа месяца — серебро", 10, "Admin")
+        self.gold = stats.create_custom_badge("chat", "🥇", "Лучшая работа месяца - ЗОЛОТО", 10, "Admin")
+
+    def _counting_writes(self):
+        writes = []
+        real = stats._save_custom_badge_data
+
+        def save(entry, data):
+            writes.append(entry)
+            return real(entry, data)
+
+        patcher = patch.object(stats, "_save_custom_badge_data", save)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return writes
+
+    def test_a_look_alike_of_the_tapped_badge_is_taken(self):
+        stats.give_custom_badge("chat", self.twin.badge_id, "20", "Павел", 10, "Admin")
+        writes = self._counting_writes()
+        badge, holder, left = stats.revoke_custom_badge_from("chat", self.silver.badge_id, ["20"])
+        self.assertEqual((badge.badge_id, holder, left), (self.twin.badge_id, "20", 0))
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+        self.assertEqual(len(writes), 1)
+
+    def test_a_different_badge_is_never_taken_for_the_tapped_one(self):
+        stats.give_custom_badge("chat", self.gold.badge_id, "20", "Павел", 10, "Admin")
+        writes = self._counting_writes()
+        self.assertIsNone(stats.revoke_custom_badge_from("chat", self.silver.badge_id, ["20"]))
+        self.assertEqual(writes, [], "nothing taken, nothing written")
+        self.assertEqual(len(stats.custom_badges_for_user("chat", "20")), 1)
+
+    def test_the_badge_on_another_record_of_the_same_person_is_found(self):
+        stats.give_custom_badge("chat", self.silver.badge_id, "777", "Павел", 10, "Admin")
+        badge, holder, _ = stats.revoke_custom_badge_from("chat", self.silver.badge_id, ["20", "777"])
+        self.assertEqual((badge.badge_id, holder), (self.silver.badge_id, "777"))
+
+    def test_the_exact_badge_goes_before_its_look_alike(self):
+        stats.give_custom_badge("chat", self.twin.badge_id, "20", "Павел", 10, "Admin")
+        stats.give_custom_badge("chat", self.silver.badge_id, "20", "Павел", 10, "Admin")
+        badge, _, _ = stats.revoke_custom_badge_from("chat", self.silver.badge_id, ["20"])
+        self.assertEqual(badge.badge_id, self.silver.badge_id)
+        self.assertEqual([b.badge_id for b in stats.custom_badges_for_user("chat", "20")], [self.twin.badge_id])
+
+    def test_one_tap_takes_one_off_a_stack(self):
+        for _ in range(2):
+            stats.give_custom_badge("chat", self.silver.badge_id, "20", "Павел", 10, "Admin", stack=True)
+        _, _, left = stats.revoke_custom_badge_from("chat", self.silver.badge_id, ["20"])
+        self.assertEqual(left, 1)
+        self.assertEqual(stats.custom_badges_for_user("chat", "20")[0].name, "Лучшая работа месяца - СЕРЕБРО")
+
+    def test_what_a_person_holds_is_listed_once_across_records(self):
+        stats.give_custom_badge("chat", self.gold.badge_id, "20", "Павел", 10, "Admin")
+        stats.give_custom_badge("chat", self.gold.badge_id, "777", "Павел", 10, "Admin")
+        stats.give_custom_badge("chat", self.twin.badge_id, "777", "Павел", 10, "Admin")
+        held = stats.custom_badges_held("chat", ["20", "777"])
+        self.assertEqual([b.badge_id for b in held], [self.gold.badge_id, self.twin.badge_id])
+
+    def test_every_exactly_named_record_is_matched(self):
+        users = {
+            "20": stats.UserStats(user_id="20", username="Alecsiel", display_name="Павел"),
+            "777": stats.UserStats(user_id="777", username="alecsiel", display_name="Паша"),
+            "30": stats.UserStats(user_id="30", username="other", display_name="Павел Другой"),
+        }
+        self.assertEqual([u.user_id for u in stats._find_users(users, "@Alecsiel")], ["20", "777"])
+        self.assertEqual([u.user_id for u in stats._find_users(users, "Павел")], ["20"])
+
+
 if __name__ == "__main__":
     unittest.main()

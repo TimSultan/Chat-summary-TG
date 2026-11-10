@@ -816,6 +816,8 @@ def _reset_badge_flow_step(flow: dict) -> None:
     flow["selected_badge_id"] = None
     flow["prompt_message_id"] = None
     flow["silent"] = False
+    flow.pop("revoke_user_ids", None)
+    flow.pop("revoke_name", None)
     # `target` is a preset recipient (/badge in reply to somebody). It belongs to the flow
     # as a whole rather than to a step, so it survives -- going back to the menu must not
     # silently turn "give this badge to Петя" into "give this badge to nobody in particular".
@@ -1474,6 +1476,23 @@ async def handle_badge_callback(
         _restart_badge_flow(flow)
         return
 
+    if action == "revone" and badge_id:
+        # A badge picked from what the person actually holds (see _revoke_badge_from_flow).
+        user_ids = flow.get("revoke_user_ids")
+        if not user_ids:
+            await api.send_message(
+                flow["chat_id"], "Эта кнопка устарела — выбери «Забрать значок» заново.",
+                reply_to_message_id=message.get("message_id"),
+                reply_markup=_badge_menu_keyboard(flow_id), parse_mode=None,
+            )
+            return
+        flow["created_at"] = time.monotonic()
+        await _revoke_badge_from_flow(
+            api, flow, flow_id, badge_id, user_ids, flow.get("revoke_name") or "участника",
+            message.get("message_id"), offer_held=False,
+        )
+        return
+
     if action == "rev" and badge_id:
         flow["selected_badge_id"] = badge_id
         flow["awaiting"] = "revoke_target"
@@ -1487,6 +1506,50 @@ async def handle_badge_callback(
         )
         flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
         return
+
+
+async def _revoke_badge_from_flow(api: TelegramBotAPI, flow: dict, flow_id: str, badge_id: str,
+                                  user_ids: list, name: str, reply_to_message_id,
+                                  offer_held: bool = True) -> None:
+    """Takes one `badge_id` away from the person behind `user_ids` and says so in the DM.
+
+    When they turn out not to hold it, the badges they DO hold come back as buttons
+    instead of a dead end: an administrator who picked the wrong one of two look-alike
+    badges, or whose award landed somewhere the lookup does not reach, can still take
+    the right one off with one tap.
+
+    Deliberately NOT announced in the group: an award is good news worth sharing, having
+    one taken away is not something to publish about somebody.
+    """
+    revoked = stats.revoke_custom_badge_from(flow["entry"], badge_id, user_ids)
+    if revoked is not None:
+        badge, _, left = revoked
+        await api.send_message(
+            flow["chat_id"],
+            f"Забрал значок {badge.label} у {name}." + (f" Осталось: ×{left}." if left else ""),
+            reply_to_message_id=reply_to_message_id, parse_mode=None,
+        )
+        return
+    held = stats.custom_badges_held(flow["entry"], user_ids) if offer_held else []
+    if not held:
+        await api.send_message(
+            flow["chat_id"],
+            f"У {name} нет этого значка." + ("" if not offer_held else " И других значков от админов тоже нет."),
+            reply_to_message_id=reply_to_message_id, parse_mode=None,
+        )
+        return
+    flow["revoke_user_ids"] = [str(user_id) for user_id in dict.fromkeys(user_ids)]
+    flow["revoke_name"] = name
+    await api.send_message(
+        flow["chat_id"],
+        f"У {name} нет значка, который ты выбрал. Вот значки, которые у {name} есть, — нажми тот, что забрать:",
+        reply_to_message_id=reply_to_message_id,
+        reply_markup={"inline_keyboard": [
+            [{"text": badge.label, "callback_data": _badge_callback_data("revone", flow_id, badge.badge_id)}]
+            for badge in held
+        ] + [_badge_back_row(flow_id)]},
+        parse_mode=None,
+    )
 
 
 async def handle_badge_text_input(
@@ -1594,8 +1657,12 @@ async def handle_badge_text_input(
         return True
 
     if flow["awaiting"] == "revoke_target":
+        # Every record the answer names, not only the first: one person can sit in the
+        # stats twice, and the badge may be on the other one (see revoke_custom_badge_from).
+        matches: list = []
         target, _, _, _, _ = await stats.resolve_stat_target(
-            telethon_client, flow["entry"], flow["entry"], text, None, "", tz, log=log
+            telethon_client, flow["entry"], flow["entry"], text, None, "", tz, log=log,
+            also_matching=matches,
         )
         if target is None:
             prompt = await api.send_message(
@@ -1607,18 +1674,12 @@ async def handle_badge_text_input(
             )
             flow["prompt_message_id"] = prompt.get("message_id") if prompt else None
             return True
+        badge_id = flow["selected_badge_id"]
         _restart_badge_flow(flow)
-        revoked = stats.revoke_custom_badge(
-            flow["entry"], flow["selected_badge_id"], target.user_id
-        )
-        # Deliberately NOT announced in the group: an award is good news worth sharing,
-        # having one taken away is not something to publish about somebody.
-        await api.send_message(
-            chat_id,
-            f"Забрал значок {revoked.label} у {target.display_name}." if revoked
-            else f"У {target.display_name} нет этого значка.",
-            reply_to_message_id=message["message_id"],
-            parse_mode=None,
+        await _revoke_badge_from_flow(
+            api, flow, flow_id, badge_id,
+            [target.user_id] + [match.user_id for match in matches],
+            target.display_name, message["message_id"],
         )
         return True
 
