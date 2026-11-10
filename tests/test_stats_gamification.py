@@ -1863,5 +1863,79 @@ class BadgeBackButtonTests(AsyncTestCase):
                 self.assertEqual(flows, {})
 
 
+class BadgeRevokeFlowTests(AsyncTestCase):
+    """«Забрать значок» end to end: the badge list, the name, the answer."""
+
+    ADMIN = {"id": 10, "first_name": "Admin"}
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        patcher = patch("stats._stats_dir", return_value=Path(self._temporary.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self._temporary.cleanup)
+        self.silver = stats.create_custom_badge("chat", "🥈", "Лучшая работа месяца - СЕРЕБРО", 10, "Admin")
+        self.gold = stats.create_custom_badge("chat", "🥇", "Лучшая работа месяца - ЗОЛОТО", 10, "Admin")
+        # One person, two records: the answer names both.
+        self.records = [
+            stats.UserStats(user_id="20", username="Alecsiel", display_name="Павел"),
+            stats.UserStats(user_id="777", username="alecsiel", display_name="Павел"),
+        ]
+
+    async def _resolve(self, client, chat_ref, entry, arg, *args, also_matching=None, **kwargs):
+        if also_matching is not None:
+            also_matching.extend(self.records)
+        return self.records[0], 1, 2, 0, 0
+
+    async def _revoke(self, badge_id, name="@Alecsiel"):
+        api, flows = FakeBotAPI(), {}
+        await bot_listener.handle_badge_command(
+            api, {"message_id": 1, "chat": {"id": 10, "type": "private"}, "from": self.ADMIN, "text": "/badge"},
+            "chat", -1001, flows,
+        )
+        flow_id = next(iter(flows))
+        for action, chosen in (("revlist", None), ("rev", badge_id)):
+            await bot_listener.handle_badge_callback(
+                api, {"id": "cb", "from": self.ADMIN, "message": api.sent[-1][0],
+                      "data": bot_listener._badge_callback_data(action, flow_id, chosen)}, flows,
+            )
+        prompt = api.sent[-1][0]
+        with patch("stats.resolve_stat_target", self._resolve):
+            consumed = await bot_listener.handle_badge_text_input(
+                api, None,
+                {"message_id": 6, "chat": {"id": 10, "type": "private"}, "from": self.ADMIN,
+                 "text": name, "reply_to_message": prompt},
+                timezone.utc, flows,
+            )
+        self.assertTrue(consumed)
+        return api, flows, flow_id
+
+    async def test_the_badge_on_the_persons_other_record_is_taken(self):
+        stats.give_custom_badge("chat", self.silver.badge_id, "777", "Павел", 10, "Admin")
+        api, _, _ = await self._revoke(self.silver.badge_id)
+        self.assertIn("Забрал значок 🥈 Лучшая работа месяца - СЕРЕБРО у Павел", api.sent[-1][0]["text"])
+        self.assertEqual(stats.custom_badges_for_user("chat", "777"), [])
+
+    async def test_the_wrong_pick_offers_the_badges_the_person_holds(self):
+        stats.give_custom_badge("chat", self.silver.badge_id, "20", "Павел", 10, "Admin")
+        api, flows, flow_id = await self._revoke(self.gold.badge_id)
+        offer, kwargs = api.sent[-1]
+        self.assertIn("нет значка, который ты выбрал", offer["text"])
+        buttons = [b for row in kwargs["reply_markup"]["inline_keyboard"] for b in row]
+        self.assertEqual(buttons[0]["text"], "🥈 Лучшая работа месяца - СЕРЕБРО")
+        self.assertEqual(buttons[-1]["text"], bot_listener.BADGE_BACK_BUTTON_TEXT)
+
+        await bot_listener.handle_badge_callback(
+            api, {"id": "cb", "from": self.ADMIN, "message": offer, "data": buttons[0]["callback_data"]}, flows,
+        )
+        self.assertIn("Забрал значок 🥈 Лучшая работа месяца - СЕРЕБРО у Павел", api.sent[-1][0]["text"])
+        self.assertEqual(stats.custom_badges_for_user("chat", "20"), [])
+
+    async def test_nobody_holding_anything_is_said_plainly(self):
+        api, _, _ = await self._revoke(self.gold.badge_id)
+        self.assertIn("У Павел нет этого значка", api.sent[-1][0]["text"])
+        self.assertIsNone(api.sent[-1][1].get("reply_markup"))
+
+
 if __name__ == "__main__":
     unittest.main()
