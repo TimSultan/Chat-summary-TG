@@ -1056,6 +1056,85 @@ class VoteApiTests(AsyncTestCase):
         self.assertEqual(admin["entries"][0]["crop"], {"x": 1.0, "y": 2.0, "size": 3.0})
         self.assertNotIn("crops", voter)
 
+    # ---- the main photo ---------------------------------------------------------------
+
+    def _seed_album(self):
+        """Work "a" posted as an album: a cat first, the actual work second."""
+        poll = self._seed_poll()
+        poll.entries[0].media = ["cat.jpg", "work.jpg", "wip.jpg"]
+        voting.set_crops(poll, {"a": {"x": 1, "y": 2, "size": 300}})
+        voting.save_poll(poll)
+        return poll
+
+    async def _cover(self, user_id, photo, entry_id="a"):
+        return await self.client.post(f"{vote_web.ROUTE_PREFIX}/api/cover", json={
+            "init_data": _init_data(user_id), "entry_id": entry_id, "photo": photo,
+        })
+
+    async def test_an_admin_picks_the_main_photo_and_everything_shows_it_first(self):
+        self._seed_album()
+        response = await self._cover(self.admin_id, "work.jpg")
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        prefix = f"{vote_web.ROUTE_PREFIX}/media/2026-08-02/"
+        self.assertEqual(data["photo"], prefix + "work.jpg")
+        self.assertEqual(data["photos"], [prefix + n for n in ("work.jpg", "cat.jpg", "wip.jpg")])
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        self.assertEqual(poll.entries[0].media, ["work.jpg", "cat.jpg", "wip.jpg"])
+        # The old crop framed the cat; it must not frame the new photo at random.
+        self.assertNotIn("a", poll.crops)
+        # The ballot and the results now lead with the chosen photo.
+        voter = await (await self.client.get(
+            f"{vote_web.ROUTE_PREFIX}/api/poll?mode=admin",
+            headers={"X-Telegram-Init-Data": _init_data(self.admin_id)},
+        )).json()
+        self.assertEqual(voter["entries"][0]["photos"][0], prefix + "work.jpg")
+        self.assertEqual(voter["results"][0]["photo"], prefix + "work.jpg")
+
+    async def test_picking_the_photo_that_is_already_main_keeps_the_crop(self):
+        self._seed_album()
+        response = await self._cover(self.admin_id, "cat.jpg")
+        self.assertEqual(response.status, 200)
+        poll = voting.load_poll(CHAT, "2026-08-02")
+        self.assertEqual(poll.entries[0].media, ["cat.jpg", "work.jpg", "wip.jpg"])
+        self.assertIn("a", poll.crops)
+
+    async def test_a_non_admin_cannot_pick_the_main_photo(self):
+        self._seed_album()
+        response = await self._cover(self.voter_id, "work.jpg")
+        self.assertEqual(response.status, 403)
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").entries[0].media[0], "cat.jpg")
+
+    async def test_a_photo_or_work_that_is_not_there_is_refused(self):
+        self._seed_album()
+        for entry_id, photo in (("a", "../../etc/passwd"), ("a", "other.jpg"), ("ghost", "work.jpg")):
+            with self.subTest(entry_id=entry_id, photo=photo):
+                response = await self._cover(self.admin_id, photo, entry_id)
+                self.assertEqual(response.status, 404)
+        self.assertEqual(voting.load_poll(CHAT, "2026-08-02").entries[0].media[0], "cat.jpg")
+
+    async def test_the_exported_picture_draws_the_main_photo(self):
+        from PIL import Image
+
+        self._seed_album()
+        directory = voting.media_path(CHAT, "2026-08-02")
+        directory.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (300, 300), (250, 0, 0)).save(directory / "cat.jpg", "JPEG")
+        Image.new("RGB", (300, 300), (0, 0, 250)).save(directory / "work.jpg", "JPEG")
+        await self._cover(self.admin_id, "work.jpg")
+        data = await (await self.client.post(
+            f"{vote_web.ROUTE_PREFIX}/api/export", json={"init_data": _init_data(self.admin_id)},
+        )).json()
+        self.assertEqual(data["entries"], 1)
+        with Image.open(voting.export_image_path(CHAT, "2026-08-02")) as picture:
+            import vote_image
+            red, green, blue = picture.convert("RGB").getpixel(
+                (vote_image.MARGIN + vote_image.CARD_WIDTH // 2, picture.height - vote_image.MARGIN
+                 - vote_image.CAPTION_HEIGHT - vote_image.THUMB_HEIGHT // 2)
+            )
+        self.assertGreater(blue, 150)
+        self.assertLess(red, 100)
+
     async def test_the_board_page_loads_without_auth_and_talks_to_the_admin_api(self):
         """The HTML shell is public like the ballot's; what makes it admin-only is that
         every request it makes is (mode=admin, /api/crops, /api/export)."""
@@ -1069,6 +1148,29 @@ class VoteApiTests(AsyncTestCase):
         # scroll the page out from under the finger.
         self.assertIn('stage.addEventListener("pointerdown"', page)
         self.assertIn("touch-action: none", page)
+        self.assertIn("/api/cover", page)
+
+    def test_the_board_pages_script_is_valid_javascript(self):
+        """One broken literal and the cropping page opens blank while every route still
+        answers 200 -- parsed by node, as test_arena_web does for the arena's page."""
+        import os
+        import re
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to parse the page")
+        page = vote_web.BOARD_HTML.replace("__PREFIX__", vote_web.ROUTE_PREFIX)
+        [script] = re.findall(r"<script>(.*?)</script>", page, re.S)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            result = subprocess.run([node, "--check", path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.unlink(path)
 
     async def test_exporting_four_across_writes_its_own_wider_file(self):
         """Four-across is a different picture, not a replacement: both files survive, so

@@ -620,6 +620,25 @@ def set_crops(poll: "Poll", crops: dict) -> "Poll":
     return poll
 
 
+def set_cover(poll: "Poll", entry_id: str, photo: str) -> "Entry | None":
+    """Makes `photo` -- one of the entry's own file names -- its main picture: the first
+    of its media, which is the one everything shows (the ballot's grid, the results, the
+    board picture, the Hall of Fame). People post a cat or a work in progress first; the
+    administrator picks the real one on the cropping page.
+
+    The rest keep their order. The entry's framing goes with the old cover, since a crop
+    is a square in ITS pixels and would frame the new photo at random. Returns the entry,
+    or None when the poll has no such entry or the entry no such photo; choosing the photo
+    that is already first changes nothing, crop included."""
+    entry = next((e for e in poll.entries if e.entry_id == str(entry_id)), None)
+    if entry is None or photo not in entry.media:
+        return None
+    if entry.media[0] != photo:
+        entry.media = [photo] + [name for name in entry.media if name != photo]
+        poll.crops.pop(entry.entry_id, None)
+    return entry
+
+
 def export_dir() -> Path:
     """Where rendered board pictures live. Its own directory for the same reason
     results_path has one: latest_poll globs "<key>_*.json" out of the voting dir itself,
