@@ -599,6 +599,40 @@ async def handle_crops(request: web.Request) -> web.Response:
     return web.json_response({"ok": True, "crops": poll.crops})
 
 
+async def handle_cover(request: web.Request) -> web.Response:
+    """The cropping page's "Главное фото": which of a work's photos is the one it is shown
+    by (voting.set_cover). Administrators only, under poll_lock like handle_crops. Saved
+    on the tap rather than with "Сохранить": the new photo needs a crop of its own before
+    anything can be framed, and the page asks for one only once the server has it.
+
+    Answers the work's photos in their new order, so the page swaps the picture without
+    reloading the poll."""
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return _json_error("malformed request body")
+
+    user = await _authenticate(request, body)
+    if not await request.app[_IS_ADMIN_KEY](user):
+        return _json_error("только администраторы могут выбирать главное фото", status=403)
+
+    entry_name = request.app[_ENTRY_KEY]
+    async with voting.poll_lock:
+        poll, problem = _requested_poll(entry_name, body, moderating=True)
+        if problem is not None:
+            return problem
+        work = voting.set_cover(poll, str(body.get("entry_id") or ""), str(body.get("photo") or ""))
+        if work is None:
+            return _json_error("нет такой работы или такого фото", status=404)
+        voting.save_poll(poll)
+    request.app[_LOG_KEY](
+        f"[vote_web] {voting.display_name(user)} made {work.media[0]} the main photo of {work.entry_id}"
+    )
+    base = request.app[_ROUTE_PREFIX_KEY]
+    photos = [f"{base}/media/{poll.poll_id}/{name}" for name in work.media]
+    return web.json_response({"ok": True, "photos": photos, "photo": photos[0]})
+
+
 async def handle_export(request: web.Request) -> web.Response:
     """Renders the board as one picture and hands it to bot_listener.py to deliver.
     Administrators only.
@@ -947,6 +981,7 @@ def create_app(
         web.get(f"{prefix}/api/stats", handle_vote_stats),
         web.post(f"{prefix}/api/moderate", handle_moderate),
         web.post(f"{prefix}/api/crops", handle_crops),
+        web.post(f"{prefix}/api/cover", handle_cover),
         web.post(f"{prefix}/api/export", handle_export),
         web.post(f"{prefix}/api/announce", handle_announce),
         web.post(f"{prefix}/api/clear", handle_clear),
@@ -2810,6 +2845,19 @@ BOARD_HTML = """<!doctype html>
   .erow button.primary { background: var(--accent); color: var(--accent-fg);
                          border-color: var(--accent); font-weight: 600; }
   .ehint { color: var(--muted); font-size: 12px; text-align: center; margin-top: 10px; }
+  /* "Главное фото": a work posted as an album is shown by its first photo, and people
+     post a cat or a sketch first. The strip picks which one the work is shown by. */
+  .covers { max-width: 460px; width: 100%; margin: 0 auto 12px; }
+  .clabel { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+  .cstrip { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; }
+  .cthumb { flex: none; width: 64px; height: 64px; padding: 0; border-radius: 10px;
+            border: 2px solid transparent; overflow: hidden; background: var(--thumb-bg);
+            cursor: pointer; }
+  .cthumb.on { border-color: var(--accent); }
+  .cthumb[disabled] { opacity: .5; cursor: default; }
+  .cthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .many { position: absolute; right: 5px; top: 5px; background: rgba(0,0,0,.6);
+          color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -2839,6 +2887,7 @@ BOARD_HTML = """<!doctype html>
     <button class="eclose" id="editorClose" aria-label="Закрыть">✕</button>
     <div class="ewho" id="editorWho"></div>
   </div>
+  <div class="covers" id="covers" hidden></div>
   <div class="stagewrap">
     <div class="stage" id="stage">
       <img id="stageImg" alt="">
@@ -2885,6 +2934,7 @@ let dirty = false;    // something changed since the last successful save
 let editing = null;   // id of the work the editor is open on
 let columns = 3;      // how many works per row, here AND in the exported picture
 let pollId = null;    // which poll this is: one of the month's rounds has a page of its own
+let photosById = {};  // id -> every photo of the work, the main one first (admin entries)
 
 const $ = (id) => document.getElementById(id);
 
@@ -2975,6 +3025,8 @@ function renderGrid() {
       '<div class="frame">' +
         (work.photo ? '<img alt="" src="' + esc(work.photo) + '">' : "") +
         '<span class="badge">' + (index + 1) + " - " + work.votes + "</span>" +
+        ((photosById[work.id] || []).length > 1
+          ? '<span class="many">фото: ' + photosById[work.id].length + "</span>" : "") +
         '<span class="edit">кадр</span>' +
       "</div>" +
       '<div class="who"><div class="name">' + esc(work.author || "") + "</div>" +
@@ -3025,6 +3077,7 @@ function openEditor(id) {
   editing = id;
   const work = works.find((w) => w.id === id);
   $("editorWho").textContent = whoText(work);
+  renderCovers(id);
   const img = $("stageImg");
   img.classList.remove("ready");
   img.src = work.photo;
@@ -3033,6 +3086,70 @@ function openEditor(id) {
   if (tg && tg.BackButton) tg.BackButton.show();
   const show = () => { applyTo(img, crops[id], natural[id], $("stage").clientWidth); syncZoom(); };
   if (img.complete && img.naturalWidth) show(); else img.addEventListener("load", show, { once: true });
+}
+
+// ------------------------------------------------------------------ the main photo
+
+function renderCovers(id) {
+  const box = $("covers");
+  const photos = photosById[id] || [];
+  const work = works.find((w) => w.id === id);
+  if (!work || photos.length < 2) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.innerHTML =
+    '<div class="clabel">Главное фото - нажми, каким показывать работу:</div><div class="cstrip">' +
+    photos.map((url) =>
+      '<button class="cthumb' + (url === work.photo ? " on" : "") + '" data-url="' + esc(url) + '">' +
+      '<img alt="" loading="lazy" src="' + esc(url) + '"></button>'
+    ).join("") + "</div>";
+  box.querySelectorAll("[data-url]").forEach((button) => {
+    button.addEventListener("click", () => setCover(id, button.dataset.url));
+  });
+}
+
+// Saved on the tap (see vote_web.handle_cover): the server puts the photo first and drops
+// the old crop, which framed a different picture. The new one starts fitted, as any
+// untouched card does, and is framed from there.
+async function setCover(id, url) {
+  const work = works.find((w) => w.id === id);
+  if (!work || url === work.photo) return;
+  const name = decodeURIComponent(url.split("/").pop().split("?")[0]);
+  document.querySelectorAll("#covers [data-url]").forEach((b) => { b.disabled = true; });
+  status("Меняю главное фото…");
+  try {
+    const response = await api("/api/cover", {
+      method: "POST",
+      body: JSON.stringify({ init_data: initData, poll_id: pollId, entry_id: id, photo: name }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "не получилось");
+    photosById[id] = data.photos;
+    work.photo = data.photo;
+    delete natural[id];
+    delete crops[id];
+    renderGrid();
+    if (editing === id) {
+      const img = $("stageImg");
+      img.classList.remove("ready");
+      let shown = false;
+      const show = () => {
+        if (shown || !img.naturalWidth) return;
+        shown = true;
+        natural[id] = { w: img.naturalWidth, h: img.naturalHeight };
+        if (!crops[id]) crops[id] = fitCrop(natural[id]);
+        paint(id);
+      };
+      img.addEventListener("load", show, { once: true });
+      img.src = work.photo;
+      if (img.complete) show();
+    }
+    renderCovers(id);
+    status("Главное фото выбрано. Кадр этой работы сброшен: фото вписано целиком.");
+    if (tg && tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success");
+  } catch (e) {
+    renderCovers(id);
+    status(esc(String(e.message || e)));
+  }
 }
 
 function closeEditor() {
@@ -3314,6 +3431,8 @@ window.addEventListener("beforeunload", (event) => {
     }
     crops = data.crops || {};
     works = data.results || [];
+    photosById = {};
+    (data.entries || []).forEach((entry) => { photosById[entry.id] = entry.photos || []; });
     if (!works.length) {
       $("sub").textContent = "";
       $("msg").hidden = false;
@@ -3322,7 +3441,9 @@ window.addEventListener("beforeunload", (event) => {
     }
     $("sub").textContent =
       "Работ: " + works.length + " · проголосовало " + (data.voter_count || 0) +
-      " · порядок как в картинке, по голосам";
+      " · порядок как в картинке, по голосам" +
+      (works.some((w) => (photosById[w.id] || []).length > 1)
+        ? " · у работ с несколькими фото в кадре можно выбрать главное" : "");
     $("tools").hidden = false;
     renderGrid();
     setColumns(columns);  // publishes --cols and lights the matching chip
