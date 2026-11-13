@@ -472,6 +472,14 @@ PRIVILEGED_MANAGEMENT_USERNAMES = frozenset({"sultan_kembayev"})
 REACTION_DELETE_USERNAMES = frozenset({"sultan_kembayev"})
 REACTION_DELETE_EMOJI = frozenset({"✍", "✍️"})
 
+# "/banuser @username" bans somebody from the main chat; "/unbanuser" lifts it. The
+# owner's alone, kept apart from both lists above for the same reason they are apart
+# from each other.
+BAN_COMMAND = "/banuser"
+UNBAN_COMMAND = "/unbanuser"
+BAN_USERNAMES = frozenset({"sultan_kembayev"})
+BAN_CALLBACK_PREFIX = "banuser"
+
 
 SHOP_COMMANDS = ("/shop", "/buy", "/coins")
 
@@ -13513,6 +13521,214 @@ async def maybe_handle_pets_flow_message(
     return False
 
 
+# ------------------------------------------------------------------------- /banuser
+#
+# The owner's ban. "/banuser @username" -- or in reply to somebody's message, or with a
+# numeric id -- removes that person from the main chat (from the group itself when typed
+# there) and keeps them out. The bot first shows WHO it found and asks once: a stale or
+# mistyped @username banning the wrong person cannot be undone by unbanning, since the
+# unbanned person is not put back into the chat. "/unbanuser" lifts a ban without asking.
+
+
+def _is_ban_owner(user: dict | None) -> bool:
+    return str((user or {}).get("username") or "").lstrip("@").lower() in BAN_USERNAMES
+
+
+def _ban_callback_data(action: str, chat_id, user_id) -> str:
+    return f"{BAN_CALLBACK_PREFIX}:{action}:{chat_id}:{user_id}"
+
+
+def _parse_ban_callback(data: str) -> tuple[str, int, int] | None:
+    parts = (data or "").split(":")
+    if len(parts) != 4 or parts[0] != BAN_CALLBACK_PREFIX or parts[1] not in ("ban", "no"):
+        return None
+    try:
+        return parts[1], int(parts[2]), int(parts[3])
+    except ValueError:
+        return None
+
+
+async def _find_by_username(telethon_client, entry: str | None, username: str, log=print) -> dict | None:
+    """{"id", "name", "username"} of whoever has @username, or None.
+
+    Telegram itself first (the userbot), since a username can move to another account and
+    only Telegram knows who holds it NOW; then the people who started the bot; then the
+    chat's stats, read in a thread (every recorded day). Exact usernames only: a near
+    match is how the wrong person gets banned."""
+    wanted = username.lstrip("@").lower()
+    if telethon_client is not None:
+        try:
+            entity = await telethon_client.get_entity(username)
+            if getattr(entity, "id", None) is not None and hasattr(entity, "first_name"):
+                return {
+                    "id": int(entity.id),
+                    "name": " ".join(p for p in (entity.first_name, getattr(entity, "last_name", None)) if p),
+                    "username": getattr(entity, "username", None) or wanted,
+                }
+        except Exception as e:  # noqa: BLE001 -- the other sources may still know them
+            log(f"[ban] Telegram did not resolve @{wanted}: {e}")
+    try:
+        for person in await asyncio.to_thread(bot_users.registry().people):
+            if person.username and person.username.lstrip("@").lower() == wanted and person.user_id.isdigit():
+                return {"id": int(person.user_id), "name": person.name, "username": person.username}
+    except Exception as e:  # noqa: BLE001
+        log(f"[ban] could not read who started the bot: {e}")
+    if entry:
+        try:
+            users = await asyncio.to_thread(stats.aggregate_all_time, entry)
+        except Exception as e:  # noqa: BLE001
+            log(f"[ban] could not read the chat's stats: {e}")
+            users = {}
+        for user in users.values():
+            user_id = str(getattr(user, "user_id", "") or "")
+            if user.username and user.username.lower() == wanted and user_id.isdigit():
+                return {"id": int(user_id), "name": user.display_name, "username": user.username}
+    return None
+
+
+async def handle_ban_command(api: TelegramBotAPI, telethon_client, message: dict, command_text: str,
+                             home_chat_ref: str | None, known_chat_ids: dict, unban: bool = False,
+                             log=print) -> None:
+    """/banuser and /unbanuser. The owner only (BAN_USERNAMES); anybody else typing it in
+    a group gets silence, in the DM one line."""
+    chat = message.get("chat") or {}
+    actor = message.get("from") or {}
+    private = chat.get("type") == "private"
+
+    async def reply(text: str, reply_markup=None) -> None:
+        try:
+            await api.send_message(
+                chat["id"], text, reply_to_message_id=message.get("message_id"),
+                reply_markup=reply_markup, parse_mode=None,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[ban] failed to reply: {e}")
+
+    if not _is_ban_owner(actor):
+        if private:
+            await reply("Эта команда только для владельца бота.")
+        return
+    command = UNBAN_COMMAND if unban else BAN_COMMAND
+
+    if private:
+        chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref else None
+        )
+        where = "в основном чате"
+        if chat_id is None:
+            await reply("Не нашёл основной чат -- некуда банить.")
+            return
+    else:
+        chat_id, where = chat["id"], "в этом чате"
+
+    target = None
+    replied = (message.get("reply_to_message") or {}).get("from") or {}
+    argument = command_text.split(maxsplit=1)[1].strip().split()[0] if len(command_text.split()) > 1 else ""
+    if replied.get("id") is not None and not replied.get("is_bot") and not argument:
+        target = {"id": int(replied["id"]), "name": bot_users.display_name(replied),
+                  "username": replied.get("username")}
+    elif argument.isdigit():
+        target = {"id": int(argument), "name": "", "username": None}
+    elif argument:
+        target = await _find_by_username(telethon_client, home_chat_ref, argument, log=log)
+        if target is None:
+            await reply(
+                f"Не нашёл {argument if argument.startswith('@') else '@' + argument}. "
+                f"Попробуй ответом на сообщение этого человека или по числовому id: {command} 123456789"
+            )
+            return
+    else:
+        await reply(
+            f"Как пользоваться: {command} @username -- или ответом на сообщение человека, "
+            f"или по числовому id: {command} 123456789."
+        )
+        return
+
+    # The member as Telegram sees them right now: the current name and @username, and
+    # whether they can be banned at all.
+    member = {}
+    try:
+        member = await api.get_chat_member(chat_id, target["id"])
+    except Exception as e:  # noqa: BLE001 -- never in the chat is still bannable
+        log(f"[ban] getChatMember for {target['id']} failed: {e}")
+    user = member.get("user") or {}
+    label = bot_users.person_label(
+        bot_users.display_name(user) or target.get("name"), user.get("username") or target.get("username"),
+        target["id"],
+    )
+    status = member.get("status")
+
+    if unban:
+        try:
+            await api.unban_chat_member(chat_id, target["id"])
+        except Exception as e:  # noqa: BLE001
+            await reply(f"Не получилось разбанить {label}: {e}")
+            return
+        await reply(
+            f"Бан снят: {label} {where}. Вернуться можно по ссылке-приглашению." if status == "kicked"
+            else f"{label}: не в бане {where} -- ничего не менял."
+        )
+        log(f"[ban] {actor.get('username')} unbanned {target['id']} in {chat_id}")
+        return
+
+    if status in ("creator", "administrator"):
+        await reply(f"{label} -- администратор чата: администратора бот забанить не может.")
+        return
+    if status == "kicked":
+        await reply(f"{label}: уже в бане {where}.")
+        return
+    note = ""
+    asked = argument.lstrip("@").lower() if argument and not argument.isdigit() else ""
+    if asked and user.get("username") and user["username"].lower() != asked:
+        note = f"\n⚠️ Сейчас у этого человека ник @{user['username']}, не @{asked}."
+    if status in ("left", None) and not note:
+        note = "\nСейчас не в чате -- бан не даст вернуться."
+    await reply(
+        f"Забанить {label} {where}? Сообщения останутся.{note}",
+        reply_markup={"inline_keyboard": [[
+            {"text": "🚫 Да, забанить", "callback_data": _ban_callback_data("ban", chat_id, target["id"])},
+            {"text": "Отмена", "callback_data": _ban_callback_data("no", chat_id, target["id"])},
+        ]]},
+    )
+
+
+async def handle_ban_callback(api: TelegramBotAPI, callback: dict, log=print) -> None:
+    """"🚫 Да, забанить" / "Отмена" under a /banuser question. The owner's taps only."""
+    parsed = _parse_ban_callback(callback.get("data"))
+    if parsed is None:
+        await api.answer_callback_query(callback["id"])
+        return
+    action, chat_id, user_id = parsed
+    clicker = callback.get("from") or {}
+    if not _is_ban_owner(clicker):
+        await api.answer_callback_query(callback["id"], text="Это только для владельца бота.")
+        return
+    await api.answer_callback_query(callback["id"])
+    message = callback.get("message") or {}
+    where_chat, message_id = (message.get("chat") or {}).get("id"), message.get("message_id")
+
+    async def finish(text: str) -> None:
+        try:
+            await api.edit_message_text(where_chat, message_id, text, reply_markup=None, parse_mode=None)
+        except Exception as e:  # noqa: BLE001
+            log(f"[ban] could not update the question: {e}")
+
+    if action == "no":
+        await finish("Бан отменён.")
+        return
+    question = message.get("text") or ""
+    who = question.removeprefix("Забанить ").split("?", 1)[0] or f"id {user_id}"
+    try:
+        await api.ban_chat_member(chat_id, user_id)
+    except Exception as e:  # noqa: BLE001 -- most often: the bot has no right to ban
+        await finish(f"Не получилось забанить: {e}")
+        log(f"[ban] banning {user_id} in {chat_id} failed: {e}")
+        return
+    await finish(f"🚫 Бан: {who}. Снять: {UNBAN_COMMAND} {user_id}")
+    log(f"[ban] {clicker.get('username')} banned {user_id} in {chat_id}")
+
+
 async def handle_moderator_reaction(api: TelegramBotAPI, cfg, reaction: dict, log=print) -> bool:
     """Delete a message a moderator has just reacted ✍️ to. True when it was deleted.
 
@@ -14152,6 +14368,8 @@ async def _dispatch_update(
             await handle_tripo_callback(api, callback, tripo_flows, background_tasks, log=log)
         elif callback_data.startswith(f"{summary_share.CALLBACK_PREFIX}:"):
             await handle_summary_share_callback(api, callback, bot_username, log=log)
+        elif callback_data.startswith(f"{BAN_CALLBACK_PREFIX}:"):
+            await handle_ban_callback(api, callback, log=log)
         elif callback_data.startswith(f"{SEABATTLE_CALLBACK_PREFIX_LITERAL}:"):
             # Decided from memory and answered before any other call, so it stays inline:
             # one press at a time is what keeps two quick taps from firing twice.
@@ -14465,6 +14683,13 @@ async def _dispatch_update(
             admin_chat_id,
             tz,
             log=log,
+        )
+        return
+    ban_match = re.match(rf"^({re.escape(BAN_COMMAND)}|{re.escape(UNBAN_COMMAND)})(?:\s|$)", command_text, re.IGNORECASE)
+    if ban_match:
+        await handle_ban_command(
+            api, telethon_client, message, command_text, home_chat_ref, known_chat_ids,
+            unban=ban_match.group(1).lower() == UNBAN_COMMAND, log=log,
         )
         return
     if re.match(rf"^{re.escape(DELETE_POKRAS_COMMAND)}(?:\s|$)", command_text, re.IGNORECASE):

@@ -214,6 +214,20 @@ purpose — deleting anybody's message is its own power.
 - Deleting a `#япокрасил` post this way does not take its figurine credit back — use
   `/deletepokras` for that, as before.
 
+### Banning somebody (`/banuser`)
+
+`/banuser @username` is the owner's alone (`BAN_USERNAMES`, `sultan_kembayev`); anybody
+else gets silence in a group and one line in the DM. Typed in the DM it bans from the main
+chat, typed in a group it bans from that group. Instead of a @username it takes a reply to
+the person's message or their numeric id. A @username is looked up exactly — Telegram via
+the userbot first, then the people who started the bot, then the chat's stats — and the
+bot then asks once, «Забанить Имя (@ник) в основном чате?», with the name and @username as
+Telegram has them now, warning when that @username is no longer the one typed. An
+administrator, or somebody already banned, is said so rather than asked about. The ban
+keeps their messages (`revoke_messages` off: it would delete every work they posted).
+`/unbanuser` (same targets) lifts a ban without asking and never kicks a current member.
+The bot needs the **ban users** admin right in that chat.
+
 ### Turning the game off (`GAME_ENABLED`)
 
 The pet game and the chat share one process, so the game's code sits in the chat's memory
