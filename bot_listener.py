@@ -209,6 +209,13 @@ try:
 except Exception:  # noqa: BLE001
     SEABATTLE_IMPORT_ERROR = traceback.format_exc()
     seabattle = None
+try:
+    # Mirrors /vote and the Hall of Fame to the Stranger Hands website (/competition). It
+    # reads the hall, so it stands or falls with it; a broken import costs the site its
+    # mirror, never the bot.
+    import site_mirror
+except Exception:  # noqa: BLE001
+    site_mirror = None
 import backup
 
 
@@ -15861,6 +15868,9 @@ async def run_bot_listener(
             # waiting for the pictures.
             async def _keep_the_closed_vote():
                 await asyncio.to_thread(_record_vote_in_hall, poll, standings, log)
+                # The website's mirror picks the new contest up now, not at its next minute.
+                if site_mirror is not None:
+                    site_mirror.wake()
                 # Then the zip, so it already holds the contest just recorded.
                 if getattr(cfg, "backup_chat_id", None):
                     problem = await _send_history_backup(
@@ -15904,6 +15914,21 @@ async def run_bot_listener(
             # it also has a restart's worth of overdue deletions to clear on the way up.
             _via_cleaner_loop(),
         ]
+        # The vote and the Hall of Fame on strangerhands.com/competition, when the site's
+        # address and token are set (site_mirror.py). Avatars through the ballot's own Bot
+        # API callable; the chat's @username or id for links to the original posts.
+        if site_mirror is not None and home_chat_ref:
+            async def _mirror_chat():
+                chat_id, username = await _cabinet_chat_ref(
+                    telethon_client, home_chat_ref, known_chat_ids, log=log,
+                )
+                return username, chat_id
+
+            mirror = site_mirror.mirror_from_env(
+                home_chat_ref, avatar=_fetch_vote_avatar, chat=_mirror_chat, log=log,
+            )
+            if mirror is not None:
+                tasks.append(mirror.run())
         if game_open():
             # Both settle and announce the game's own clocks -- farm expeditions coming
             # home, yesterday's chatter prizes. With the game closed there is nothing for

@@ -1360,6 +1360,36 @@ failed fetch is retried on the next view. The page carries `noindex`, so search 
 leave members' names alone. `HALL_BRAND` (default `ЕЧХ`) is the community's name in the
 header. Storage: `DATA_DIR/hall_of_fame/<chat key>/contests/*.json` and `media/<contest id>/`.
 
+### Mirrored on strangerhands.com — `/competition`
+
+The vote and the Hall of Fame also appear on the Stranger Hands website, in English and in
+that site's own design: **/competition** (the vote on now, or a month's three rounds),
+**/competition/hall** (the Hall of Fame and every contest) and **/competition/artists** (the
+leaderboard and a page per painter). `site_mirror.py` runs beside the voting server and,
+once a minute, looks at what the voting page shows (`voting.page_polls`) and at the Hall of
+Fame (`hall_of_fame.snapshot`). When either has changed since the last push that went
+through, it sends it: first asks the site which photos it lacks, uploads those one per
+request (base64, under their SHA-256, so nothing is ever sent twice), then posts the records
+naming photos by hash. Closing a vote also wakes it at once (`site_mirror.wake()` after the
+hall records the contest). A vote opening, a work admitted, a vote closed or a week cleared
+reaches the site within the minute; an idle week costs a directory listing.
+
+What leaves the bot is what the public browser page and the hall already show: the admitted
+works, captions, names, @tags, avatars, places and votes of closed contests, and how many
+people have voted in an open one. **No ballot, no count of a vote still open, and no Telegram
+user id**: a painter is named on the site by a salted hash of the hall's author key
+(`site_mirror.artist_id`), stable across renames. Links to the original posts go along when
+the chat can be resolved.
+
+The website translates the names, titles and captions itself (and transliterates a name
+while it waits). Voting there is for its registered members and locked for now; ballots are
+still cast here, in Telegram. A failed push is retried with a back-off up to 15 minutes and
+never touches the rest of the bot.
+
+Configure with `STRANGERHANDS_MIRROR_URL` (`https://strangerhands.com`) and
+`STRANGERHANDS_MIRROR_TOKEN` (the site's `COMPETITION_SYNC_TOKEN`); either blank and the
+mirror is off. Tests: `tests/test_site_mirror.py`.
+
 ### Keeping the history — votes, entrants and photos are never lost
 
 Every contest's record — who voted for what, who took part with which work, how it ended,
