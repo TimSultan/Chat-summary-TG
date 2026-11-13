@@ -84,6 +84,16 @@ class TelegramBotAPI:
     async def get_chat_member(self, chat_id, user_id: int) -> dict:
         return await self._call("getChatMember", chat_id=chat_id, user_id=user_id)
 
+    async def ban_chat_member(self, chat_id, user_id: int) -> None:
+        """Remove somebody from a group and keep them out (bot_listener's /banuser). Their
+        messages stay: revoke_messages would also wipe every work they ever posted."""
+        await self._call("banChatMember", chat_id=chat_id, user_id=user_id, revoke_messages=False)
+
+    async def unban_chat_member(self, chat_id, user_id: int) -> None:
+        """Lift a ban. only_if_banned, so that this never kicks out somebody who is in the
+        chat right now -- which is what a bare unbanChatMember does to a current member."""
+        await self._call("unbanChatMember", chat_id=chat_id, user_id=user_id, only_if_banned=True)
+
     async def get_user_profile_photo(self, user_id) -> str | None:
         """The largest available profile-photo file id, if Telegram exposes one to the bot."""
         photos = await self._call("getUserProfilePhotos", user_id=user_id, limit=1)
