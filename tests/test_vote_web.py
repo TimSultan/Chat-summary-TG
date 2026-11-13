@@ -1150,6 +1150,85 @@ class VoteApiTests(AsyncTestCase):
         self.assertIn("touch-action: none", page)
         self.assertIn("/api/cover", page)
 
+    def _node(self):
+        import shutil
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to run the page's script")
+        return node
+
+    def _run_node(self, source):
+        import os
+        import subprocess
+
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(source)
+            path = handle.name
+        try:
+            return subprocess.run([self._node(), path], capture_output=True, text=True)
+        finally:
+            os.unlink(path)
+
+    def test_the_ballot_pages_script_is_valid_javascript(self):
+        import re
+        import subprocess
+
+        page = vote_web.PAGE_HTML
+        [script] = re.findall(r"<script>(.*?)</script>", page, re.S)
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8") as handle:
+            handle.write(script)
+            path = handle.name
+        try:
+            result = subprocess.run([self._node(), "--check", path], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            import os
+            os.unlink(path)
+
+    def test_the_results_list_frames_exactly_the_works_this_person_voted_for(self):
+        """After voting, the "Голоса" list frames every row of this person's ballot --
+        all five cells of it, so the frame closes around the whole row -- and nothing
+        else; with no ballot there is no frame and no note about one."""
+        import json
+        import re
+
+        page = vote_web.PAGE_HTML
+        [script] = re.findall(r"<script>(.*?)</script>", page, re.S)
+        render = re.search(r"function renderResults\(\) \{.*?\n\}\n", script, re.S).group(0)
+        results = [{"id": i, "author": i.upper(), "username": None, "votes": v, "photo": None}
+                   for i, v in (("a", 3), ("b", 2), ("c", 1))]
+
+        def run(my_vote):
+            source = (
+                "const box = { hidden: true, innerHTML: '' };\n"
+                "const $ = () => box;\n"
+                "const esc = (s) => String(s);\n"
+                "const who = (r) => r.author;\n"
+                f"let poll = {{ results: {json.dumps(results)}, voter_count: 3, my_vote: {json.dumps(my_vote)} }};\n"
+                + render +
+                "renderResults(); console.log(box.innerHTML);\n"
+            )
+            result = self._run_node(source)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout
+
+        html = run(["a", "c"])
+        framed = re.findall(r'<span class="(\w+) mine">', html)
+        self.assertEqual(framed, ["rank", "name", "pic", "meter", "num"] * 2)
+        rows = re.findall(r'<span class="name( mine)?"><span>(\w)</span>', html)
+        self.assertEqual([(name, bool(mine)) for mine, name in rows],
+                         [("A", True), ("B", False), ("C", True)])
+        self.assertIn("твой голос", html)
+
+        html = run([])
+        self.assertNotIn(" mine", html)
+        self.assertNotIn("твой голос", html)
+
+    def test_a_chosen_card_wears_a_frame(self):
+        page = vote_web.PAGE_HTML
+        self.assertIn(".gcard.on { outline: 3px solid var(--accent)", page)
+        self.assertIn(".rcard.on .photos img { outline: 3px solid var(--accent)", page)
+
     def test_the_board_pages_script_is_valid_javascript(self):
         """One broken literal and the cropping page opens blank while every route still
         answers 200 -- parsed by node, as test_arena_web does for the arena's page."""
@@ -1280,9 +1359,11 @@ class VoteApiTests(AsyncTestCase):
         lifted every number out of its row -- hence class="num" and no `.results .count`
         rule left to grow one back."""
         page = await (await self.client.get(vote_web.ROUTE_PREFIX)).text()
-        self.assertIn('<span class="num">', page)
+        self.assertIn("""'<span class="num' + m + '">'""", page)
         self.assertNotIn(".results .count", page)
         self.assertIn(".results .table { display: grid;", page)
+        # The same trap twice over: class="bar" is the page's fixed bottom bar.
+        self.assertNotIn("""'<span class="bar""", page)
 
     async def test_the_page_wires_a_tap_on_a_reel_photo_to_closing_it(self):
         """Tapping a picture in the reel goes back to the grid, and does it through the

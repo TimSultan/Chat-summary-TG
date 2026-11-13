@@ -1091,7 +1091,9 @@ PAGE_HTML = """<!doctype html>
   .pick { display: block; width: 100%; border: 0; padding: 7px 4px; font-size: 12px;
           background: transparent; color: var(--muted); cursor: pointer;
           border-top: 1px solid rgba(128,128,128,.25); }
-  .gcard.on { outline: 2px solid var(--accent); }
+  /* The works this person picked -- and, once the ballot is in, voted for -- wear a frame.
+     Three pixels, inside the 8px gap, so it reads at a glance in a three-column grid. */
+  .gcard.on { outline: 3px solid var(--accent); outline-offset: 0; }
   .gcard.on .pick { background: var(--accent); color: var(--accent-fg); font-weight: 600; }
   .gcard.pending { opacity: .55; }
   .pick[disabled], .pickBtn[disabled] { opacity: .5; cursor: default; }
@@ -1165,6 +1167,7 @@ PAGE_HTML = """<!doctype html>
              border-radius: 8px; padding: 10px; font-size: 14px; font-weight: 600;
              background: transparent; color: var(--fg); cursor: pointer; }
   .rcard.on .pickBtn { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  .rcard.on .photos img { outline: 3px solid var(--accent); outline-offset: -3px; }
   .rcard.pending { opacity: .6; }
   .bar {
     position: fixed; left: 0; right: 0; bottom: 0; padding: 10px 12px;
@@ -1232,12 +1235,31 @@ PAGE_HTML = """<!doctype html>
      class="count" because that name is already taken by the grid's photo-count badge,
      which is position:absolute -- inherited here, it lifted every number out of its row
      and stacked them all in the corner of the page. */
-  .results .table { display: grid; align-items: center; column-gap: 8px; row-gap: 6px;
+  .results .table { display: grid; align-items: stretch; column-gap: 0; row-gap: 4px;
                     grid-template-columns: auto minmax(0, 38%) auto minmax(0, 1fr) auto; }
+  /* The gap between columns is each cell's own left padding instead of column-gap, and
+     every cell carries a transparent border: then a row this person voted for (.mine) can
+     be framed as one piece -- tinted cells, a border along the top and bottom, closed at
+     the rank and at the tally -- with every column still where it was. The bar's cell is
+     class="meter" and the picture's class="pic": class="bar" is the page's fixed bottom
+     bar, and inherited here it lifted the cell out of the grid and shifted every row. */
+  .results .table > span { display: flex; align-items: center; min-width: 0;
+                           padding: 3px 0 3px 8px; border: 2px solid transparent;
+                           border-left-width: 0; border-right-width: 0; }
+  .results .table > span.rank { padding-left: 6px; border-left-width: 2px; border-radius: 8px 0 0 8px;
+                                justify-content: flex-end; }
+  .results .table > span.num { padding-right: 6px; border-right-width: 2px; border-radius: 0 8px 8px 0;
+                               justify-content: flex-end; }
+  .results .table > span.mine { border-color: var(--accent);
+                                background: rgba(128,128,128,.14);
+                                background: color-mix(in srgb, var(--accent) 16%, transparent); }
+  .results .table > span.name.mine { font-weight: 600; }
+  .results .mineNote { color: var(--muted); font-size: 12px; margin: -4px 0 8px; }
+  .results .mineNote b { color: var(--accent); font-weight: 600; }
   .results .rank { color: var(--muted); font-size: 12px; text-align: right;
                     font-variant-numeric: tabular-nums; }
-  .results .name { min-width: 0; overflow: hidden;
-                    text-overflow: ellipsis; white-space: nowrap; }
+  .results .name { min-width: 0; overflow: hidden; }
+  .results .name > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   /* Just enough of the work to recognise it while reading the standings -- who won is the
      question here, not what they drew, and the reel is one tap away for that. Fixed square
      rather than the picture's own ratio, so the bars all still start at the same x.
@@ -1247,7 +1269,7 @@ PAGE_HTML = """<!doctype html>
      the same number of cells or the whole grid shifts by one from there down. */
   .results .mini { width: 22px; height: 22px; border-radius: 4px; display: block;
                     object-fit: cover; background: rgba(128,128,128,.2); }
-  .results .track { height: 8px; border-radius: 4px;
+  .results .track { display: block; width: 100%; height: 8px; border-radius: 4px;
                      background: rgba(128,128,128,.2); overflow: hidden; }
   /* display:block, because the fill is a span: width and height do nothing on an inline
      box, so without this the bar was a grey track with an invisible zero-sized fill in it.
@@ -1643,24 +1665,30 @@ function renderResults() {
   if (!poll.results) { box.hidden = true; return; }  // not yet earned, see handle_poll
   box.hidden = false;
   const max = Math.max(1, ...poll.results.map((r) => r.votes));
+  // The server's record of this person's ballot, never the draft in `picked`: the list is
+  // what was counted.
+  const mine = new Set(poll.my_vote || []);
+  const framed = poll.results.some((r) => mine.has(r.id));
   box.innerHTML =
     "<h2>Голоса</h2>" +
     '<div class="voterCount">Проголосовало: ' + (poll.voter_count || 0) + "</div>" +
+    (framed ? '<div class="mineNote">Рамкой выделен <b>твой голос</b></div>' : "") +
     // Five cells per entry, straight into one grid with no per-row wrapper -- a wrapper
     // would make every line its own formatting context again, which is what stopped the
     // columns lining up. An entry without a picture contributes an empty cell rather than
     // skipping it, since a row one cell short would slide every row after it sideways.
     '<div class="table">' +
-    poll.results.map((r, i) =>
-      '<span class="rank">' + (i + 1) + "</span>" +
-      '<span class="name">' + esc(who(r)) + "</span>" +
-      (r.photo
-        ? '<img class="mini" loading="lazy" src="' + esc(r.photo) + '" alt="">'
-        : '<span class="mini"></span>') +
-      '<span class="track"><span class="fill" style="width:' +
-        Math.round(100 * r.votes / max) + '%"></span></span>' +
-      '<span class="num">' + r.votes + "</span>"
-    ).join("") +
+    poll.results.map((r, i) => {
+      const m = mine.has(r.id) ? " mine" : "";
+      return '<span class="rank' + m + '">' + (i + 1) + "</span>" +
+        '<span class="name' + m + '"><span>' + esc(who(r)) + "</span></span>" +
+        '<span class="pic' + m + '">' + (r.photo
+          ? '<img class="mini" loading="lazy" src="' + esc(r.photo) + '" alt="">'
+          : '<span class="mini"></span>') + "</span>" +
+        '<span class="meter' + m + '"><span class="track"><span class="fill" style="width:' +
+          Math.round(100 * r.votes / max) + '%"></span></span></span>' +
+        '<span class="num' + m + '">' + r.votes + "</span>";
+    }).join("") +
     "</div>";
 }
 
