@@ -121,6 +121,8 @@ class Recorder:
 # that the catalogue and the router agree -- a new action with nothing wired to it fails
 # test_every_action_reaches_a_handler below.
 HANDLER_FOR_ACTION = {
+    "broadcast": "handle_broadcast_command",
+    "people": "handle_vote_command",
     "send": "handle_send_command",
     "preview": "handle_preview_command",
     "buttons": "handle_button_builder_command",
@@ -128,10 +130,14 @@ HANDLER_FOR_ACTION = {
     "vote": "handle_vote_command",
     "vote2": "handle_arena_command",
     "vote3": "handle_nominations_command",
+    "backup": "handle_backup_command",
+    "votelog": "handle_votelog_command",
     "badge": "handle_badge_command",
     "badgeadmin": "handle_badge_admin_command",
     "weekwinner": "handle_week_winner_command",
     "deletepokras": "handle_delete_pokras_command",
+    "banuser": "handle_ban_command",
+    "unbanuser": "handle_ban_command",
     "plant": "handle_plant_command",
     "plantreminder": "handle_plant_reminder_command",
     "replant": "handle_replant_command",
@@ -193,6 +199,16 @@ class CatalogueTests(unittest.TestCase):
         self.assertIn(admin_menu.action("vote")["command"], bot_listener.VOTE_COMMANDS)
         self.assertIn(admin_menu.action("vote2")["command"], bot_listener.ARENA_COMMANDS)
         self.assertIn(admin_menu.action("vote3")["command"], bot_listener.NOMINATIONS_COMMANDS)
+        self.assertIn(admin_menu.action("broadcast")["command"], bot_listener.BROADCAST_COMMANDS)
+        self.assertIn(admin_menu.action("backup")["command"], bot_listener.BACKUP_COMMANDS)
+        self.assertIn(admin_menu.action("votelog")["command"], bot_listener.VOTELOG_COMMANDS)
+        self.assertEqual(admin_menu.action("banuser")["command"], bot_listener.BAN_COMMAND)
+        self.assertEqual(admin_menu.action("unbanuser")["command"], bot_listener.UNBAN_COMMAND)
+        # "/vote люди" is a /vote sub-command: the word after the command must be one /vote
+        # reads as the list of who has the bot started.
+        command, word = admin_menu.action("people")["command"].split(maxsplit=1)
+        self.assertIn(command, bot_listener.VOTE_COMMANDS)
+        self.assertIn(word, bot_listener.VOTE_PEOPLE_WORDS)
 
 
 class RenderingTests(unittest.TestCase):

@@ -77,6 +77,7 @@ import aiohttp
 from telethon import utils as tl_utils
 
 import admin_menu
+import broadcast
 import bot_users
 import cabinet
 import button_builder
@@ -579,7 +580,7 @@ VOTE_CHAT_DEST_CALLBACK_PREFIX = "votechatdest"
 # "dm" is everybody who has the bot started (bot_users.py), each in their own DM. It asks
 # once more before anything goes out -- "dmyes" -- because that is hundreds of messages
 # nobody can take back, where a group post is one the admin can delete.
-VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "dm", "dmyes", "cancel")
+VOTE_CHAT_DESTINATIONS = ("main", "extra", "both", "dm", "dmyes", "cancel", "buttons", "nobuttons")
 # "/vote люди" -- the list of who has the bot started and who blocked it (bot_users.py),
 # with the check that finds the people who started it before the list existed ("/vote
 # проверить"). DM and admin-only like the rest of the panel: it names people.
@@ -591,6 +592,13 @@ VOTE_CHECK_WORDS = frozenset({"проверить", "проверка", "check"}
 # "/vote chat" (tagged with this system), then previewed exactly as it will arrive.
 VOTE_ADMINS_WORDS = frozenset({"админам", "админы", "admins"})
 ADMIN_NOTICE_SYSTEM = "admins"
+# "/broadcast" (broadcast.py): the same draft as "/vote chat" -- text, a picture or an
+# album, to the chat, the second group, both or everybody's DM -- without the vote button.
+# Between the text and the preview it asks for the admin's own link buttons ("buttons":
+# a force-reply for them, "nobuttons": none). Real chat administrators and the owner
+# only, like /admin itself: a badge delegate may announce a vote, not mail anything at all.
+BROADCAST_COMMANDS = broadcast.COMMANDS
+BROADCAST_SYSTEM = "broadcast"
 VOTE_ADMINS_CALLBACK_PREFIX = "voteadmins"
 VOTE_ADMINS_ACTIONS = ("send", "cancel")
 # A Telegram message's own length limit, less a margin: past it the list of people goes
@@ -947,12 +955,20 @@ def _badge_flow(
     return flow
 
 
+# Who the latest administrator list named, per chat, as strings. Only so the cabinet can
+# decide whether to DRAW «🛠 Админка» without a Telegram round trip per render (see
+# _shows_admin_panel_button) -- never a permission: the panel asks Telegram itself.
+_SEEN_CHAT_ADMIN_IDS: dict = {}
+
+
 async def _is_chat_admin(api: TelegramBotAPI, chat_id: int, user_id: int) -> bool:
     try:
         administrators = await api.get_chat_administrators(chat_id)
     except ChatSummaryError:
         return False
-    return any((member.get("user") or {}).get("id") == user_id for member in administrators)
+    ids = [(member.get("user") or {}).get("id") for member in administrators]
+    _SEEN_CHAT_ADMIN_IDS[chat_id] = frozenset(str(i) for i in ids if i is not None)
+    return any(i == user_id for i in ids)
 
 
 _CHAT_MEMBER_STATUSES = frozenset({"creator", "administrator", "member"})
@@ -4036,7 +4052,17 @@ async def _run_admin_action(
     the wording all stay in one place, and the panel cannot drift from the command.
     """
     action_id = item["id"]
-    if action_id == "send":
+    if action_id == "broadcast":
+        await handle_broadcast_command(
+            api, telethon_client, message, entry, admin_chat_id, vote_chat_flows, log=log,
+        )
+    elif action_id == "people":
+        # "/vote люди" -- the message carries that text, which is how /vote finds it.
+        await handle_vote_command(
+            api, telethon_client, cfg, tz, message, entry, bot_username,
+            background_tasks, log=log, vote_chat_flows=vote_chat_flows,
+        )
+    elif action_id == "send":
         await handle_send_command(api, message, command_text, entry, admin_chat_id, log=log)
     elif action_id == "preview":
         await handle_preview_command(
@@ -4063,6 +4089,10 @@ async def _run_admin_action(
             api, telethon_client, cfg, tz, message, entry, bot_username,
             background_tasks, log=log,
         )
+    elif action_id == "backup":
+        await handle_backup_command(api, telethon_client, message, entry, log=log)
+    elif action_id == "votelog":
+        await handle_votelog_command(api, telethon_client, message, entry, command_text, log=log)
     elif action_id == "badge":
         await handle_badge_command(api, message, entry, admin_chat_id, badge_flows)
     elif action_id == "badgeadmin":
@@ -4076,6 +4106,11 @@ async def _run_admin_action(
     elif action_id == "deletepokras":
         await handle_delete_pokras_command(
             api, telethon_client, message, command_text, entry, admin_chat_id, tz, log=log,
+        )
+    elif action_id in ("banuser", "unbanuser"):
+        await handle_ban_command(
+            api, telethon_client, message, command_text, entry, known_chat_ids,
+            unban=action_id == "unbanuser", log=log,
         )
     elif action_id == "plant":
         await handle_plant_command(api, message, entry, admin_chat_id, log=log)
@@ -4157,13 +4192,25 @@ async def handle_admin_callback(
         except Exception:
             log(f"[bot_listener] failed to redraw the admin panel:\n{traceback.format_exc()}")
 
+    async def refuse(text: str) -> None:
+        # «🛠 Админка» sits on somebody else's screen -- the /vote panel, which a badge
+        # delegate sees too, or the cabinet -- so its refusal is a new message: redrawing
+        # would wipe the screen it was pressed on.
+        if step != "open":
+            await redraw(text, None, None)
+            return
+        try:
+            await api.send_message(chat_id, text, reply_to_message_id=message_id, parse_mode=None)
+        except Exception:
+            log(f"[bot_listener] failed to refuse the admin panel:\n{traceback.format_exc()}")
+
     admin_chat_id = (
         await _resolve_chat_id(telethon_client, entry, known_chat_ids, log=log)
         if entry
         else None
     )
     if entry is None or admin_chat_id is None:
-        await redraw("Основной чат не настроен.", None, None)
+        await refuse("Основной чат не настроен.")
         return
     # Re-checked rather than trusted: the panel only ever exists in the DM of somebody who
     # was an administrator when it was opened, so this differs only if they have stopped
@@ -4171,11 +4218,22 @@ async def handle_admin_callback(
     # the message is still on their screen. Every handler below checks again anyway; this
     # one is here so a stranger never even reaches a force-reply prompt.
     if not await _is_chat_admin_or_privileged(api, admin_chat_id, presser):
-        await redraw(ADMIN_PANEL_REFUSAL, None, None)
+        await refuse(ADMIN_PANEL_REFUSAL)
         return
 
     if step == "menu":
         await redraw(admin_menu.menu_text(), admin_menu.menu_keyboard(), "HTML")
+        return
+    if step == "open":
+        # «🛠 Админка» on the /vote panel or in the cabinet: the panel as a new message,
+        # leaving the screen the button sat on where it was.
+        try:
+            await api.send_message(
+                chat_id, admin_menu.menu_text(), reply_to_message_id=message_id,
+                parse_mode="HTML", reply_markup=admin_menu.menu_keyboard(),
+            )
+        except Exception:
+            log(f"[bot_listener] failed to open the admin panel:\n{traceback.format_exc()}")
         return
 
     item = admin_menu.action(action_id)
@@ -4839,6 +4897,7 @@ async def _render_cabinet_section(
     return cabinet.main_view(
         entry, user, xp, rank, total, streak,
         can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+        can_open_admin_panel=_shows_admin_panel_button(user.user_id, user.username),
     )
 
 
@@ -4876,6 +4935,17 @@ async def _cabinet_buy(
     return cabinet.result_view(
         user.user_id, f"{delivered}\n\n🪙 Осталось: {remaining}."
     )
+
+
+def _shows_admin_panel_button(user_id, username: str | None) -> bool:
+    """Whether the cabinet draws «🛠 Админка». No Telegram call, for the same reason as the
+    badge button below: the owner always, and a chat administrator once any admin check
+    since the restart has fetched the list that names them (_SEEN_CHAT_ADMIN_IDS) -- their
+    first /vote or /admin does. Drawing only: the panel re-checks on the press."""
+    if (username or "").strip().lstrip("@").lower() in PRIVILEGED_MANAGEMENT_USERNAMES:
+        return True
+    wanted = str(user_id)
+    return any(wanted in ids for ids in _SEEN_CHAT_ADMIN_IDS.values())
 
 
 def _shows_badge_admin_button(entry: str | None, user_id, username: str | None) -> bool:
@@ -5000,6 +5070,7 @@ async def maybe_send_menu(
                 text, keyboard = cabinet.main_view(
                     entry, user, xp, rank, total, streak,
                     can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+                    can_open_admin_panel=_shows_admin_panel_button(user.user_id, user.username),
                 )
         await api.send_message(
             chat_id, text, reply_to_message_id=message.get("message_id"),
@@ -5097,6 +5168,7 @@ async def handle_cabinet_command(
     text, keyboard = cabinet.main_view(
         entry, user, xp, rank, total, streak,
         can_manage_badges=_shows_badge_admin_button(entry, user.user_id, user.username),
+        can_open_admin_panel=_shows_admin_panel_button(user.user_id, user.username),
     )
     await api.send_message(
         chat_id, text, reply_to_message_id=reply_to, reply_markup=keyboard, parse_mode="HTML"
@@ -6692,13 +6764,15 @@ ANNOUNCE_ALBUM_SETTLE_SECONDS = 1.5
 ANNOUNCE_MAX_PHOTOS = 10  # Telegram's own limit for one album
 # An album carries no buttons, so the text and the button follow it as their own message;
 # an album with no text at all still needs a line for the button to sit under.
-_ANNOUNCE_ALBUM_TEXT = {"vote": "🗳 Голосуем!", "arena": "⚔️ На арену!"}
+_ANNOUNCE_ALBUM_TEXT = {"vote": "🗳 Голосуем!", "arena": "⚔️ На арену!", BROADCAST_SYSTEM: "👇"}
 # Album waits started without a caller's background_tasks set: kept referenced here so
 # the event loop does not collect them half-way.
 _ANNOUNCE_TASKS: set = set()
 
 
 def _announce_restart_hint(system: str | None) -> str:
+    if system == BROADCAST_SYSTEM:
+        return BROADCAST_COMMANDS[0]
     return "/vote2 chat" if system == "arena" else "/vote chat"
 
 
@@ -6718,7 +6792,9 @@ def _announcement_steps(flow: dict, keyboard: dict | None) -> list[tuple[str, di
     - text: one message, its formatting carried as entities;
     - one picture: the picture with the text as its caption and `keyboard` under it, or,
       past a bot's caption limit, the picture and then the text with `keyboard`;
-    - an album: the pictures, then the text with `keyboard` (an album takes no buttons).
+    - an album: the pictures, then the text with `keyboard` (an album takes no buttons);
+      an album with neither text nor `keyboard` (a broadcast of pictures alone) is just
+      the pictures.
     """
     text = flow.get("text") or ""
     entities = flow.get("entities") or None
@@ -6742,6 +6818,8 @@ def _announcement_steps(flow: dict, keyboard: dict | None) -> list[tuple[str, di
             return [("send_photo", kwargs)]
         return [("send_photo", {"photo": photos[0], "caption": None}), message(text, entities)]
     album = [{"type": "photo", "media": file_id} for file_id in photos]
+    if not text and keyboard is None:
+        return [("send_media_group", {"media": album})]
     if not text:
         text, entities = _ANNOUNCE_ALBUM_TEXT.get(flow.get("system") or "vote", "🗳 Голосуем!"), None
     return [("send_media_group", {"media": album}), message(text, entities)]
@@ -8882,6 +8960,8 @@ async def handle_vote_command(
                             "callback_data": _vote_action_callback_data("clear", chat_id, admin_user_id),
                         },
                     ],
+                    # Every other management command, the broadcast among them (admin_menu).
+                    [admin_menu.entry_button()],
                 ]},
             )
         else:
@@ -8996,9 +9076,13 @@ async def handle_vote_chat_text_input(
         vote_chat_flows.pop(flow_id, None)
         await say("Черновик отменён.")
         return True
-    if not await _can_manage_chat(api, flow["admin_chat_id"], actor, flow.get("entry")):
+    if not await _may_post_draft(api, flow, actor):
         vote_chat_flows.pop(flow_id, None)
         return True  # silently dropped, same as badge_flows -- admin status changed mid-flow
+    if flow.get("awaiting") == "buttons":
+        # A broadcast's second answer: its link buttons, not its text.
+        await _take_broadcast_buttons(api, cfg, message, flow_id, flow, vote_chat_flows, log=log)
+        return True
     photo = _largest_photo_id(message)
     if _has_other_media(message):
         # A file, a video, a sticker: posting only its caption would quietly lose the
@@ -9015,8 +9099,9 @@ async def handle_vote_chat_text_input(
         return True
 
     # Which system asked for the draft decides where its button goes; "vote" is the default
-    # so a flow written before the arena existed still means what it did.
-    if not (_arena_page_url(cfg) if system == "arena" else _vote_page_url(cfg)):
+    # so a flow written before the arena existed still means what it did. A broadcast has
+    # no page to lead to: its buttons are the admin's own.
+    if system != BROADCAST_SYSTEM and not (_arena_page_url(cfg) if system == "arena" else _vote_page_url(cfg)):
         vote_chat_flows.pop(flow_id, None)
         await say(
             "Арена не настроена -- некуда вести кнопку." if system == "arena"
@@ -9033,9 +9118,14 @@ async def handle_vote_chat_text_input(
         # decide where it goes.
         created_at=time.monotonic(),
     )
-    for key in ("media_group_id", "album", "album_caption_taken"):
+    for key in ("media_group_id", "album", "album_caption_taken", "keyboard", "awaiting"):
         flow.pop(key, None)
-    offer = lambda: _offer_announcement(api, cfg, flow_id, flow, vote_chat_flows, log=log)  # noqa: E731
+    if system == BROADCAST_SYSTEM:
+        # The buttons come between the text and the preview: the preview is the promise of
+        # what goes out, so it has to show them.
+        offer = lambda: _ask_broadcast_buttons(api, flow_id, flow, vote_chat_flows, log=log)  # noqa: E731
+    else:
+        offer = lambda: _offer_announcement(api, cfg, flow_id, flow, vote_chat_flows, log=log)  # noqa: E731
     if album is not None and photo is not None:
         _start_album(flow, message, photo, caption_taken=bool(text))
         _wait_for_album(flow_id, flow, vote_chat_flows, offer, background_tasks, log=log)
@@ -9053,13 +9143,17 @@ async def _offer_announcement(api: TelegramBotAPI, cfg, flow_id: str, flow: dict
     reply_to = flow.get("source_message_id")
     system = flow.get("system") or "vote"
 
-    preview_button = _announce_dm_button(cfg, system)
-    if preview_button is None:
-        vote_chat_flows.pop(flow_id, None)
-        await api.send_message(chat_id, "Голосование не настроено -- некуда вести кнопку.", parse_mode=None)
-        return
+    if system == BROADCAST_SYSTEM:
+        keyboard = flow.get("keyboard")
+    else:
+        preview_button = _announce_dm_button(cfg, system)
+        if preview_button is None:
+            vote_chat_flows.pop(flow_id, None)
+            await api.send_message(chat_id, "Голосование не настроено -- некуда вести кнопку.", parse_mode=None)
+            return
+        keyboard = _announce_keyboard(preview_button)
     try:
-        await _post_announcement(api, chat_id, _announcement_steps(flow, _announce_keyboard(preview_button)))
+        await _post_announcement(api, chat_id, _announcement_steps(flow, keyboard))
     except Exception as e:  # noqa: BLE001 -- Telegram's reason goes back to the admin
         vote_chat_flows.pop(flow_id, None)
         log(f"[bot_listener] the announcement's preview was refused: {e}")
@@ -9097,9 +9191,13 @@ async def _offer_announcement(api: TelegramBotAPI, cfg, flow_id: str, flow: dict
     }])
 
     flow["created_at"] = time.monotonic()
+    question = (
+        "Куда отправить рассылку? Выше -- как она будет выглядеть." if system == BROADCAST_SYSTEM
+        else "Куда отправить объявление? Выше -- как оно будет выглядеть."
+    )
     try:
         await api.send_message(
-            chat_id, "Куда отправить объявление? Выше -- как оно будет выглядеть.",
+            chat_id, question,
             reply_to_message_id=reply_to, parse_mode=None,
             reply_markup={"inline_keyboard": destinations},
         )
@@ -9108,9 +9206,11 @@ async def _offer_announcement(api: TelegramBotAPI, cfg, flow_id: str, flow: dict
         vote_chat_flows.pop(flow_id, None)
         return
     photos = len(flow.get("photos") or [])
+    buttons = sum(len(row) for row in (flow.get("keyboard") or {}).get("inline_keyboard", []))
     log(
-        f"[bot_listener] user {flow.get('user_id')} drafted a vote announcement "
-        f"({len(flow.get('text') or '')} chars, {len(flow.get('entities') or [])} entities, {photos} pictures)"
+        f"[bot_listener] user {flow.get('user_id')} drafted a {system} announcement "
+        f"({len(flow.get('text') or '')} chars, {len(flow.get('entities') or [])} entities, {photos} pictures"
+        + (f", {buttons} buttons)" if system == BROADCAST_SYSTEM else ")")
     )
 
 
@@ -9162,9 +9262,8 @@ async def handle_vote_chat_destination_callback(
     flow = vote_chat_flows.get(flow_id)
     if flow is None or time.monotonic() - flow["created_at"] > VOTE_CHAT_FLOW_TTL_SECONDS:
         vote_chat_flows.pop(flow_id, None)
-        await api.answer_callback_query(
-            callback["id"], text="Черновик устарел -- начни заново: /vote chat"
-        )
+        hint = _announce_restart_hint((flow or {}).get("system")) if flow else "/vote chat или /broadcast"
+        await api.answer_callback_query(callback["id"], text=f"Черновик устарел -- начни заново: {hint}")
         return
     clicker = callback.get("from") or {}
     if clicker.get("id") != flow.get("user_id"):
@@ -9183,6 +9282,14 @@ async def handle_vote_chat_destination_callback(
         except Exception as e:
             log(f"[bot_listener] failed to report the vote announcement result: {e}")
 
+    is_broadcast = flow.get("system") == BROADCAST_SYSTEM
+    if destination in ("buttons", "nobuttons"):
+        # A broadcast's question between its text and its preview. Only while it is still
+        # open: once the preview is out, a second press would draw a second one.
+        if is_broadcast and flow.get("awaiting") in ("choice", "buttons"):
+            await _choose_broadcast_buttons(api, cfg, destination, flow_id, flow, vote_chat_flows, log=log)
+        return
+
     if destination == "dm":
         # Nothing is sent yet: the draft lives on, with a fresh TTL, for the answer.
         flow["created_at"] = time.monotonic()
@@ -9194,10 +9301,14 @@ async def handle_vote_chat_destination_callback(
                 "выбери «📬 Всем в личку» ещё раз. Черновик пока жив."
             )
             return
+        what = (
+            "Каждый получит её такой, как в превью выше."
+            if is_broadcast else
+            "Каждый получит его таким, как в превью выше, с кнопкой голосования."
+        )
         await report(
-            f"Разослать это объявление в личку {count} {_ru_people(count)}, у которых "
-            "запущен бот? Каждый получит его таким, как в превью выше, с кнопкой "
-            "голосования. Отменить разосланное будет нельзя.",
+            f"Разослать {'эту рассылку' if is_broadcast else 'это объявление'} в личку {count} "
+            f"{_ru_people(count)}, у которых запущен бот? {what} Отменить разосланное будет нельзя.",
             reply_markup={"inline_keyboard": [
                 [{"text": f"✅ Да, разослать ({count})",
                   "callback_data": _vote_chat_dest_callback_data("dmyes", flow_id)}],
@@ -9208,41 +9319,53 @@ async def handle_vote_chat_destination_callback(
     vote_chat_flows.pop(flow_id, None)
 
     if destination == "cancel":
-        await report("Объявление отменено.")
+        await report("Рассылка отменена." if is_broadcast else "Объявление отменено.")
         return
     # Re-checked against the tapper even though only they could see the button, the same
     # belt-and-suspenders check every other confirm flow in this file does -- admin status
     # can have been taken away between writing the text and choosing a destination.
-    if not await _can_manage_chat(api, flow["admin_chat_id"], clicker, flow.get("entry")):
+    if not await _may_post_draft(api, flow, clicker):
         await report("Публиковать объявление могут только администраторы.")
         return
 
     if destination == "dmyes":
-        # A web_app button, unlike the group posts below: every message here lands in a
-        # private chat, the one place Telegram allows one, and it opens the page directly.
-        button = _announce_dm_button(cfg, flow.get("system") or "vote")
-        if button is None:
-            await report("Голосование не настроено -- некуда вести кнопку.")
-            return
+        if is_broadcast:
+            keyboard = flow.get("keyboard")
+        else:
+            # A web_app button, unlike the group posts below: every message here lands in
+            # a private chat, the one place Telegram allows one, and it opens the page
+            # directly.
+            button = _announce_dm_button(cfg, flow.get("system") or "vote")
+            if button is None:
+                await report("Голосование не настроено -- некуда вести кнопку.")
+                return
+            keyboard = _announce_keyboard(button)
         mailing = lambda: _mail_bot_users(  # noqa: E731 -- built only if the job starts
-            api, dm_chat_id, _announcement_steps(flow, _announce_keyboard(button)), log=log,
+            api, dm_chat_id, _announcement_steps(flow, keyboard), log=log,
         )
         if background_tasks is None:
             await mailing()
         elif not _start_bot_users_job(background_tasks, mailing):
-            await report(BOT_USERS_JOB_BUSY_TEXT + " Черновик сброшен -- начни заново: /vote chat")
+            await report(
+                f"{BOT_USERS_JOB_BUSY_TEXT} Черновик сброшен -- начни заново: "
+                f"{_announce_restart_hint(flow.get('system'))}"
+            )
         log(f"[bot_listener] {clicker.get('username') or clicker.get('id')} started a DM mailing")
         return
 
-    # A url button, never web_app: every destination here is a group, and Telegram accepts
-    # a web_app button only in a private chat (see _vote_group_button_url).
-    button = _announce_button(cfg, bot_username, flow.get("system") or "vote")
-    if button is None:
-        await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
-        return
-    # One button only: the owner wants the posted announcement without "Если Бот не
-    # работает" -- the browser page stays on the voter's DM and the admin panel.
-    steps = _announcement_steps(flow, _announce_keyboard(button))
+    if is_broadcast:
+        # The admin's own link buttons, or none: url buttons go into a group as they are.
+        steps = _announcement_steps(flow, flow.get("keyboard"))
+    else:
+        # A url button, never web_app: every destination here is a group, and Telegram
+        # accepts a web_app button only in a private chat (see _vote_group_button_url).
+        button = _announce_button(cfg, bot_username, flow.get("system") or "vote")
+        if button is None:
+            await report("Не удалось собрать кнопку голосования -- неизвестно имя бота.")
+            return
+        # One button only: the owner wants the posted announcement without "Если Бот не
+        # работает" -- the browser page stays on the voter's DM and the admin panel.
+        steps = _announcement_steps(flow, _announce_keyboard(button))
 
     targets: list[tuple[str, object]] = []
     if destination in ("main", "both"):
@@ -9272,7 +9395,8 @@ async def handle_vote_chat_destination_callback(
         return
     lines = []
     if posted:
-        lines.append("Объявление опубликовано: " + ", ".join(posted) + ".")
+        lines.append(("Рассылка отправлена: " if is_broadcast else "Объявление опубликовано: ")
+                     + ", ".join(posted) + ".")
     if failed:
         lines.append("Не получилось отправить: " + "; ".join(failed))
     await report("\n".join(lines))
@@ -9280,6 +9404,132 @@ async def handle_vote_chat_destination_callback(
         f"[bot_listener] {clicker.get('username') or clicker.get('id')} posted a vote "
         f"announcement to {destination}: {len(posted)} ok, {len(failed)} failed"
     )
+
+
+async def _may_post_draft(api: TelegramBotAPI, flow: dict, user: dict | None) -> bool:
+    """The draft's gate, asked again at every step that can send it. An announcement is
+    for whoever may run the vote (_can_manage_chat, badge delegates included); a broadcast
+    carries anything at all, so only real chat administrators and the owner."""
+    if flow.get("system") == BROADCAST_SYSTEM:
+        if flow.get("admin_chat_id") is None:
+            return _is_privileged_username(user)
+        return await _is_chat_admin_or_privileged(api, flow["admin_chat_id"], user)
+    return await _can_manage_chat(api, flow["admin_chat_id"], user, flow.get("entry"))
+
+
+async def handle_broadcast_command(
+    api: TelegramBotAPI,
+    telethon_client,
+    message: dict,
+    entry: str | None,
+    admin_chat_id: int | None,
+    vote_chat_flows: dict[str, dict] | None,
+    log=print,
+) -> None:
+    """/broadcast -- opens the draft (see broadcast.py). DM-only; the dispatcher has
+    already made sure of that. Real chat administrators and the owner only."""
+    chat_id = message["chat"]["id"]
+    user = message.get("from") or {}
+
+    async def reply(text: str, reply_markup=None):
+        try:
+            return await api.send_message(
+                chat_id, text, reply_to_message_id=message.get("message_id"),
+                reply_markup=reply_markup, parse_mode=None,
+            )
+        except Exception:
+            log(f"[bot_listener] failed to answer /broadcast:\n{traceback.format_exc()}")
+            return None
+
+    if entry is None or admin_chat_id is None:
+        await reply("Основной чат не настроен.")
+        return
+    if not await _is_chat_admin_or_privileged(api, admin_chat_id, user):
+        await reply("Рассылку могут делать только администраторы чата.")
+        return
+    await _start_announcement_draft(
+        vote_chat_flows, reply, telethon_client, chat_id, user, entry, BROADCAST_SYSTEM,
+        "📬 Рассылка. Что отправить? Ответь на это сообщение текстом -- можно с картинкой "
+        "или альбомом. Ссылки и форматирование сохранятся, Markdown тоже работает: "
+        "[текст](ссылка), **жирный**, __курсив__. Кнопку голосования не добавлю; свои "
+        "кнопки-ссылки -- следующим шагом. Перед отправкой покажу, как это будет выглядеть.",
+        log=log,
+    )
+
+
+async def _ask_broadcast_buttons(api: TelegramBotAPI, flow_id: str, flow: dict,
+                                 vote_chat_flows: dict[str, dict], log=print) -> None:
+    """A broadcast's text is in: buttons under it, or none?"""
+    flow["awaiting"] = "choice"
+    flow["created_at"] = time.monotonic()
+    try:
+        await api.send_message(
+            flow["chat_id"], "Добавить под рассылкой кнопки-ссылки?",
+            reply_to_message_id=flow.get("source_message_id"), parse_mode=None,
+            reply_markup={"inline_keyboard": [
+                [
+                    {"text": "🔗 Добавить кнопки",
+                     "callback_data": _vote_chat_dest_callback_data("buttons", flow_id)},
+                    {"text": "➡️ Без кнопок",
+                     "callback_data": _vote_chat_dest_callback_data("nobuttons", flow_id)},
+                ],
+                [{"text": "Отмена", "callback_data": _vote_chat_dest_callback_data("cancel", flow_id)}],
+            ]},
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_listener] failed to ask for the broadcast's buttons: {e}")
+        vote_chat_flows.pop(flow_id, None)
+
+
+async def _ask_for_button_lines(api: TelegramBotAPI, flow: dict, lead: str,
+                                reply_to: int | None = None, log=print) -> bool:
+    """The force-reply the buttons are typed into. The draft now waits on THIS message."""
+    try:
+        prompt = await api.send_message(
+            flow["chat_id"],
+            f"{lead}\n\n{broadcast.FORMAT_HELP}\n\n"
+            "Ответь на это сообщение. «нет» -- без кнопок, «отмена» -- выйти.",
+            reply_to_message_id=reply_to, parse_mode=None,
+            reply_markup={"force_reply": True, "selective": True},
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[bot_listener] failed to ask for the broadcast's button lines: {e}")
+        return False
+    flow["awaiting"] = "buttons"
+    flow["prompt_message_id"] = (prompt or {}).get("message_id")
+    flow["created_at"] = time.monotonic()
+    return True
+
+
+async def _choose_broadcast_buttons(api: TelegramBotAPI, cfg, choice: str, flow_id: str, flow: dict,
+                                    vote_chat_flows: dict[str, dict], log=print) -> None:
+    """«🔗 Добавить кнопки» asks for them; «➡️ Без кнопок» goes straight to the preview."""
+    if choice == "buttons":
+        if not await _ask_for_button_lines(api, flow, "🔗 Кнопки под рассылкой.", log=log):
+            vote_chat_flows.pop(flow_id, None)
+        return
+    flow["keyboard"] = None
+    flow.pop("awaiting", None)
+    await _offer_announcement(api, cfg, flow_id, flow, vote_chat_flows, log=log)
+
+
+async def _take_broadcast_buttons(api: TelegramBotAPI, cfg, message: dict, flow_id: str, flow: dict,
+                                  vote_chat_flows: dict[str, dict], log=print) -> None:
+    """The reply to the buttons prompt. A line that does not parse asks again, with what was
+    wrong, rather than ending the draft: the text above it is the part that took work."""
+    raw = message.get("text") or message.get("caption") or ""
+    if broadcast.wants_no_buttons(raw):
+        flow["keyboard"] = None
+    else:
+        try:
+            rows = broadcast.parse_buttons(raw)
+        except broadcast.ButtonsError as e:
+            if not await _ask_for_button_lines(api, flow, f"⚠️ {e}", message.get("message_id"), log=log):
+                vote_chat_flows.pop(flow_id, None)
+            return
+        flow["keyboard"] = {"inline_keyboard": rows}
+    flow.pop("awaiting", None)
+    await _offer_announcement(api, cfg, flow_id, flow, vote_chat_flows, log=log)
 
 
 # ------------------------------------------------------------- who has the bot started
@@ -14619,6 +14869,21 @@ async def _dispatch_update(
             else None
         )
         await handle_admin_command(api, message, home_chat_ref, admin_chat_id, log=log)
+        return
+    if any(
+        re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
+        for spelling in BROADCAST_COMMANDS
+    ):
+        if chat.get("type") != "private":
+            return
+        admin_chat_id = (
+            await _resolve_chat_id(telethon_client, home_chat_ref, known_chat_ids, log=log)
+            if home_chat_ref
+            else None
+        )
+        await handle_broadcast_command(
+            api, telethon_client, message, home_chat_ref, admin_chat_id, vote_chat_flows, log=log,
+        )
         return
     if any(
         re.match(rf"^{re.escape(spelling)}(?:\s|$)", command_text, re.IGNORECASE)
