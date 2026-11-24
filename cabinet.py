@@ -18,6 +18,7 @@ display name, a bought title, another member's name) must go through html.escape
 
 from html import escape
 
+import admin_menu
 import economy
 import stats
 
@@ -59,6 +60,7 @@ def _money(amount: int) -> str:
 def main_view(
     entry: str, user: stats.UserStats, xp: int, rank: int, total: int, streak: int,
     can_manage_badges: bool = False,
+    can_open_admin_panel: bool = False,
 ) -> tuple[str, dict]:
     """The landing screen: a compact identity card plus the section buttons. The level,
     rank and coins all come from the same all-time `xp`, exactly as in /stat."""
@@ -99,6 +101,10 @@ def main_view(
             "text": "🛠️ Выдать значок участнику",
             "callback_data": callback_data(user.user_id, "badge_admin"),
         }])
+    # The /admin panel, for an administrator (bot_listener._shows_admin_panel_button). Its
+    # own callback, not a cabinet one: the panel checks the presser's rights itself.
+    if can_open_admin_panel:
+        rows.append([admin_menu.entry_button()])
     rows.append([{"text": "🔄 Обновить", "callback_data": callback_data(user.user_id, "main")}])
     return "\n".join(lines), {"inline_keyboard": rows}
 

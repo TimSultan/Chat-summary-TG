@@ -301,13 +301,23 @@ DM-only, and gated on being an administrator of the home chat or a hardcoded del
 
 > 🛠 **Панель администратора**
 >
+> **Рассылка** — `/broadcast` · `/vote люди`
 > **Чат и посты** — `/send` · `/preview` · `/buttons` · `/viacleaner`
-> **Голосования** — `/vote` · `/vote2`
-> **Участники** — `/badge` · `/badgeadmin` · `/weekwinner` · `/deletepokras`
+> **Голосования** — `/vote` · `/vote2` · `/vote3` · `/backup` · `/votelog`
+> **Участники** — `/badge` · `/badgeadmin` · `/weekwinner` · `/deletepokras` · `/banuser` · `/unbanuser`
 > **Дерево** — `/plant` · `/plantreminder` · `/replant`
 > **Игра** — `/arenanews`
 
 Details worth knowing:
+
+- **«🛠 Админка» opens it from the screens an admin already looks at**: the bottom of an
+  administrator's `/vote` panel, and the personal cabinet (`/start`, `/cabinet`, any
+  unrecognised DM) of the owner and of every chat administrator the bot has seen in an
+  administrator list since its last restart (`_SEEN_CHAT_ADMIN_IDS`: drawing the button
+  costs no Telegram call, so a fresh restart shows it to the owner only until the first
+  admin check). It sends the panel as a **new** message, leaving the `/vote` status or the
+  balance where it was, and a refusal is a new message too — never a redraw of the screen
+  the button sat on.
 
 - **It is an index, not a new permission.** Every button ends in the very handler the
   typed command runs, and that handler checks the same rights again on its own. Nothing
@@ -320,7 +330,7 @@ Details worth knowing:
   - `open` presses straight through, and is reserved for actions whose whole effect is a
     screen in the admin's own DM. A misclick costs them one message on their own screen.
   - `ask` sends a force-reply and runs the command with whatever comes back — `/send`,
-    `/weekwinner`, `/deletepokras`, `/arenanews`. The prompt is consumed once, so a second
+    `/weekwinner`, `/deletepokras`, `/banuser`, `/unbanuser`, `/arenanews`. The prompt is consumed once, so a second
     reply to it cannot post to the chat twice.
   - `confirm` asks «точно?» first. Everything that writes into the group or resets
     something shared is one of these: `/plant`, `/plantreminder`, `/replant`. One stray tap
@@ -1208,6 +1218,23 @@ page that changes shape depending on who opens it:
   "Too Many Requests" when it comes), rewriting one progress message as it goes, and ends
   with how many arrived, who turned out to have blocked the bot, and any other failure.
   One mailing or check at a time.
+- **`/broadcast`** (`/рассылка`; DM, real chat administrators and the owner only — not
+  badge delegates; «📬 Рассылка» in `/admin`) is the same draft without the vote button:
+  anything at all through the bot. Text with its formatting, a picture or an album, as
+  above; then «🔗 Добавить кнопки» / «➡️ Без кнопок». Buttons are typed one row per line,
+  `|` between buttons in a row (`broadcast.py`, at most 8 rows of 3):
+
+  ```
+  Сайт - https://example.com
+  Канал - https://t.me/channel | Бот - @some_bot
+  ```
+
+  `@username` and a bare `t.me/…` become links, `[текст](ссылка)` works too, and a line
+  that does not parse asks again with what was wrong instead of dropping the text. Link
+  buttons only: a callback button would need a handler that outlives the draft, and a
+  `web_app` one is refused in a group. Pictures with neither text nor buttons go out as the
+  album alone. Then the preview and the same destinations — the chat, the second group,
+  both, or «📬 Всем в личку (N)» with its extra confirmation and background mailing.
 - **`/vote люди`** (DM, administrators only, the "👥 Кто активировал бота" button) lists
   who has the bot started and who blocked it. Telegram gives a bot no such list, so the
   bot keeps one (`bot_users.py`, `DATA_DIR/bot_users/users.json`): anything somebody does

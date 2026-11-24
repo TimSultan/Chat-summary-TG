@@ -34,6 +34,11 @@ CALLBACK_PREFIX = "adminmenu"
 FLOW_TTL_SECONDS = 10 * 60
 
 BACK_BUTTON_TEXT = "◀️ Назад"
+# The way in from the screens an administrator already looks at -- the /vote panel and,
+# for whoever the cabinet can tell is one, the cabinet. It sends the panel as a NEW message
+# ("open"), where "menu" redraws a panel in place: the screen it sits on is a /vote status
+# or somebody's balance, and swapping that for the panel would lose it.
+ENTRY_BUTTON_TEXT = "🛠 Админка"
 CANCEL_BUTTON_TEXT = "✖️ Отмена"
 CANCEL_WORDS = frozenset({"отмена", "cancel", "/cancel", "назад", "back"})
 
@@ -45,6 +50,22 @@ CANCEL_WORDS = frozenset({"отмена", "cancel", "/cancel", "назад", "ba
 # for an `ask`, and `confirm` is the question for a `confirm`; each kind uses exactly one
 # of them.
 ACTIONS = (
+    {
+        "id": "broadcast",
+        "section": "Рассылка",
+        "label": "📬 Рассылка",
+        "command": "/broadcast",
+        "kind": "open",
+        "hint": "текст, картинки и свои кнопки в чат или всем в личку (без кнопки голосования)",
+    },
+    {
+        "id": "people",
+        "section": "Рассылка",
+        "label": "👥 Кто запустил бота",
+        "command": "/vote люди",
+        "kind": "open",
+        "hint": "кому дойдёт рассылка в личку",
+    },
     {
         "id": "send",
         "section": "Чат и посты",
@@ -103,6 +124,22 @@ ACTIONS = (
         "hint": "голосование по номинациям во вкладках, отдельно от основного",
     },
     {
+        "id": "backup",
+        "section": "Голосования",
+        "label": "💾 Бэкап голосований",
+        "command": "/backup",
+        "kind": "open",
+        "hint": "архив всех голосований файлом",
+    },
+    {
+        "id": "votelog",
+        "section": "Голосования",
+        "label": "📜 Журнал голосов",
+        "command": "/votelog",
+        "kind": "open",
+        "hint": "откуда пришли голоса текущего голосования",
+    },
+    {
         "id": "badge",
         "section": "Участники",
         "label": "🏅 Значки",
@@ -135,6 +172,24 @@ ACTIONS = (
         "kind": "ask",
         "hint": "убрать чужую работу из статистики",
         "prompt": "Ответьте участником и номером работы, например: @username 3",
+    },
+    {
+        "id": "banuser",
+        "section": "Участники",
+        "label": "🚫 Забанить",
+        "command": "/banuser",
+        "kind": "ask",
+        "hint": "забанить в основном чате (только владелец)",
+        "prompt": "Ответьте @username или числовым id. Перед баном переспрошу.",
+    },
+    {
+        "id": "unbanuser",
+        "section": "Участники",
+        "label": "♻️ Разбанить",
+        "command": "/unbanuser",
+        "kind": "ask",
+        "hint": "снять бан (только владелец)",
+        "prompt": "Ответьте @username или числовым id того, с кого снять бан.",
     },
     {
         "id": "plant",
@@ -192,6 +247,10 @@ def callback_data(step: str, action_id: str | None = None) -> str:
     if action_id is not None:
         parts.append(action_id)
     return ":".join(parts)
+
+
+def entry_button() -> dict:
+    return {"text": ENTRY_BUTTON_TEXT, "callback_data": callback_data("open")}
 
 
 def parse_callback(data: str) -> tuple[str, str] | None:
